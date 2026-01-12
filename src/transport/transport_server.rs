@@ -211,6 +211,11 @@ impl TransportServer {
         // [CREATE] Create Transport instance
         let transport = Arc::new(crate::transport::transport::Transport::new(self.config.clone()).await.unwrap());
         
+        // [FIX] Subscribe to event stream BEFORE setting connection
+        // This ensures that when adapter's event loop starts, there's already a subscriber ready
+        // This prevents message loss during the time window between event loop start and consumer loop start
+        let event_receiver_opt = connection.event_stream();
+        
         // Set connection to Transport
         transport.set_connection(connection, session_id).await;
         
@@ -222,20 +227,20 @@ impl TransportServer {
         self.state_manager.add_connection(session_id);
         
         // [LOOP] Start event consumption loop, converting TransportEvent to ServerEvent
-        let server_clone = self.clone();
-        let transport_for_events = transport.clone();
-        tokio::spawn(async move {
-            if let Some(mut event_receiver) = transport_for_events.get_event_stream().await {
-                tracing::debug!("[LISTENER] TransportServer starting event consumption loop for session {}", session_id);
+        // [FIX] Use the pre-subscribed event receiver to ensure no messages are lost
+        if let Some(mut event_receiver) = event_receiver_opt {
+            let server_clone = self.clone();
+            tokio::spawn(async move {
+                tracing::info!("[LISTENER] TransportServer starting event consumption loop for session {} (pre-subscribed)", session_id);
                 while let Ok(transport_event) = event_receiver.recv().await {
                     tracing::trace!("[EVENT] TransportServer received event from session {}: {:?}", session_id, transport_event);
                     server_clone.handle_transport_event(session_id, transport_event).await;
                 }
-                tracing::debug!("[END] TransportServer event consumption loop ended for session {}", session_id);
-            } else {
-                tracing::warn!("[WARN] Session {} unable to get event stream", session_id);
-            }
-        });
+                tracing::info!("[END] TransportServer event consumption loop ended for session {}", session_id);
+            });
+        } else {
+            tracing::warn!("[WARN] Session {} unable to get event stream before connection setup", session_id);
+        }
         
         tracing::info!("[SUCCESS] TransportServer added session: {} (using Transport abstraction)", session_id);
         session_id
@@ -549,13 +554,13 @@ impl TransportServer {
 
     /// [HANDLER] Handle connection's TransportEvent, convert to ServerEvent
     async fn handle_transport_event(&self, session_id: SessionId, transport_event: crate::event::TransportEvent) {
-        tracing::debug!("[HANDLER] handle_transport_event: session {}, event: {:?}", session_id, transport_event);
+        tracing::info!("[HANDLER] handle_transport_event: session {}, event: {:?}", session_id, transport_event);
         match transport_event {
             crate::event::TransportEvent::MessageReceived(packet) => {
-                tracing::debug!("[RECV] Received MessageReceived event, packet type: {:?}, ID: {}", packet.header.packet_type, packet.header.message_id);
+                tracing::info!("[RECV] Received MessageReceived event, packet type: {:?}, ID: {}, biz_type: {}", packet.header.packet_type, packet.header.message_id, packet.header.biz_type);
                 match packet.header.packet_type {
                     crate::packet::PacketType::Request => {
-                        tracing::debug!("[REQUEST] Handling Request type packet (ID: {})", packet.header.message_id);
+                        tracing::info!("[REQUEST] Handling Request type packet (ID: {}, biz_type: {})", packet.header.message_id, packet.header.biz_type);
                         // Create unified TransportContext
                         let server_clone = self.clone();
                         let mut context = crate::event::TransportContext::new_request(
@@ -566,14 +571,17 @@ impl TransportServer {
                             packet.payload.clone(),
                             std::sync::Arc::new(move |response_data: Vec<u8>| {
                                 let server = server_clone.clone();
+                                let request_message_id = packet.header.message_id;
+                                let request_biz_type = packet.header.biz_type;
                                 tokio::spawn(async move {
+                                    tracing::info!("[RESPOND] Creating response packet: request_id={}, request_biz_type={}, response_size={} bytes", request_message_id, request_biz_type, response_data.len());
                                     let response_packet = crate::packet::Packet {
                                         header: crate::packet::FixedHeader {
                                             version: 1,
                                             compression: crate::packet::CompressionType::None,
                                             packet_type: crate::packet::PacketType::Response,
                                             biz_type: 0,
-                                            message_id: packet.header.message_id,
+                                            message_id: request_message_id,
                                             ext_header_len: 0,
                                             payload_len: response_data.len() as u32,
                                             reserved: crate::packet::ReservedFlags::new(),
@@ -581,7 +589,14 @@ impl TransportServer {
                                         ext_header: Vec::new(),
                                         payload: response_data,
                                     };
-                                    let _ = server.send_to_session(session_id, response_packet).await;
+                                    match server.send_to_session(session_id, response_packet).await {
+                                        Ok(_) => {
+                                            tracing::info!("[SUCCESS] Response sent successfully: session={}, request_id={}", session_id, request_message_id);
+                                        }
+                                        Err(e) => {
+                                            tracing::error!("[ERROR] Failed to send response: session={}, request_id={}, error={:?}", session_id, request_message_id, e);
+                                        }
+                                    }
                                 });
                             }),
                         );
@@ -594,11 +609,11 @@ impl TransportServer {
                             session_id, 
                             context 
                         };
-                        tracing::debug!("[SEND] Preparing to send ServerEvent::MessageReceived (session: {}, ID: {})", session_id, packet.header.message_id);
+                        tracing::info!("[SEND] Preparing to send ServerEvent::MessageReceived (session: {}, ID: {}, biz_type: {})", session_id, packet.header.message_id, packet.header.biz_type);
                         
                         match self.event_sender.send(event) {
                             Ok(receivers) => {
-                                tracing::debug!("[SUCCESS] ServerEvent sent successfully, receiver count: {} (session: {}, ID: {})", receivers, session_id, packet.header.message_id);
+                                tracing::info!("[SUCCESS] ServerEvent sent successfully, receiver count: {} (session: {}, ID: {})", receivers, session_id, packet.header.message_id);
                             }
                             Err(e) => {
                                 tracing::error!("[ERROR] ServerEvent send failed: {:?} (session: {}, ID: {})", e, session_id, packet.header.message_id);

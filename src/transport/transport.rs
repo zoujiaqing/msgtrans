@@ -289,28 +289,29 @@ impl Transport {
         // [FIX] Set connection session_id
         connection.set_session_id(session_id);
         
+        // [FIX] Subscribe to event stream BEFORE setting connection to ensure we don't miss events
+        // This ensures that when adapter's event loop starts sending events, there's already a subscriber
+        let event_receiver_opt = connection.event_stream();
+        
         *self.connection_adapter.lock().await = Some(Arc::new(Mutex::new(connection)));
         *self.session_id.lock().await = Some(session_id);
         self.state_manager.add_connection(session_id);
         tracing::debug!("[SUCCESS] Transport connection setup complete: {}", session_id);
         
         // Start event consumer loop, ensure all TransportEvent are handled uniformly in on_event
-        let this = Arc::clone(self);
-        let adapter = self.connection_adapter.lock().await.as_ref().unwrap().clone();
-        tokio::spawn(async move {
-            let conn = adapter.lock().await;
-            if let Some(mut event_receiver) = conn.event_stream() {
-                drop(conn);
+        if let Some(mut event_receiver) = event_receiver_opt {
+            let this = Arc::clone(self);
+            tokio::spawn(async move {
                 tracing::debug!("[LISTEN] Transport event consumer loop started (session: {})", session_id);
                 while let Ok(event) = event_receiver.recv().await {
                     tracing::trace!("[RECV] Transport received event: {:?}", event);
                     this.on_event(event).await;
                 }
                 tracing::debug!("[LISTEN] Transport event consumer loop ended (session: {})", session_id);
-            } else {
-                tracing::warn!("[WARN] Connection doesn't support event stream (session: {})", session_id);
-            }
-        });
+            });
+        } else {
+            tracing::warn!("[WARN] Connection doesn't support event stream (session: {})", session_id);
+        }
     }
     
     /// Get protocol registry
@@ -396,9 +397,12 @@ impl Transport {
                 match packet.header.packet_type {
                     crate::packet::PacketType::Response => {
                         let id = packet.header.message_id;
-                        tracing::debug!("[RECV] Processing response packet: ID={}, type={:?}", id, packet.header.packet_type);
+                        tracing::info!("[RECV] Processing response packet: ID={}, type={:?}, biz_type={}", id, packet.header.packet_type, packet.header.biz_type);
                         let completed = self.request_tracker.complete(id, packet);
-                        tracing::debug!("[PROC] Response packet processing result: ID={}, completed={}", id, completed);
+                        tracing::info!("[PROC] Response packet processing result: ID={}, completed={}", id, completed);
+                        if !completed {
+                            tracing::warn!("[WARN] Response packet ID={} not found in request tracker, may be timeout or duplicate", id);
+                        }
                     }
                     
                     crate::packet::PacketType::Request => {
@@ -481,13 +485,18 @@ impl Transport {
         // Register request tracking
         let (_id, rx) = self.request_tracker.register_with_id(message_id);
         
+        tracing::info!("[SEND] Sending request: message_id={}, biz_type={}, timeout={:?}", message_id, packet.header.biz_type, options.timeout);
+        
         // Send packet
         self.send(packet).await?;
+        
+        tracing::info!("[WAIT] Waiting for response: message_id={}, timeout={:?}", message_id, options.timeout);
         
         // Wait for response (with custom timeout)
         let timeout_duration = options.timeout.unwrap_or(std::time::Duration::from_secs(10));
         match tokio::time::timeout(timeout_duration, rx).await {
             Ok(Ok(resp)) => {
+                tracing::info!("[SUCCESS] Received response: message_id={}, biz_type={}, payload_len={}", message_id, resp.header.biz_type, resp.payload.len());
                 // [FIX] Decompress response data
                 match self.decode_payload(&resp) {
                     Ok(decoded_data) => Ok(Bytes::from(decoded_data)),
@@ -497,8 +506,14 @@ impl Transport {
                     }
                 }
             }
-            Ok(Err(_)) => Err(TransportError::connection_error("Connection closed", false)),
-            Err(_) => Err(TransportError::connection_error("Request timeout", false)),
+            Ok(Err(_)) => {
+                tracing::warn!("[WARN] Response channel closed: message_id={}", message_id);
+                Err(TransportError::connection_error("Connection closed", false))
+            }
+            Err(_) => {
+                tracing::warn!("[WARN] Request timeout: message_id={}, timeout={:?}", message_id, timeout_duration);
+                Err(TransportError::connection_error("Request timeout", false))
+            }
         }
     }
 
