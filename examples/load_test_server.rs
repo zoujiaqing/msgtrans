@@ -9,19 +9,9 @@
 
 use msgtrans::{
     event::ServerEvent, protocol::QuicServerConfig, protocol::TcpServerConfig,
-    protocol::WebSocketServerConfig, tokio, transport::TransportServerBuilder, SessionId,
+    protocol::WebSocketServerConfig, tokio, transport::TransportServerBuilder,
 };
 use std::sync::Arc;
-use tokio::sync::mpsc;
-
-const NUM_WORKERS: usize = 8;
-const WORKER_QUEUE_SIZE: usize = 10000;
-
-// Task for worker to process
-struct EchoTask {
-    session_id: SessionId,
-    data: Vec<u8>,
-}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -32,7 +22,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Load Test Server - High-performance Echo Server");
     println!("================================================");
-    println!("Workers: {}", NUM_WORKERS);
 
     let tcp_config = TcpServerConfig::new("127.0.0.1:8001")?;
     let websocket_config = WebSocketServerConfig::new("127.0.0.1:8002")?;
@@ -55,37 +44,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let transport = Arc::new(transport);
     let transport_for_serve = transport.clone();
 
-    // Create work distribution channels - one sender, multiple receivers via mpsc
-    // Using mpsc with multiple worker tasks that share a single receiver
-    let (task_tx, task_rx) = mpsc::channel::<EchoTask>(WORKER_QUEUE_SIZE);
-    let task_rx = Arc::new(tokio::sync::Mutex::new(task_rx));
-
-    // Spawn worker tasks - each worker competes for tasks from the shared queue
-    let mut worker_handles = Vec::new();
-    for _ in 0..NUM_WORKERS {
-        let transport_clone = transport.clone();
-        let rx = task_rx.clone();
-
-        let handle = tokio::spawn(async move {
-            loop {
-                let task = {
-                    let mut rx_guard = rx.lock().await;
-                    rx_guard.recv().await
-                };
-
-                match task {
-                    Some(task) => {
-                        let _ = transport_clone.send(task.session_id, &task.data).await;
-                    }
-                    None => break, // Channel closed
-                }
-            }
-        });
-        worker_handles.push(handle);
-    }
-
-    // Single event dispatcher - distributes work to workers
+    // Subscribe to events BEFORE serve() to ensure we don't miss any
     let mut events = transport.subscribe_events();
+
+    // Single dispatcher - handles echo directly without intermediate queue
+    // This avoids the overhead of task spawning and channel communication
+    let transport_clone = transport.clone();
     let dispatcher_handle = tokio::spawn(async move {
         while let Ok(event) = events.recv().await {
             match event {
@@ -93,13 +57,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     session_id,
                     context,
                 } => {
+                    // Clone data first before consuming context
                     let data = context.data.clone();
                     if context.is_request() {
-                        // Direct respond for requests
+                        // Direct respond for requests - this is synchronous and fast
                         context.respond(data);
                     } else {
-                        // Send to worker queue - workers compete for tasks
-                        let _ = task_tx.send(EchoTask { session_id, data }).await;
+                        // For one-way messages, spawn a task to avoid blocking the event loop
+                        let transport = transport_clone.clone();
+                        tokio::spawn(async move {
+                            let _ = transport.send(session_id, &data).await;
+                        });
                     }
                 }
                 _ => {}
@@ -107,18 +75,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    println!(
-        "Server running with {} workers... Press Ctrl+C to stop.",
-        NUM_WORKERS
-    );
+    println!("Server running... Press Ctrl+C to stop.");
 
     let server_result = transport_for_serve.serve().await;
 
     // Cleanup
     dispatcher_handle.abort();
-    for handle in worker_handles {
-        handle.abort();
-    }
 
     if let Err(e) = server_result {
         eprintln!("Server error: {:?}", e);

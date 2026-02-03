@@ -330,6 +330,7 @@ impl<C> QuicAdapter<C> {
         connection: Connection,
         config: C,
         event_sender: broadcast::Sender<TransportEvent>,
+        is_server: bool,
     ) -> Result<Self, QuicError> {
         let session_id = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
@@ -357,6 +358,7 @@ impl<C> QuicAdapter<C> {
             send_queue_rx,
             shutdown_rx,
             event_sender.clone(),
+            is_server,
         )
         .await;
 
@@ -379,204 +381,277 @@ impl<C> QuicAdapter<C> {
         self.event_sender.subscribe()
     }
 
-    /// Start event loop based on tokio::select!
+    /// Start event loop with single bidirectional stream multiplexing
+    ///
+    /// This is the optimized version that uses a single long-lived bidirectional stream
+    /// instead of creating a new stream per message. This approach:
+    /// - Eliminates stream creation overhead (no `open_uni()` per message)
+    /// - Reduces QUIC state machine overhead
+    /// - Achieves throughput comparable to TCP
+    ///
+    /// Frame format: [4-byte length (big-endian)] + [packet data]
+    ///
+    /// `is_server`: if true, use accept_bi() to wait for client stream; if false, use open_bi() to create stream
+    ///
+    /// This version uses separate tasks for reading and writing to avoid blocking issues
+    /// under high load where one direction could starve the other in a select! loop.
     async fn start_event_loop(
         connection: Connection,
         session_id: Arc<std::sync::atomic::AtomicU64>,
         mut send_queue: mpsc::UnboundedReceiver<Packet>,
         mut shutdown_signal: mpsc::UnboundedReceiver<()>,
         event_sender: broadcast::Sender<TransportEvent>,
+        is_server: bool,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let current_session_id =
                 SessionId(session_id.load(std::sync::atomic::Ordering::SeqCst));
             tracing::debug!(
-                "[START] QUIC event loop started (session: {})",
+                "[START] QUIC event loop started with single-stream multiplexing (session: {}, role: {})",
+                current_session_id,
+                if is_server { "server" } else { "client" }
+            );
+
+            // Get bidirectional stream based on role:
+            // - Server: accept_bi() to wait for client's stream
+            // - Client: open_bi() to create a new stream
+            let (send_stream, recv_stream) = if is_server {
+                match connection.accept_bi().await {
+                    Ok(streams) => streams,
+                    Err(e) => {
+                        tracing::error!(
+                            "[ERROR] Failed to accept bidirectional stream: {:?} (session: {})",
+                            e,
+                            current_session_id
+                        );
+                        let close_event = TransportEvent::ConnectionClosed {
+                            reason: crate::error::CloseReason::Error(format!(
+                                "Failed to accept stream: {:?}",
+                                e
+                            )),
+                        };
+                        let _ = event_sender.send(close_event);
+                        return;
+                    }
+                }
+            } else {
+                match connection.open_bi().await {
+                    Ok(streams) => streams,
+                    Err(e) => {
+                        tracing::error!(
+                            "[ERROR] Failed to open bidirectional stream: {:?} (session: {})",
+                            e,
+                            current_session_id
+                        );
+                        let close_event = TransportEvent::ConnectionClosed {
+                            reason: crate::error::CloseReason::Error(format!(
+                                "Failed to open stream: {:?}",
+                                e
+                            )),
+                        };
+                        let _ = event_sender.send(close_event);
+                        return;
+                    }
+                }
+            };
+
+            tracing::debug!(
+                "[STREAM] Bidirectional stream ready (session: {})",
                 current_session_id
             );
 
-            loop {
-                // Get current session ID
-                let current_session_id =
-                    SessionId(session_id.load(std::sync::atomic::Ordering::SeqCst));
+            // Use a shared shutdown flag for coordinating between read and write tasks
+            let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-                tokio::select! {
-                    // [RECV] Handle incoming data
-                    recv_result = connection.accept_uni() => {
-                        match recv_result {
-                            Ok(mut recv_stream) => {
-                                match recv_stream.read_to_end(1024 * 1024).await {
-                                    Ok(buf) => {
-                                        tracing::debug!("[RECV] QUIC received stream data: {} bytes (session: {})", buf.len(), current_session_id);
+            // Spawn dedicated READ task
+            let read_session_id = session_id.clone();
+            let read_event_sender = event_sender.clone();
+            let read_shutdown_flag = shutdown_flag.clone();
+            let read_task = tokio::spawn(async move {
+                let mut recv_stream = recv_stream;
+                let mut header_buf = [0u8; 4];
 
-                                        // [PERF] Optimization: QUIC stream guarantees data integrity, pre-check to avoid invalid parsing
-                                        let packet = if buf.len() < 16 {
-                                            // Data too short, cannot be valid Packet, create basic data packet directly
-                                            tracing::debug!("[RECV] QUIC data too short, creating basic data packet: {} bytes", buf.len());
-                                            Packet::one_way(0, buf)
-                                        } else {
-                                            // Try to parse as complete Packet
-                                            match Packet::from_bytes(&buf) {
-                                                Ok(packet) => {
-                                                    tracing::debug!("[RECV] QUIC packet parsing successful: {} bytes", packet.payload.len());
-                                                    packet
-                                                }
-                                                Err(e) => {
-                                                    tracing::debug!("[RECV] QUIC packet parsing failed: {:?}, creating basic data packet", e);
-                                                    // [PERF] Optimization: avoid slice copying, use buf directly
-                                                    Packet::one_way(0, buf)
-                                                }
-                                            }
-                                        };
-
-                                        // Send receive event
-                                        let event = TransportEvent::MessageReceived(packet);
-
-                                        if let Err(e) = event_sender.send(event) {
-                                            tracing::warn!("[RECV] Failed to send receive event: {:?}", e);
-                                        }
-                                    }
-                                    Err(e) => {
-                                        // [PERF] Optimization: more fine-grained QUIC error classification handling
-                                        let (should_notify, reason, log_level) = match e {
-                                            quinn::ReadToEndError::Read(quinn::ReadError::ConnectionLost(_)) => {
-                                                (true, crate::error::CloseReason::Normal, "debug")
-                                            }
-                                            quinn::ReadToEndError::Read(quinn::ReadError::Reset(_)) => {
-                                                (true, crate::error::CloseReason::Normal, "debug")
-                                            }
-                                            quinn::ReadToEndError::TooLong => {
-                                                (true, crate::error::CloseReason::Error("QUIC stream too long".to_string()), "warn")
-                                            }
-                                            _ => {
-                                                (true, crate::error::CloseReason::Error(format!("QUIC stream error: {:?}", e)), "error")
-                                            }
-                                        };
-
-                                        // [PERF] Optimization: more detailed logging
-                                        match log_level {
-                                            "debug" => tracing::debug!("[CLOSE] QUIC stream closed normally: {:?} (session: {})", e, current_session_id),
-                                            "warn" => tracing::warn!("[WARN] QUIC stream warning: {:?} (session: {})", e, current_session_id),
-                                            "error" => tracing::error!("[ERROR] QUIC stream error: {:?} (session: {})", e, current_session_id),
-                                            _ => {}
-                                        }
-
-                                        // Notify upper layer connection closed (network exception or peer closed)
-                                        if should_notify {
-                                            let close_event = TransportEvent::ConnectionClosed { reason };
-
-                                            if let Err(e) = event_sender.send(close_event) {
-                                                tracing::debug!("[CLOSE] Failed to notify upper layer connection closed: session {} - {:?}", current_session_id, e);
-                                            } else {
-                                                tracing::debug!("[CLOSE] Notified upper layer connection closed: session {}", current_session_id);
-                                            }
-                                        }
-
-                                        break;
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                // [PERF] Optimization: enhanced QUIC connection error classification
-                                let (should_notify, reason, log_level) = match e {
-                                    quinn::ConnectionError::TimedOut => {
-                                        (true, crate::error::CloseReason::Timeout, "info")
-                                    }
-                                    quinn::ConnectionError::ConnectionClosed(_) => {
-                                        (true, crate::error::CloseReason::Normal, "debug")
-                                    }
-                                    quinn::ConnectionError::ApplicationClosed(_) => {
-                                        (true, crate::error::CloseReason::Normal, "debug")
-                                    }
-                                    quinn::ConnectionError::Reset => {
-                                        (true, crate::error::CloseReason::Normal, "debug")
-                                    }
-                                    quinn::ConnectionError::LocallyClosed => {
-                                        (false, crate::error::CloseReason::Normal, "debug") // Local close doesn't need notification
-                                    }
-                                    _ => {
-                                        (true, crate::error::CloseReason::Error(format!("QUIC connection error: {:?}", e)), "error")
-                                    }
-                                };
-
-                                // [PERF] Optimization: more precise log levels
-                                match log_level {
-                                    "debug" => tracing::debug!("[CLOSE] QUIC connection closed normally: {:?} (session: {})", e, current_session_id),
-                                    "info" => tracing::info!("[TIMEOUT] QUIC connection timeout: {:?} (session: {})", e, current_session_id),
-                                    "error" => tracing::error!("[ERROR] QUIC connection error: {:?} (session: {})", e, current_session_id),
-                                    _ => {}
-                                }
-
-                                // Notify upper layer connection closed (network exception or peer closed)
-                                if should_notify {
-                                    let close_event = TransportEvent::ConnectionClosed { reason };
-
-                                    if let Err(e) = event_sender.send(close_event) {
-                                        tracing::debug!("[CLOSE] Failed to notify upper layer connection closed: session {} - {:?}", current_session_id, e);
-                                    } else {
-                                        tracing::debug!("[CLOSE] Notified upper layer connection closed: session {}", current_session_id);
-                                    }
-                                } else {
-                                    tracing::debug!("[CLOSE] Local close, no need to notify upper layer (session: {})", current_session_id);
-                                }
-
-                                break;
-                            }
-                        }
+                loop {
+                    if read_shutdown_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
                     }
 
-                    // [SEND] Handle outgoing data - optimized version
-                    packet = send_queue.recv() => {
-                        if let Some(packet) = packet {
-                            match connection.open_uni().await {
-                                Ok(mut send_stream) => {
-                                    // [PERF] Optimization: prepare send data
-                                    let data = packet.to_bytes();
-                                    let packet_size = packet.payload.len();
-                                    let packet_id = packet.header.message_id;
+                    let current_session_id =
+                        SessionId(read_session_id.load(std::sync::atomic::Ordering::SeqCst));
 
-                                    match send_stream.write_all(&data).await {
-                                        Ok(_) => {
-                                            // [PERF] Optimization: use more efficient stream closing method
-                                            match send_stream.finish() {
-                                                Ok(_) => {
-                                                    tracing::debug!("[SEND] QUIC send successful: {} bytes (ID: {}, session: {})",
-                                                        packet_size, packet_id, current_session_id);
+                    // Read frame header
+                    match recv_stream.read_exact(&mut header_buf).await {
+                        Ok(_) => {
+                            let frame_len = u32::from_be_bytes(header_buf) as usize;
 
-                                                    // Send send event
-                                                    let event = TransportEvent::MessageSent { packet_id };
+                            // Sanity check
+                            if frame_len > 16 * 1024 * 1024 {
+                                tracing::error!(
+                                    "[ERROR] Frame too large: {} bytes (session: {})",
+                                    frame_len,
+                                    current_session_id
+                                );
+                                let close_event = TransportEvent::ConnectionClosed {
+                                    reason: crate::error::CloseReason::Error(
+                                        "Frame too large".to_string(),
+                                    ),
+                                };
+                                let _ = read_event_sender.send(close_event);
+                                break;
+                            }
 
-                                                    if let Err(e) = event_sender.send(event) {
-                                                        tracing::warn!("[SEND] Failed to send send event: {:?}", e);
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    tracing::error!("[ERROR] QUIC stream close error: {:?} (session: {})", e, current_session_id);
-                                                }
-                                            }
+                            // Read frame payload
+                            let mut payload_buf = vec![0u8; frame_len];
+                            match recv_stream.read_exact(&mut payload_buf).await {
+                                Ok(_) => {
+                                    tracing::debug!(
+                                        "[RECV] QUIC received frame: {} bytes (session: {})",
+                                        frame_len,
+                                        current_session_id
+                                    );
+
+                                    let packet = if payload_buf.len() < 16 {
+                                        Packet::one_way(0, payload_buf)
+                                    } else {
+                                        match Packet::from_bytes(&payload_buf) {
+                                            Ok(packet) => packet,
+                                            Err(_) => Packet::one_way(0, payload_buf),
                                         }
-                                        Err(e) => {
-                                            tracing::error!("[ERROR] QUIC send error: {:?} (session: {})", e, current_session_id);
-                                            break;
-                                        }
+                                    };
+
+                                    let event = TransportEvent::MessageReceived(packet);
+                                    if let Err(e) = read_event_sender.send(event) {
+                                        tracing::warn!(
+                                            "[RECV] Failed to send receive event: {:?}",
+                                            e
+                                        );
                                     }
                                 }
                                 Err(e) => {
-                                    tracing::error!("[ERROR] QUIC open send stream error: {:?} (session: {})", e, current_session_id);
+                                    tracing::debug!(
+                                        "[CLOSE] Failed to read frame payload: {:?} (session: {})",
+                                        e,
+                                        current_session_id
+                                    );
+                                    let close_event = TransportEvent::ConnectionClosed {
+                                        reason: crate::error::CloseReason::Normal,
+                                    };
+                                    let _ = read_event_sender.send(close_event);
                                     break;
                                 }
                             }
                         }
-                    }
+                        Err(e) => {
+                            let current_session_id = SessionId(
+                                read_session_id.load(std::sync::atomic::Ordering::SeqCst),
+                            );
+                            tracing::debug!(
+                                "[CLOSE] Stream read ended: {:?} (session: {})",
+                                e,
+                                current_session_id
+                            );
 
-                    // [STOP] Handle shutdown signal
-                    _ = shutdown_signal.recv() => {
-                        tracing::info!("[STOP] Received shutdown signal, stopping QUIC event loop (session: {})", current_session_id);
-                        // Active close: no need to send close event, because it was initiated by upper layer
-                        // Lower layer protocol close has already notified peer, upper layer already knows about the close
-                        tracing::debug!("[CLOSE] Active close, not sending close event");
+                            let close_event = TransportEvent::ConnectionClosed {
+                                reason: crate::error::CloseReason::Normal,
+                            };
+                            let _ = read_event_sender.send(close_event);
+                            break;
+                        }
+                    }
+                }
+            });
+
+            // Spawn dedicated WRITE task
+            let write_session_id = session_id.clone();
+            let write_event_sender = event_sender.clone();
+            let write_shutdown_flag = shutdown_flag.clone();
+            let write_task = tokio::spawn(async move {
+                let mut send_stream = send_stream;
+
+                loop {
+                    if write_shutdown_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        let _ = send_stream.finish();
                         break;
                     }
+
+                    match send_queue.recv().await {
+                        Some(packet) => {
+                            let current_session_id = SessionId(
+                                write_session_id.load(std::sync::atomic::Ordering::SeqCst),
+                            );
+                            let packet_id = packet.header.message_id;
+                            let data = packet.to_bytes();
+                            let frame_len = data.len() as u32;
+                            let header = frame_len.to_be_bytes();
+
+                            // Write header + payload
+                            if let Err(e) = send_stream.write_all(&header).await {
+                                tracing::error!(
+                                    "[ERROR] Failed to write frame header: {:?} (session: {})",
+                                    e,
+                                    current_session_id
+                                );
+                                let close_event = TransportEvent::ConnectionClosed {
+                                    reason: crate::error::CloseReason::Error(format!(
+                                        "Write error: {:?}",
+                                        e
+                                    )),
+                                };
+                                let _ = write_event_sender.send(close_event);
+                                break;
+                            }
+
+                            if let Err(e) = send_stream.write_all(&data).await {
+                                tracing::error!(
+                                    "[ERROR] Failed to write frame payload: {:?} (session: {})",
+                                    e,
+                                    current_session_id
+                                );
+                                let close_event = TransportEvent::ConnectionClosed {
+                                    reason: crate::error::CloseReason::Error(format!(
+                                        "Write error: {:?}",
+                                        e
+                                    )),
+                                };
+                                let _ = write_event_sender.send(close_event);
+                                break;
+                            }
+
+                            tracing::debug!(
+                                "[SEND] QUIC frame sent: {} bytes (ID: {}, session: {})",
+                                data.len(),
+                                packet_id,
+                                current_session_id
+                            );
+
+                            let event = TransportEvent::MessageSent { packet_id };
+                            if let Err(e) = write_event_sender.send(event) {
+                                tracing::warn!("[SEND] Failed to send sent event: {:?}", e);
+                            }
+                        }
+                        None => {
+                            // send_queue closed
+                            tracing::debug!("[CLOSE] Send queue closed");
+                            let _ = send_stream.finish();
+                            break;
+                        }
+                    }
+                }
+            });
+
+            // Wait for shutdown signal or task completion
+            tokio::select! {
+                _ = shutdown_signal.recv() => {
+                    tracing::info!("[STOP] Received shutdown signal (session: {})", current_session_id);
+                    shutdown_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                _ = read_task => {
+                    tracing::debug!("[CLOSE] Read task ended (session: {})", current_session_id);
+                    shutdown_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                _ = write_task => {
+                    tracing::debug!("[CLOSE] Write task ended (session: {})", current_session_id);
+                    shutdown_flag.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
 
@@ -624,7 +699,7 @@ impl QuicAdapter<QuicClientConfig> {
             config.connect_timeout
         );
 
-        Self::new_with_connection(connection, config, broadcast::channel(8192).0).await
+        Self::new_with_connection(connection, config, broadcast::channel(8192).0, false).await
     }
 }
 
@@ -839,6 +914,7 @@ impl QuicServer {
             connection,
             self.config.clone(),
             broadcast::channel(8192).0,
+            true, // is_server = true
         )
         .await
     }
