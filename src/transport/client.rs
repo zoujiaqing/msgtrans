@@ -1,17 +1,14 @@
-/// Client transport layer module
-/// 
-/// Provides transport layer API specifically designed for client connections
-
-use std::time::Duration;
-use std::sync::Arc;
-use tokio::sync::RwLock;
 use bytes::Bytes;
+use std::sync::Arc;
+/// Client transport layer module
+///
+/// Provides transport layer API specifically designed for client connections
+use std::time::Duration;
+use tokio::sync::RwLock;
 
 use crate::{
+    error::TransportError, protocol::adapter::DynClientConfig, transport::config::TransportConfig,
     SessionId,
-    error::TransportError,
-    transport::config::TransportConfig,
-    protocol::adapter::DynClientConfig,
 };
 
 // Internal use of new Transport structure
@@ -156,7 +153,7 @@ impl TransportClientBuilder {
             protocol_config: None,
         }
     }
-    
+
     /// Set protocol configuration - Client specific
     pub fn with_protocol<T: DynClientConfig>(mut self, config: T) -> Self {
         self.protocol_config = Some(Box::new(config));
@@ -209,7 +206,7 @@ impl TransportClientBuilder {
     pub async fn build(self) -> Result<TransportClient, TransportError> {
         // Create underlying Transport
         let transport = Transport::new(self.transport_config).await?;
-        
+
         Ok(TransportClient::new(
             transport,
             self.retry_config,
@@ -248,153 +245,207 @@ impl TransportClient {
             retry_config,
             protocol_config,
             current_session_id: Arc::new(RwLock::new(None)),
-            event_sender: tokio::sync::broadcast::channel(16).0,
+            event_sender: tokio::sync::broadcast::channel(8192).0,
             message_id_counter: std::sync::atomic::AtomicU32::new(1),
         }
     }
-    
+
     /// [CONNECT] Use protocol configuration specified at build time for connection - Framework's only connection method
     pub async fn connect(&mut self) -> Result<(), TransportError> {
         // Check if protocol configuration exists and clone to avoid borrow conflicts
         let protocol_config = self.protocol_config.as_ref()
-            .ok_or_else(|| TransportError::config_error("protocol", 
+            .ok_or_else(|| TransportError::config_error("protocol",
                 "No protocol config specified. Use TransportClientBuilder::with_protocol() when building."))?
             .clone_client_dyn();
 
         // Validate protocol configuration
-        protocol_config.validate_dyn().map_err(|e| TransportError::config_error("protocol", format!("Config validation failed: {:?}", e)))?;
-        
+        protocol_config.validate_dyn().map_err(|e| {
+            TransportError::config_error("protocol", format!("Config validation failed: {:?}", e))
+        })?;
+
         // Connect using stored protocol configuration
         let session_id = self.connect_with_stored_config(&protocol_config).await?;
-        
+
         // Update current session ID (internal use)
         let mut current_session = self.current_session_id.write().await;
         *current_session = Some(session_id);
-        
+
         // [START] Start event forwarding task, converting Transport events to ClientEvent
         self.start_event_forwarding().await?;
-        
+
         tracing::info!("[SUCCESS] TransportClient connected successfully");
         Ok(())
     }
 
     /// [CONFIG] Internal method: Connect using stored protocol configuration
-    async fn connect_with_stored_config(&mut self, protocol_config: &Box<dyn DynClientConfig>) -> Result<SessionId, TransportError> {
+    async fn connect_with_stored_config(
+        &mut self,
+        protocol_config: &Box<dyn DynClientConfig>,
+    ) -> Result<SessionId, TransportError> {
         let mut last_error = None;
         let max_retries = self.retry_config.max_retries;
-        
+
         for attempt in 0..=max_retries {
             if attempt > 0 {
                 let delay = self.calculate_retry_delay(attempt);
-                tracing::debug!("Connection retry {}/{}, delay: {:?}", attempt, max_retries, delay);
+                tracing::debug!(
+                    "Connection retry {}/{}, delay: {:?}",
+                    attempt,
+                    max_retries,
+                    delay
+                );
                 tokio::time::sleep(delay).await;
             }
-            
+
             // Connect according to protocol type
             match protocol_config.protocol_name() {
                 "tcp" => {
-                    if let Some(tcp_config) = protocol_config.as_any().downcast_ref::<crate::protocol::TcpClientConfig>() {
+                    if let Some(tcp_config) = protocol_config
+                        .as_any()
+                        .downcast_ref::<crate::protocol::TcpClientConfig>()
+                    {
                         match self.inner.connect_with_config(tcp_config.clone()).await {
                             Ok(session_id) => return Ok(session_id),
                             Err(e) => {
                                 last_error = Some(e);
-                                tracing::warn!("TCP connection failed (attempt {}): {:?}", attempt + 1, last_error);
+                                tracing::warn!(
+                                    "TCP connection failed (attempt {}): {:?}",
+                                    attempt + 1,
+                                    last_error
+                                );
                             }
                         }
                     } else {
-                        return Err(TransportError::config_error("protocol", "Invalid TCP config"));
+                        return Err(TransportError::config_error(
+                            "protocol",
+                            "Invalid TCP config",
+                        ));
                     }
                 }
                 "websocket" => {
-                    if let Some(ws_config) = protocol_config.as_any().downcast_ref::<crate::protocol::WebSocketClientConfig>() {
+                    if let Some(ws_config) = protocol_config
+                        .as_any()
+                        .downcast_ref::<crate::protocol::WebSocketClientConfig>(
+                    ) {
                         match self.inner.connect_with_config(ws_config.clone()).await {
                             Ok(session_id) => return Ok(session_id),
                             Err(e) => {
                                 last_error = Some(e);
-                                tracing::warn!("WebSocket connection failed (attempt {}): {:?}", attempt + 1, last_error);
+                                tracing::warn!(
+                                    "WebSocket connection failed (attempt {}): {:?}",
+                                    attempt + 1,
+                                    last_error
+                                );
                             }
                         }
                     } else {
-                        return Err(TransportError::config_error("protocol", "Invalid WebSocket config"));
+                        return Err(TransportError::config_error(
+                            "protocol",
+                            "Invalid WebSocket config",
+                        ));
                     }
                 }
                 "quic" => {
-                    if let Some(quic_config) = protocol_config.as_any().downcast_ref::<crate::protocol::QuicClientConfig>() {
+                    if let Some(quic_config) = protocol_config
+                        .as_any()
+                        .downcast_ref::<crate::protocol::QuicClientConfig>()
+                    {
                         match self.inner.connect_with_config(quic_config.clone()).await {
                             Ok(session_id) => return Ok(session_id),
                             Err(e) => {
                                 last_error = Some(e);
-                                tracing::warn!("QUIC connection failed (attempt {}): {:?}", attempt + 1, last_error);
+                                tracing::warn!(
+                                    "QUIC connection failed (attempt {}): {:?}",
+                                    attempt + 1,
+                                    last_error
+                                );
                             }
                         }
                     } else {
-                        return Err(TransportError::config_error("protocol", "Invalid QUIC config"));
+                        return Err(TransportError::config_error(
+                            "protocol",
+                            "Invalid QUIC config",
+                        ));
                     }
                 }
                 protocol_name => {
-                    return Err(TransportError::config_error("protocol", format!("Unsupported protocol: {}", protocol_name)));
+                    return Err(TransportError::config_error(
+                        "protocol",
+                        format!("Unsupported protocol: {}", protocol_name),
+                    ));
                 }
             }
         }
-        
+
         // All retries failed
-        Err(last_error.unwrap_or_else(|| TransportError::connection_error("Connection failed after all retries", true)))
+        Err(last_error.unwrap_or_else(|| {
+            TransportError::connection_error("Connection failed after all retries", true)
+        }))
     }
 
     fn calculate_retry_delay(&self, attempt: usize) -> std::time::Duration {
-        let delay = self.retry_config.initial_delay.as_secs_f64() 
+        let delay = self.retry_config.initial_delay.as_secs_f64()
             * self.retry_config.backoff_multiplier.powi(attempt as i32);
         let delay = delay.min(self.retry_config.max_delay.as_secs_f64());
         std::time::Duration::from_secs_f64(delay)
     }
-    
+
     /// [DISCONNECT] Disconnect (graceful close)
     pub async fn disconnect(&self) -> Result<(), TransportError> {
         // Check if already connected
         let mut current_session = self.current_session_id.write().await;
         if let Some(session_id) = current_session.take() {
             drop(current_session);
-            
+
             tracing::info!("TransportClient disconnecting");
-            
+
             // Use Transport's unified close method
             self.inner.close_session(session_id).await?;
-            
+
             Ok(())
         } else {
             Err(TransportError::connection_error("Not connected", false))
         }
     }
-    
+
     /// [FORCE] Force disconnect
     pub async fn force_disconnect(&self) -> Result<(), TransportError> {
         // Check if already connected
         let mut current_session = self.current_session_id.write().await;
         if let Some(session_id) = current_session.take() {
             drop(current_session);
-            
+
             tracing::info!("TransportClient force disconnecting");
-            
+
             // Use Transport's force close method
             self.inner.force_close_session(session_id).await?;
-            
+
             Ok(())
         } else {
             Err(TransportError::connection_error("Not connected", false))
         }
     }
-    
+
     /// [SEND] Send byte data - Unified API returns TransportResult
     pub async fn send(&self, data: &[u8]) -> Result<crate::event::TransportResult, TransportError> {
         if !self.is_connected().await {
-            return Err(TransportError::connection_error("Not connected - call connect() first", false));
+            return Err(TransportError::connection_error(
+                "Not connected - call connect() first",
+                false,
+            ));
         }
-        
-        let message_id = self.message_id_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        let message_id = self
+            .message_id_counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let packet = crate::packet::Packet::one_way(message_id, data.to_vec());
-        
-        tracing::debug!("TransportClient sending data: {} bytes (ID: {})", data.len(), message_id);
-        
+
+        tracing::debug!(
+            "TransportClient sending data: {} bytes (ID: {})",
+            data.len(),
+            message_id
+        );
+
         match self.inner.send(packet).await {
             Ok(()) => {
                 // Send successful, return TransportResult
@@ -403,23 +454,43 @@ impl TransportClient {
             Err(e) => Err(e),
         }
     }
-    
+
     /// [REQUEST] Send byte request and wait for response - Unified API returns TransportResult
-    pub async fn request(&self, data: &[u8]) -> Result<crate::event::TransportResult, TransportError> {
+    pub async fn request(
+        &self,
+        data: &[u8],
+    ) -> Result<crate::event::TransportResult, TransportError> {
         if !self.is_connected().await {
-            return Err(TransportError::connection_error("Not connected - call connect() first", false));
+            return Err(TransportError::connection_error(
+                "Not connected - call connect() first",
+                false,
+            ));
         }
-        
-        let message_id = self.message_id_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        let message_id = self
+            .message_id_counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let packet = crate::packet::Packet::request(message_id, data.to_vec());
-        
-        tracing::debug!("TransportClient sending request: {} bytes (ID: {})", data.len(), message_id);
-        
+
+        tracing::debug!(
+            "TransportClient sending request: {} bytes (ID: {})",
+            data.len(),
+            message_id
+        );
+
         match self.inner.request(packet).await {
             Ok(response_packet) => {
-                tracing::debug!("TransportClient received response: {} bytes (ID: {})", response_packet.payload.len(), response_packet.header.message_id);
+                tracing::debug!(
+                    "TransportClient received response: {} bytes (ID: {})",
+                    response_packet.payload.len(),
+                    response_packet.header.message_id
+                );
                 // Request successful, return TransportResult containing response data
-                Ok(crate::event::TransportResult::new_completed(None, message_id, response_packet.payload.clone()))
+                Ok(crate::event::TransportResult::new_completed(
+                    None,
+                    message_id,
+                    response_packet.payload.clone(),
+                ))
             }
             Err(e) => {
                 // Check if it's a timeout error
@@ -431,7 +502,7 @@ impl TransportClient {
             }
         }
     }
-    
+
     /// [STATUS] Check connection status
     pub async fn is_connected(&self) -> bool {
         self.inner.is_connected().await
@@ -447,16 +518,19 @@ impl TransportClient {
     pub async fn current_session_id(&self) -> Option<SessionId> {
         self.inner.current_session_id().await
     }
-    
+
     /// Get client event stream - Returns event stream for current connection (hides session ID)
     pub async fn events(&self) -> Result<crate::stream::ClientEventStream, TransportError> {
         use crate::stream::StreamFactory;
-        
+
         // Check if connected
         if !self.is_connected().await {
-            return Err(TransportError::connection_error("Not connected - call connect() first", false));
+            return Err(TransportError::connection_error(
+                "Not connected - call connect() first",
+                false,
+            ));
         }
-        
+
         // [FIX] Fix: Use Transport's event stream directly, no longer depends on session ID
         if let Some(event_receiver) = self.inner.get_event_stream().await {
             tracing::debug!("[SUCCESS] TransportClient got connection adapter event stream");
@@ -464,23 +538,27 @@ impl TransportClient {
             return Ok(StreamFactory::client_event_stream(event_receiver));
         } else {
             // If event stream cannot be obtained, return error
-            return Err(TransportError::connection_error("Connection does not support event streams", false));
+            return Err(TransportError::connection_error(
+                "Connection does not support event streams",
+                false,
+            ));
         }
     }
-    
+
     /// [DEBUG] Internal method: Get current session ID (for internal debugging only)
     async fn current_session(&self) -> Option<SessionId> {
         self.inner.current_session_id().await
     }
-    
+
     /// Get client connection statistics
     /// TODO: Transport needs to implement statistics functionality
     pub async fn stats(&self) -> Result<crate::command::TransportStats, TransportError> {
         // Temporarily return error, waiting for Transport to implement statistics
-        Err(TransportError::connection_error("Stats not implemented for Transport yet", false))
+        Err(TransportError::connection_error(
+            "Stats not implemented for Transport yet",
+            false,
+        ))
     }
-
-
 
     /// Business layer subscribe to ClientEvent
     pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<crate::event::ClientEvent> {
@@ -493,28 +571,32 @@ impl TransportClient {
         if let Some(mut transport_events) = self.inner.get_event_stream().await {
             let client_event_sender = self.event_sender.clone();
             let transport_for_response = self.inner.clone();
-            
+
             // Start forwarding task
             tokio::spawn(async move {
                 tracing::debug!("[LOOP] TransportClient event forwarding task started");
-                
+
                 while let Ok(transport_event) = transport_events.recv().await {
                     tracing::debug!("[RECV] TransportClient received Transport event");
-                    
+
                     // [TARGET] Special handling of Request packets in MessageReceived
                     match &transport_event {
-                        crate::event::TransportEvent::MessageReceived(packet) 
-                            if packet.header.packet_type == crate::packet::PacketType::Request => {
-                            
+                        crate::event::TransportEvent::MessageReceived(packet)
+                            if packet.header.packet_type == crate::packet::PacketType::Request =>
+                        {
                             // Create TransportContext with real response functionality for Request packets
                             let transport = transport_for_response.clone();
                             let message_id = packet.header.message_id;
-                            
-                                                        let context = crate::event::TransportContext::new_request(
+
+                            let context = crate::event::TransportContext::new_request(
                                 None,
                                 message_id,
                                 packet.header.biz_type,
-                                if packet.ext_header.is_empty() { None } else { Some(packet.ext_header.clone()) },
+                                if packet.ext_header.is_empty() {
+                                    None
+                                } else {
+                                    Some(packet.ext_header.clone())
+                                },
                                 packet.payload.clone(),
                                 Arc::new(move |response_data: Vec<u8>| {
                                     let transport = transport.clone();
@@ -534,55 +616,85 @@ impl TransportClient {
                                             ext_header: Vec::new(),
                                             payload: response_data,
                                         };
-                                        
+
                                         if let Err(e) = transport.send(response_packet).await {
-                                            tracing::error!("[ERROR] TransportClient response send failed: {}", e);
+                                            tracing::error!(
+                                                "[ERROR] TransportClient response send failed: {}",
+                                                e
+                                            );
                                         }
                                     });
-                                })
+                                }),
                             );
-                            
+
                             let client_event = crate::event::ClientEvent::MessageReceived(context);
-                            tracing::debug!("[SEND] TransportClient forwarding ClientEvent (Request): {:?}", client_event);
-                            
+                            tracing::debug!(
+                                "[SEND] TransportClient forwarding ClientEvent (Request): {:?}",
+                                client_event
+                            );
+
                             if let Err(e) = client_event_sender.send(client_event) {
-                                tracing::warn!("[WARNING] TransportClient event forwarding failed: {:?}", e);
+                                tracing::warn!(
+                                    "[WARNING] TransportClient event forwarding failed: {:?}",
+                                    e
+                                );
                             }
                         }
                         _ => {
                             // Other events use standard conversion
-                            if let Some(client_event) = crate::event::ClientEvent::from_transport_event(transport_event) {
-                                tracing::debug!("[SEND] TransportClient forwarding ClientEvent: {:?}", client_event);
-                                
+                            if let Some(client_event) =
+                                crate::event::ClientEvent::from_transport_event(transport_event)
+                            {
+                                tracing::debug!(
+                                    "[SEND] TransportClient forwarding ClientEvent: {:?}",
+                                    client_event
+                                );
+
                                 if let Err(e) = client_event_sender.send(client_event) {
-                                    tracing::warn!("[WARNING] TransportClient event forwarding failed: {:?}", e);
+                                    tracing::warn!(
+                                        "[WARNING] TransportClient event forwarding failed: {:?}",
+                                        e
+                                    );
                                 }
                             } else {
-                                tracing::debug!("[SKIP] TransportClient skipping unsupported event");
+                                tracing::debug!(
+                                    "[SKIP] TransportClient skipping unsupported event"
+                                );
                             }
                         }
                     }
                 }
-                
+
                 tracing::debug!("[END] TransportClient event forwarding task ended");
             });
-            
+
             tracing::debug!("[SUCCESS] TransportClient event forwarding task started");
             Ok(())
         } else {
-            Err(TransportError::connection_error("Connection does not support event streams", false))
+            Err(TransportError::connection_error(
+                "Connection does not support event streams",
+                false,
+            ))
         }
     }
 
     /// [SEND] Send request and wait for response (with options)
-    pub async fn request_with_options(&self, data: Bytes, options: super::TransportOptions) -> Result<Bytes, TransportError> {
+    pub async fn request_with_options(
+        &self,
+        data: Bytes,
+        options: super::TransportOptions,
+    ) -> Result<Bytes, TransportError> {
         self.inner.request_with_options(data, options).await
     }
 
     /// [SEND] Send one-way message (with options)
-    pub async fn send_with_options(&self, data: Bytes, options: super::TransportOptions) -> Result<(), TransportError> {
+    pub async fn send_with_options(
+        &self,
+        data: Bytes,
+        options: super::TransportOptions,
+    ) -> Result<(), TransportError> {
         self.inner.send_with_options(data, options).await
     }
 }
 
-// Simplification complete - Unique connection method that meets user requirements 
+// Simplification complete - Unique connection method that meets user requirements

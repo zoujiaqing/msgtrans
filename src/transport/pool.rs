@@ -1,51 +1,52 @@
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 /// Intelligent expansion mechanism - core implementation
-/// 
+///
 /// Progressive resource expansion based on mathematical models:
 /// - Early rapid expansion: 2.0x (1G→2G→4G)
-/// - Mid-period moderate expansion: 1.5x (4G→6G)  
+/// - Mid-period moderate expansion: 1.5x (4G→6G)
 /// - Late conservative expansion: 1.2x (6G→7.2G)
 /// - Final fine expansion: 1.1x (7.2G→7.9G→8.7G)
 
 /// [PERF] High-performance connection pool full optimization
-/// 
+///
 /// Based on successful experience from previous phases, applying hybrid architecture strategy to connection pool:
 /// - LockFree + Crossbeam: Synchronous high-frequency path (connection get/return)
-/// - Flume: Asynchronous processing path (connection management commands)  
+/// - Flume: Asynchronous processing path (connection management commands)
 /// - Tokio: Ecosystem integration path (event broadcasting)
-
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use std::collections::VecDeque;
 
+use crossbeam_channel::{
+    unbounded as crossbeam_unbounded, Receiver as CrossbeamReceiver, Sender as CrossbeamSender,
+};
 use tokio::sync::RwLock;
-use crossbeam_channel::{unbounded as crossbeam_unbounded, Sender as CrossbeamSender, Receiver as CrossbeamReceiver};
 
 use crate::error::TransportError;
 use crate::transport::lockfree::{LockFreeHashMap, LockFreeQueue};
-use crate::SessionId;
 use crate::transport::memory_pool::{OptimizedMemoryPool, OptimizedMemoryStatsSnapshot};
+use crate::SessionId;
 
 /// [PERF] Optimized intelligent connection pool
 pub struct ConnectionPool {
     /// Connection ID counter
     connection_id_counter: AtomicU64,
-    
+
     /// [PERF] LockFree connection storage
     active_connections: Arc<LockFreeHashMap<ConnectionId, PoolConnection>>,
     available_connections: Arc<LockFreeQueue<ConnectionId>>,
-    
+
     /// [SYNC] Crossbeam synchronous control
     pool_control_tx: CrossbeamSender<PoolControlCommand>,
     pool_control_rx: CrossbeamReceiver<PoolControlCommand>,
-    
+
     /// [EVENT] Tokio event broadcasting
     pub event_broadcaster: tokio::sync::broadcast::Sender<PoolEvent>,
-    
+
     /// Configuration and state
     max_size: usize,
     initial_size: usize,
-    
+
     /// [PERF] Optimized statistics
     stats: Arc<OptimizedPoolStats>,
     /// Expansion strategy (maintain compatibility)
@@ -132,7 +133,7 @@ pub struct OptimizedPoolStats {
     pub available_connections: AtomicU64,
     /// Get operation count
     pub get_operations: AtomicU64,
-    /// Return operation count  
+    /// Return operation count
     pub return_operations: AtomicU64,
     /// Create operation count
     pub create_operations: AtomicU64,
@@ -193,7 +194,7 @@ pub struct ExpansionStrategy {
 pub struct PoolStats {
     /// Total expansion count
     pub expansion_count: AtomicU64,
-    /// Total shrink count  
+    /// Total shrink count
     pub shrink_count: AtomicU64,
     /// Last expansion time
     pub last_expansion: RwLock<Option<Instant>>,
@@ -208,8 +209,8 @@ impl Default for ExpansionStrategy {
         Self {
             factors: vec![2.0, 1.5, 1.2, 1.1],
             current_factor_index: 0,
-            expansion_threshold: 0.8,   // 80% utilization triggers expansion
-            shrink_threshold: 0.3,      // 30% utilization triggers shrink
+            expansion_threshold: 0.8, // 80% utilization triggers expansion
+            shrink_threshold: 0.3,    // 30% utilization triggers shrink
         }
     }
 }
@@ -217,7 +218,9 @@ impl Default for ExpansionStrategy {
 impl Clone for ConnectionPool {
     fn clone(&self) -> Self {
         Self {
-            connection_id_counter: AtomicU64::new(self.connection_id_counter.load(Ordering::Relaxed)),
+            connection_id_counter: AtomicU64::new(
+                self.connection_id_counter.load(Ordering::Relaxed),
+            ),
             active_connections: self.active_connections.clone(),
             available_connections: self.available_connections.clone(),
             pool_control_tx: self.pool_control_tx.clone(),
@@ -237,8 +240,8 @@ impl ConnectionPool {
     /// [PERF] Create optimized intelligent connection pool
     pub fn new(initial_size: usize, max_size: usize) -> Self {
         let (pool_control_tx, pool_control_rx) = crossbeam_unbounded();
-        let (event_broadcaster, _) = tokio::sync::broadcast::channel(1024);
-        
+        let (event_broadcaster, _) = tokio::sync::broadcast::channel(8192);
+
         Self {
             connection_id_counter: AtomicU64::new(0),
             active_connections: Arc::new(LockFreeHashMap::new()),
@@ -259,7 +262,8 @@ impl ConnectionPool {
     pub async fn initialize_pool(self) -> Result<Self, TransportError> {
         // Create initial connections
         for _ in 0..self.initial_size {
-            let connection_id = ConnectionId::new(self.connection_id_counter.fetch_add(1, Ordering::Relaxed));
+            let connection_id =
+                ConnectionId::new(self.connection_id_counter.fetch_add(1, Ordering::Relaxed));
             let connection = PoolConnection {
                 id: connection_id,
                 session_id: None,
@@ -268,30 +272,43 @@ impl ConnectionPool {
                 use_count: 0,
                 state: ConnectionState::Available,
             };
-            
+
             // LockFree store connection
             if let Err(e) = self.active_connections.insert(connection_id, connection) {
-                return Err(TransportError::config_error("initialize_pool", format!("Failed to create connection: {:?}", e)));
+                return Err(TransportError::config_error(
+                    "initialize_pool",
+                    format!("Failed to create connection: {:?}", e),
+                ));
             }
-            
+
             // Add to available queue
             if let Err(e) = self.available_connections.push(connection_id) {
-                return Err(TransportError::config_error("initialize_pool", format!("Failed to add available connection: {:?}", e)));
+                return Err(TransportError::config_error(
+                    "initialize_pool",
+                    format!("Failed to add available connection: {:?}", e),
+                ));
             }
-            
+
             // Update statistics
             self.stats.total_connections.fetch_add(1, Ordering::Relaxed);
-            self.stats.available_connections.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .available_connections
+                .fetch_add(1, Ordering::Relaxed);
             self.stats.create_operations.fetch_add(1, Ordering::Relaxed);
-            
+
             // Send creation event
-            let _ = self.event_broadcaster.send(PoolEvent::ConnectionCreated { connection_id });
+            let _ = self
+                .event_broadcaster
+                .send(PoolEvent::ConnectionCreated { connection_id });
         }
-        
-        tracing::info!("[PERF] Connection pool initialization completed - initial connections: {}", self.initial_size);
+
+        tracing::info!(
+            "[PERF] Connection pool initialization completed - initial connections: {}",
+            self.initial_size
+        );
         Ok(self)
     }
-    
+
     /// [PERF] Compatibility method - with_lockfree_optimization (for benchmarking)
     pub fn with_lockfree_optimization(self) -> Self {
         // LockFree optimization is enabled by default, this method is for compatibility only
@@ -302,7 +319,7 @@ impl ConnectionPool {
     /// [PERF] High-performance connection acquisition (LockFree)
     pub fn get_connection(&self) -> Result<ConnectionId, TransportError> {
         let start_time = Instant::now();
-        
+
         // Try to get connection from available queue
         if let Some(connection_id) = self.available_connections.pop() {
             // Update connection state to in use
@@ -310,30 +327,46 @@ impl ConnectionPool {
                 connection.state = ConnectionState::InUse;
                 connection.last_used = Instant::now();
                 connection.use_count += 1;
-                
+
                 // Update connection to storage (LockFree)
                 let _ = self.active_connections.insert(connection_id, connection);
-                
+
                 // Update statistics
                 self.stats.get_operations.fetch_add(1, Ordering::Relaxed);
-                self.stats.available_connections.fetch_sub(1, Ordering::Relaxed);
-                self.stats.active_connections.fetch_add(1, Ordering::Relaxed);
-                
+                self.stats
+                    .available_connections
+                    .fetch_sub(1, Ordering::Relaxed);
+                self.stats
+                    .active_connections
+                    .fetch_add(1, Ordering::Relaxed);
+
                 let wait_time = start_time.elapsed().as_nanos() as u64;
-                self.stats.total_wait_time_ns.fetch_add(wait_time, Ordering::Relaxed);
+                self.stats
+                    .total_wait_time_ns
+                    .fetch_add(wait_time, Ordering::Relaxed);
                 self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
-                
+
                 // Send acquisition event
-                let _ = self.event_broadcaster.send(PoolEvent::ConnectionAcquired { connection_id });
-                
-                tracing::debug!("[PERF] Get connection: {:?}, wait time: {:?}", connection_id, start_time.elapsed());
+                let _ = self
+                    .event_broadcaster
+                    .send(PoolEvent::ConnectionAcquired { connection_id });
+
+                tracing::debug!(
+                    "[PERF] Get connection: {:?}, wait time: {:?}",
+                    connection_id,
+                    start_time.elapsed()
+                );
                 return Ok(connection_id);
             }
         }
-        
-        Err(TransportError::resource_error("connection_pool", 0, self.max_size))
+
+        Err(TransportError::resource_error(
+            "connection_pool",
+            0,
+            self.max_size,
+        ))
     }
-    
+
     /// [PERF] High-performance connection return (LockFree)
     pub fn return_connection(&self, connection_id: ConnectionId) -> Result<(), TransportError> {
         // Check if connection exists
@@ -341,35 +374,47 @@ impl ConnectionPool {
             // Update connection state to available
             connection.state = ConnectionState::Available;
             connection.last_used = Instant::now();
-            
+
             // Update connection to storage (LockFree)
             let _ = self.active_connections.insert(connection_id, connection);
-            
+
             // Add back to available queue
             if let Err(e) = self.available_connections.push(connection_id) {
-                return Err(TransportError::config_error("return_connection", format!("Failed to return connection: {:?}", e)));
+                return Err(TransportError::config_error(
+                    "return_connection",
+                    format!("Failed to return connection: {:?}", e),
+                ));
             }
-            
+
             // Update statistics
             self.stats.return_operations.fetch_add(1, Ordering::Relaxed);
-            self.stats.available_connections.fetch_add(1, Ordering::Relaxed);
-            self.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
-            
+            self.stats
+                .available_connections
+                .fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .active_connections
+                .fetch_sub(1, Ordering::Relaxed);
+
             // Send return event
-            let _ = self.event_broadcaster.send(PoolEvent::ConnectionReleased { connection_id });
-            
+            let _ = self
+                .event_broadcaster
+                .send(PoolEvent::ConnectionReleased { connection_id });
+
             tracing::debug!("[PERF] Return connection: {:?}", connection_id);
             Ok(())
         } else {
-            Err(TransportError::config_error("return_connection", format!("Connection not found: {:?}", connection_id)))
+            Err(TransportError::config_error(
+                "return_connection",
+                format!("Connection not found: {:?}", connection_id),
+            ))
         }
     }
-    
+
     /// [PERF] Get current utilization (LockFree)
     pub fn utilization(&self) -> f64 {
         let total = self.stats.total_connections.load(Ordering::Relaxed) as f64;
         let available = self.stats.available_connections.load(Ordering::Relaxed) as f64;
-        
+
         if total == 0.0 {
             0.0
         } else {
@@ -382,36 +427,37 @@ impl ConnectionPool {
         // Get current statistics
         let current_total = self.stats.total_connections.load(Ordering::Relaxed) as usize;
         let available_count = self.stats.available_connections.load(Ordering::Relaxed) as usize;
-        
+
         // Calculate utilization
         let utilization = if current_total > 0 {
             (current_total - available_count) as f64 / current_total as f64
         } else {
             0.0
         };
-        
+
         // Check if expansion is needed
         if utilization < self.expansion_strategy.expansion_threshold {
             return Ok(false); // No expansion needed
         }
-        
+
         // Get current expansion factor
         let factor = self.get_current_expansion_factor();
         let new_size = ((current_total as f64) * factor) as usize;
-        
+
         // Check if exceeding maximum limit
         if new_size > self.max_size {
             return Err(TransportError::resource_error(
-                "connection_pool_expansion", 
-                new_size, 
-                self.max_size
+                "connection_pool_expansion",
+                new_size,
+                self.max_size,
             ));
         }
-        
+
         // Create new connections
         let connections_to_create = new_size - current_total;
         for _ in 0..connections_to_create {
-            let connection_id = ConnectionId::new(self.connection_id_counter.fetch_add(1, Ordering::Relaxed));
+            let connection_id =
+                ConnectionId::new(self.connection_id_counter.fetch_add(1, Ordering::Relaxed));
             let connection = PoolConnection {
                 id: connection_id,
                 session_id: None,
@@ -420,44 +466,50 @@ impl ConnectionPool {
                 use_count: 0,
                 state: ConnectionState::Available,
             };
-            
+
             // LockFree store connection
             if let Err(e) = self.active_connections.insert(connection_id, connection) {
                 tracing::error!("[ERROR] Failed to create connection: {:?}", e);
                 continue;
             }
-            
+
             // Add to available queue
             if let Err(e) = self.available_connections.push(connection_id) {
                 tracing::error!("[ERROR] Failed to add available connection: {:?}", e);
                 continue;
             }
-            
+
             // Update statistics
             self.stats.total_connections.fetch_add(1, Ordering::Relaxed);
-            self.stats.available_connections.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .available_connections
+                .fetch_add(1, Ordering::Relaxed);
             self.stats.create_operations.fetch_add(1, Ordering::Relaxed);
-            
+
             // Send creation event
-            let _ = self.event_broadcaster.send(PoolEvent::ConnectionCreated { connection_id });
+            let _ = self
+                .event_broadcaster
+                .send(PoolEvent::ConnectionCreated { connection_id });
         }
-        
+
         // Update expansion factor index
         self.advance_expansion_factor();
-        
+
         // Record performance metrics
-        self.monitor.record_expansion(current_total, new_size, factor).await;
-        
+        self.monitor
+            .record_expansion(current_total, new_size, factor)
+            .await;
+
         // Send expansion event
-        let _ = self.event_broadcaster.send(PoolEvent::PoolExpanded { 
-            from_size: current_total, 
-            to_size: new_size 
+        let _ = self.event_broadcaster.send(PoolEvent::PoolExpanded {
+            from_size: current_total,
+            to_size: new_size,
         });
-        
+
         tracing::info!(
-            "[PERF] Connection pool expanded: {} -> {} (factor: {:.1}x), utilization: {:.1}%", 
-            current_total, 
-            new_size, 
+            "[PERF] Connection pool expanded: {} -> {} (factor: {:.1}x), utilization: {:.1}%",
+            current_total,
+            new_size,
             factor,
             utilization * 100.0
         );
@@ -475,19 +527,19 @@ impl ConnectionPool {
         // Temporarily set expansion threshold to 0, force expansion
         let original_threshold = self.expansion_strategy.expansion_threshold;
         self.expansion_strategy.expansion_threshold = 0.0;
-        
+
         let result = self.smart_expand().await;
-        
+
         // Restore original threshold
         self.expansion_strategy.expansion_threshold = original_threshold;
-        
+
         result
     }
 
     /// [PERF] Intelligent shrink decision (based on LockFree statistics)
     pub async fn try_shrink(&mut self) -> Result<bool, TransportError> {
         let utilization = self.utilization();
-        
+
         // Check if shrink is needed
         if utilization > self.expansion_strategy.shrink_threshold {
             return Ok(false);
@@ -496,7 +548,7 @@ impl ConnectionPool {
         // Get current statistics
         let current_total = self.stats.total_connections.load(Ordering::Relaxed) as usize;
         let available_count = self.stats.available_connections.load(Ordering::Relaxed) as usize;
-        
+
         // Maintain minimum size
         let min_size = self.initial_size;
         if current_total <= min_size {
@@ -505,10 +557,7 @@ impl ConnectionPool {
 
         // Progressive shrink (reverse factor)
         let shrink_factor = 0.8; // Shrink to 80%
-        let new_size = std::cmp::max(
-            ((current_total as f64) * shrink_factor) as usize,
-            min_size
-        );
+        let new_size = std::cmp::max(((current_total as f64) * shrink_factor) as usize, min_size);
 
         if new_size >= current_total {
             return Ok(false);
@@ -517,7 +566,7 @@ impl ConnectionPool {
         // Calculate connections to remove
         let connections_to_remove = current_total - new_size;
         let mut removed_count = 0;
-        
+
         // Only remove available connections
         for _ in 0..std::cmp::min(connections_to_remove, available_count) {
             if let Some(connection_id) = self.available_connections.pop() {
@@ -526,33 +575,39 @@ impl ConnectionPool {
                     tracing::warn!("[WARNING] Failed to remove connection: {:?}", e);
                     continue;
                 }
-                
+
                 // Update statistics
                 self.stats.total_connections.fetch_sub(1, Ordering::Relaxed);
-                self.stats.available_connections.fetch_sub(1, Ordering::Relaxed);
+                self.stats
+                    .available_connections
+                    .fetch_sub(1, Ordering::Relaxed);
                 self.stats.remove_operations.fetch_add(1, Ordering::Relaxed);
-                
+
                 // Send removal event
-                let _ = self.event_broadcaster.send(PoolEvent::ConnectionRemoved { connection_id });
-                
+                let _ = self
+                    .event_broadcaster
+                    .send(PoolEvent::ConnectionRemoved { connection_id });
+
                 removed_count += 1;
             }
         }
-        
+
         let final_size = current_total - removed_count;
-        
+
         // Record performance metrics
-        self.monitor.record_shrink(current_total, final_size, shrink_factor).await;
+        self.monitor
+            .record_shrink(current_total, final_size, shrink_factor)
+            .await;
 
         // Send shrink event
-        let _ = self.event_broadcaster.send(PoolEvent::PoolShrunk { 
-            from_size: current_total, 
-            to_size: final_size 
+        let _ = self.event_broadcaster.send(PoolEvent::PoolShrunk {
+            from_size: current_total,
+            to_size: final_size,
         });
 
         tracing::info!(
-            "[PERF] Connection pool shrunk: {} -> {} (removed {} connections, utilization: {:.1}%)", 
-            current_total, 
+            "[PERF] Connection pool shrunk: {} -> {} (removed {} connections, utilization: {:.1}%)",
+            current_total,
             final_size,
             removed_count,
             utilization * 100.0
@@ -564,15 +619,16 @@ impl ConnectionPool {
     /// Get current expansion factor
     fn get_current_expansion_factor(&self) -> f64 {
         let index = std::cmp::min(
-            self.expansion_strategy.current_factor_index, 
-            self.expansion_strategy.factors.len() - 1
+            self.expansion_strategy.current_factor_index,
+            self.expansion_strategy.factors.len() - 1,
         );
         self.expansion_strategy.factors[index]
     }
 
     /// Advance expansion factor index
     fn advance_expansion_factor(&mut self) {
-        if self.expansion_strategy.current_factor_index < self.expansion_strategy.factors.len() - 1 {
+        if self.expansion_strategy.current_factor_index < self.expansion_strategy.factors.len() - 1
+        {
             self.expansion_strategy.current_factor_index += 1;
         }
     }
@@ -580,7 +636,7 @@ impl ConnectionPool {
     /// [PERF] Get detailed status (based on LockFree architecture)
     pub async fn detailed_status(&self) -> PoolDetailedStatus {
         let stats = self.stats.snapshot();
-        
+
         PoolDetailedStatus {
             current_size: stats.total_connections as usize,
             max_size: self.max_size,
@@ -590,7 +646,9 @@ impl ConnectionPool {
             current_expansion_factor: self.get_current_expansion_factor(),
             avg_utilization: if stats.total_operations > 0 {
                 stats.active_connections as f64 / stats.total_connections as f64
-            } else { 0.0 },
+            } else {
+                0.0
+            },
             memory_pool_status: OptimizedMemoryStatsSnapshot {
                 small_get_operations: 0,
                 medium_get_operations: 0,
@@ -613,7 +671,7 @@ impl ConnectionPool {
             },
         }
     }
-    
+
     /// [PERF] Get performance statistics
     pub fn get_performance_stats(&self) -> OptimizedPoolStatsSnapshot {
         self.stats.snapshot()
@@ -691,9 +749,9 @@ struct ShrinkEvent {
 #[derive(Debug, Clone)]
 pub struct PerformanceMetrics {
     pub avg_expansion_factor: f64,
-    pub expansion_frequency: f64,  // Expansions per hour
-    pub shrink_frequency: f64,     // Shrinks per hour
-    pub memory_efficiency: f64,    // Memory usage efficiency
+    pub expansion_frequency: f64, // Expansions per hour
+    pub shrink_frequency: f64,    // Shrinks per hour
+    pub memory_efficiency: f64,   // Memory usage efficiency
 }
 
 impl PerformanceMonitor {
@@ -717,7 +775,7 @@ impl PerformanceMonitor {
         {
             let mut events = self.expansion_events.write().await;
             events.push_back(event);
-            
+
             // Keep last 1000 events
             if events.len() > 1000 {
                 events.pop_front();
@@ -740,7 +798,7 @@ impl PerformanceMonitor {
         {
             let mut events = self.shrink_events.write().await;
             events.push_back(event);
-            
+
             // Keep last 1000 events
             if events.len() > 1000 {
                 events.pop_front();
@@ -765,12 +823,12 @@ impl PerformanceMonitor {
 
         // Calculate frequency (based on recent 1 hour)
         let one_hour_ago = Instant::now() - Duration::from_secs(3600);
-        
+
         let recent_expansions = expansion_events
             .iter()
             .filter(|e| e.timestamp > one_hour_ago)
             .count() as f64;
-            
+
         let recent_shrinks = shrink_events
             .iter()
             .filter(|e| e.timestamp > one_hour_ago)
@@ -798,4 +856,4 @@ impl Default for PerformanceMetrics {
             memory_efficiency: 1.0,
         }
     }
-} 
+}

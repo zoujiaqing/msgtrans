@@ -1,22 +1,21 @@
 use async_trait::async_trait;
-use tokio_tungstenite::{MaybeTlsStream,
-    tungstenite::{protocol::Message, Error as TungsteniteError, error},
-    WebSocketStream,
-    accept_async, connect_async,
-};
-use tokio::net::{TcpListener, TcpStream};
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc};
+use tokio_tungstenite::{
+    accept_async, connect_async,
+    tungstenite::{error, protocol::Message, Error as TungsteniteError},
+    MaybeTlsStream, WebSocketStream,
+};
 
 use crate::{
-    SessionId,
+    command::ConnectionState,
     error::TransportError,
+    event::TransportEvent,
     packet::Packet,
     protocol::{AdapterStats, ProtocolAdapter, ProtocolConfig},
-    event::TransportEvent,
-    ConnectionInfo,
-    command::ConnectionState,
+    ConnectionInfo, SessionId,
 };
 
 /// WebSocket message processing result
@@ -35,16 +34,16 @@ enum MessageProcessResult {
 pub enum WebSocketError {
     #[error("Tungstenite error: {0}")]
     Tungstenite(#[from] TungsteniteError),
-    
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    
+
     #[error("Connection closed")]
     ConnectionClosed,
-    
+
     #[error("Invalid message type")]
     InvalidMessageType,
-    
+
     #[error("Configuration error: {0}")]
     Config(String),
 }
@@ -52,10 +51,18 @@ pub enum WebSocketError {
 impl From<WebSocketError> for TransportError {
     fn from(error: WebSocketError) -> Self {
         match error {
-            WebSocketError::Tungstenite(e) => TransportError::connection_error(format!("WebSocket protocol error: {}", e), true),
-            WebSocketError::Io(e) => TransportError::connection_error(format!("WebSocket IO error: {}", e), true),
-            WebSocketError::ConnectionClosed => TransportError::connection_error("WebSocket connection closed", false),
-            WebSocketError::InvalidMessageType => TransportError::protocol_error("websocket", "Invalid message type"),
+            WebSocketError::Tungstenite(e) => {
+                TransportError::connection_error(format!("WebSocket protocol error: {}", e), true)
+            }
+            WebSocketError::Io(e) => {
+                TransportError::connection_error(format!("WebSocket IO error: {}", e), true)
+            }
+            WebSocketError::ConnectionClosed => {
+                TransportError::connection_error("WebSocket connection closed", false)
+            }
+            WebSocketError::InvalidMessageType => {
+                TransportError::protocol_error("websocket", "Invalid message type")
+            }
             WebSocketError::Config(msg) => TransportError::config_error("websocket", msg),
         }
     }
@@ -85,10 +92,10 @@ pub struct WebSocketAdapter<C> {
 
 impl<C> WebSocketAdapter<C> {
     pub fn new(config: C) -> Self {
-        let (event_sender, _) = broadcast::channel(1000);
+        let (event_sender, _) = broadcast::channel(8192);
         let (send_queue_tx, _) = mpsc::unbounded_channel();
         let (shutdown_tx, _) = mpsc::unbounded_channel();
-        
+
         Self {
             session_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             config,
@@ -101,21 +108,25 @@ impl<C> WebSocketAdapter<C> {
             is_connected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
-    
+
     /// Create adapter with WebSocket stream
-    pub async fn new_with_stream(config: C, stream: WebSocketStream<MaybeTlsStream<TcpStream>>, event_sender: broadcast::Sender<TransportEvent>) -> Result<Self, WebSocketError> {
+    pub async fn new_with_stream(
+        config: C,
+        stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
+        event_sender: broadcast::Sender<TransportEvent>,
+    ) -> Result<Self, WebSocketError> {
         let mut connection_info = ConnectionInfo::default();
         connection_info.protocol = "websocket".to_string();
         connection_info.state = ConnectionState::Connected;
         connection_info.established_at = std::time::SystemTime::now();
-        
+
         let session_id = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let is_connected = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        
+
         // Create communication channels
         let (send_queue_tx, send_queue_rx) = mpsc::unbounded_channel();
         let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel();
-        
+
         // Start event loop
         let event_loop_handle = Self::start_event_loop(
             stream,
@@ -124,8 +135,9 @@ impl<C> WebSocketAdapter<C> {
             send_queue_rx,
             shutdown_rx,
             event_sender.clone(),
-        ).await;
-        
+        )
+        .await;
+
         Ok(Self {
             session_id,
             config,
@@ -138,7 +150,7 @@ impl<C> WebSocketAdapter<C> {
             is_connected,
         })
     }
-    
+
     /// Get event stream receiver
     pub fn subscribe_events(&self) -> broadcast::Receiver<TransportEvent> {
         self.event_sender.subscribe()
@@ -154,13 +166,18 @@ impl<C> WebSocketAdapter<C> {
         event_sender: broadcast::Sender<TransportEvent>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            let current_session_id = SessionId(session_id.load(std::sync::atomic::Ordering::SeqCst));
-            tracing::debug!("[START] WebSocket event loop started (session: {})", current_session_id);
-            
+            let current_session_id =
+                SessionId(session_id.load(std::sync::atomic::Ordering::SeqCst));
+            tracing::debug!(
+                "[START] WebSocket event loop started (session: {})",
+                current_session_id
+            );
+
             loop {
                 // Get current session ID
-                let current_session_id = SessionId(session_id.load(std::sync::atomic::Ordering::SeqCst));
-                
+                let current_session_id =
+                    SessionId(session_id.load(std::sync::atomic::Ordering::SeqCst));
+
                 tokio::select! {
                     // [RECV] Handle incoming data
                     read_result = stream.next() => {
@@ -169,10 +186,10 @@ impl<C> WebSocketAdapter<C> {
                                 match Self::process_websocket_message(message) {
                                     MessageProcessResult::Packet(packet) => {
                                         tracing::debug!("[RECV] WebSocket received packet: {} bytes (session: {})", packet.payload.len(), current_session_id);
-                                        
+
                                         // Send receive event
                                         let event = TransportEvent::MessageReceived(packet);
-                                        
+
                                         if let Err(e) = event_sender.send(event) {
                                             tracing::warn!("[RECV] Failed to send receive event: {:?}", e);
                                         }
@@ -184,7 +201,7 @@ impl<C> WebSocketAdapter<C> {
                                     MessageProcessResult::PeerClosed => {
                                         // Peer closed normally: notify upper layer application that connection is closed for resource cleanup
                                         let close_event = TransportEvent::ConnectionClosed { reason: crate::error::CloseReason::Normal };
-                                        
+
                                         if let Err(e) = event_sender.send(close_event) {
                                             tracing::debug!("[CLOSE] Failed to notify upper layer connection closed: session {} - {:?}", current_session_id, e);
                                         } else {
@@ -197,7 +214,7 @@ impl<C> WebSocketAdapter<C> {
                                         tracing::error!("[ERROR] WebSocket message processing error: {:?} (session: {})", e, current_session_id);
                                         // Message processing error: notify upper layer application of connection error for resource cleanup
                                         let close_event = TransportEvent::ConnectionClosed { reason: crate::error::CloseReason::Error(format!("{:?}", e)) };
-                                        
+
                                         if let Err(e) = event_sender.send(close_event) {
                                             tracing::debug!("[ERROR] Failed to notify upper layer message processing error: session {} - {:?}", current_session_id, e);
                                         } else {
@@ -224,10 +241,10 @@ impl<C> WebSocketAdapter<C> {
                                         crate::error::CloseReason::Error(format!("{:?}", e))
                                     }
                                 };
-                                
+
                                 // Network exception or peer closed: notify upper layer application that connection is closed for resource cleanup
                                 let close_event = TransportEvent::ConnectionClosed { reason };
-                                
+
                                 if let Err(e) = event_sender.send(close_event) {
                                     tracing::debug!("[CLOSE] Failed to notify upper layer connection closed: session {} - {:?}", current_session_id, e);
                                 } else {
@@ -240,7 +257,7 @@ impl<C> WebSocketAdapter<C> {
                                 tracing::debug!("[CLOSE] Peer actively closed WebSocket connection (session: {})", current_session_id);
                                 // Peer actively closed: notify upper layer application that connection is closed for resource cleanup
                                 let close_event = TransportEvent::ConnectionClosed { reason: crate::error::CloseReason::Normal };
-                                
+
                                 if let Err(e) = event_sender.send(close_event) {
                                     tracing::debug!("[CLOSE] Failed to notify upper layer connection closed: session {} - {:?}", current_session_id, e);
                                 } else {
@@ -251,21 +268,21 @@ impl<C> WebSocketAdapter<C> {
                             }
                         }
                     }
-                    
+
                     // [SEND] Handle outgoing data - zero-copy optimization
                     packet = send_queue.recv() => {
                         if let Some(packet) = packet {
                             let serialized_data = packet.to_bytes();
                             // [PERF] Optimization: use into() conversion to avoid extra copy (if possible)
                             let message = Message::Binary(serialized_data.into());
-                            
+
                             match stream.send(message).await {
                                 Ok(_) => {
                                     tracing::debug!("[SEND] WebSocket send successful: {} bytes (session: {})", packet.payload.len(), current_session_id);
-                                    
+
                                     // Send send event
                                     let event = TransportEvent::MessageSent { packet_id: packet.header.message_id };
-                                    
+
                                     if let Err(e) = event_sender.send(event) {
                                         tracing::warn!("[SEND] Failed to send send event: {:?}", e);
                                     }
@@ -274,7 +291,7 @@ impl<C> WebSocketAdapter<C> {
                                     tracing::error!("[ERROR] WebSocket send error: {:?} (session: {})", e, current_session_id);
                                     // Send error: notify upper layer application of connection error for resource cleanup
                                     let close_event = TransportEvent::ConnectionClosed { reason: crate::error::CloseReason::Error(format!("{:?}", e)) };
-                                    
+
                                     if let Err(e) = event_sender.send(close_event) {
                                         tracing::debug!("[ERROR] Failed to notify upper layer send error: session {} - {:?}", current_session_id, e);
                                     } else {
@@ -286,20 +303,20 @@ impl<C> WebSocketAdapter<C> {
                             }
                         }
                     }
-                    
+
                     // [STOP] Handle shutdown signal
                     _ = shutdown_signal.recv() => {
                         tracing::info!("[STOP] Received shutdown signal, stopping WebSocket event loop (session: {})", current_session_id);
                         // Active close: first send WebSocket Close frame, then close connection
                         tracing::debug!("[CLOSE] Send WebSocket Close frame for graceful shutdown");
-                        
+
                         // Send Close frame
                         if let Err(e) = stream.close(None).await {
                             tracing::warn!("[SEND] Failed to send WebSocket Close frame: {:?} (session: {})", e, current_session_id);
                         } else {
                             tracing::debug!("[SEND] WebSocket Close frame sent successfully (session: {})", current_session_id);
                         }
-                        
+
                         // Active close: no need to send close event, because it was initiated by upper layer
                         // Lower layer protocol close has already notified peer, upper layer already knows about the close
                         tracing::debug!("[CLOSE] Active close, not sending close event");
@@ -307,11 +324,14 @@ impl<C> WebSocketAdapter<C> {
                     }
                 }
             }
-            
-            tracing::debug!("[SUCCESS] WebSocket event loop ended (session: {})", current_session_id);
+
+            tracing::debug!(
+                "[SUCCESS] WebSocket event loop ended (session: {})",
+                current_session_id
+            );
         })
     }
-    
+
     /// Process WebSocket message - optimized version
     fn process_websocket_message(message: Message) -> MessageProcessResult {
         match message {
@@ -323,11 +343,14 @@ impl<C> WebSocketAdapter<C> {
                     let packet = Packet::one_way(0, data.clone());
                     return MessageProcessResult::Packet(packet);
                 }
-                
+
                 // Try to parse as complete Packet
                 match Packet::from_bytes(&data) {
                     Ok(packet) => {
-                        tracing::debug!("[RECV] WebSocket packet parsing successful: {} bytes", packet.payload.len());
+                        tracing::debug!(
+                            "[RECV] WebSocket packet parsing successful: {} bytes",
+                            packet.payload.len()
+                        );
                         MessageProcessResult::Packet(packet)
                     }
                     Err(e) => {
@@ -340,7 +363,10 @@ impl<C> WebSocketAdapter<C> {
             }
             Message::Text(text) => {
                 // [SUCCESS] Text message creates data packet directly (usually for debugging)
-                tracing::debug!("[RECV] WebSocket received text message: {} bytes", text.len());
+                tracing::debug!(
+                    "[RECV] WebSocket received text message: {} bytes",
+                    text.len()
+                );
                 let packet = Packet::one_way(0, text.as_bytes());
                 MessageProcessResult::Packet(packet)
             }
@@ -368,49 +394,57 @@ where
 {
     type Config = C;
     type Error = WebSocketError;
-    
+
     async fn send(&mut self, packet: Packet) -> Result<(), Self::Error> {
         // Use send queue instead of direct sending
-        self.send_queue.send(packet).map_err(|_| WebSocketError::ConnectionClosed)?;
+        self.send_queue
+            .send(packet)
+            .map_err(|_| WebSocketError::ConnectionClosed)?;
         Ok(())
     }
-    
+
     async fn close(&mut self) -> Result<(), Self::Error> {
-        let current_session_id = SessionId(self.session_id.load(std::sync::atomic::Ordering::SeqCst));
-        tracing::debug!("[CLOSE] Close WebSocket connection (session: {})", current_session_id);
-        
+        let current_session_id =
+            SessionId(self.session_id.load(std::sync::atomic::Ordering::SeqCst));
+        tracing::debug!(
+            "[CLOSE] Close WebSocket connection (session: {})",
+            current_session_id
+        );
+
         // Send shutdown signal
         let _ = self.shutdown_sender.send(());
-        
+
         // Wait for event loop to end
         if let Some(handle) = self.event_loop_handle.take() {
             let _ = handle.await;
         }
-        
-        self.is_connected.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        self.is_connected
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
-    
+
     fn connection_info(&self) -> ConnectionInfo {
         self.connection_info.clone()
     }
-    
+
     fn is_connected(&self) -> bool {
         self.is_connected.load(std::sync::atomic::Ordering::SeqCst)
     }
-    
+
     fn stats(&self) -> AdapterStats {
         self.stats.clone()
     }
-    
+
     fn session_id(&self) -> SessionId {
         SessionId(self.session_id.load(std::sync::atomic::Ordering::SeqCst))
     }
-    
+
     fn set_session_id(&mut self, session_id: SessionId) {
-        self.session_id.store(session_id.0, std::sync::atomic::Ordering::SeqCst);
+        self.session_id
+            .store(session_id.0, std::sync::atomic::Ordering::SeqCst);
     }
-    
+
     async fn flush(&mut self) -> Result<(), Self::Error> {
         Ok(())
     }
@@ -424,19 +458,24 @@ impl<C> WebSocketServerBuilder<C> {
     pub(crate) fn new() -> Self {
         Self { config: None }
     }
-    
+
     pub(crate) fn config(mut self, config: C) -> Self {
         self.config = Some(config);
         self
     }
-    
+
     pub(crate) fn bind_address(self, _addr: std::net::SocketAddr) -> Self {
         self
     }
-    
+
     pub(crate) async fn build(self) -> Result<WebSocketServer<C>, WebSocketError> {
-        let config = self.config.ok_or_else(|| WebSocketError::Config("Missing WebSocket server config".to_string()))?;
-        Ok(WebSocketServer { config, listener: None })
+        let config = self
+            .config
+            .ok_or_else(|| WebSocketError::Config("Missing WebSocket server config".to_string()))?;
+        Ok(WebSocketServer {
+            config,
+            listener: None,
+        })
     }
 }
 
@@ -452,34 +491,37 @@ impl<C: 'static> WebSocketServer<C> {
     {
         // Create listener if not already created
         if self.listener.is_none() {
-            let bind_addr = if let Some(ws_config) = (&self.config as &dyn std::any::Any).downcast_ref::<crate::protocol::WebSocketServerConfig>() {
+            let bind_addr = if let Some(ws_config) = (&self.config as &dyn std::any::Any)
+                .downcast_ref::<crate::protocol::WebSocketServerConfig>(
+            ) {
                 ws_config.bind_address.to_string()
             } else {
                 "127.0.0.1:8080".parse().unwrap()
             };
-            
+
             let listener = TcpListener::bind(&bind_addr).await?;
             tracing::debug!("[START] WebSocket server listening on: {}", bind_addr);
             self.listener = Some(listener);
         }
-        
+
         if let Some(listener) = &self.listener {
             let (tcp_stream, addr) = listener.accept().await?;
             tracing::debug!("[ACCEPT] WebSocket server accepted connection: {}", addr);
-            
+
             // Perform WebSocket handshake
-            let maybe_tls_stream = MaybeTlsStream::Plain(tcp_stream); let ws_stream = accept_async(maybe_tls_stream).await?;
-            
+            let maybe_tls_stream = MaybeTlsStream::Plain(tcp_stream);
+            let ws_stream = accept_async(maybe_tls_stream).await?;
+
             // Create event sender
-            let (event_sender, _) = broadcast::channel(1000);
-            
+            let (event_sender, _) = broadcast::channel(8192);
+
             // Create WebSocket adapter
             WebSocketAdapter::new_with_stream(self.config.clone(), ws_stream, event_sender).await
         } else {
             Err(WebSocketError::Config("No listener available".to_string()))
         }
     }
-    
+
     pub(crate) fn local_addr(&self) -> Result<std::net::SocketAddr, WebSocketError> {
         if let Some(listener) = &self.listener {
             listener.local_addr().map_err(WebSocketError::Io)
@@ -497,40 +539,44 @@ impl<C> WebSocketClientBuilder<C> {
     pub(crate) fn new() -> Self {
         Self { config: None }
     }
-    
+
     pub(crate) fn config(mut self, config: C) -> Self {
         self.config = Some(config);
         self
     }
-    
+
     pub(crate) fn target_url<S: Into<String>>(self, _url: S) -> Self {
         self
     }
-    
-    pub(crate) async fn connect(self) -> Result<WebSocketAdapter<C>, WebSocketError> 
+
+    pub(crate) async fn connect(self) -> Result<WebSocketAdapter<C>, WebSocketError>
     where
         C: crate::protocol::ProtocolConfig,
     {
-        let config = self.config.ok_or_else(|| WebSocketError::Config("Missing WebSocket client config".to_string()))?;
-        
+        let config = self
+            .config
+            .ok_or_else(|| WebSocketError::Config("Missing WebSocket client config".to_string()))?;
+
         // Get connection URL from configuration
-        let url = if let Some(ws_config) = (&config as &dyn std::any::Any).downcast_ref::<crate::protocol::WebSocketClientConfig>() {
+        let url = if let Some(ws_config) =
+            (&config as &dyn std::any::Any).downcast_ref::<crate::protocol::WebSocketClientConfig>()
+        {
             ws_config.target_url.clone()
         } else {
             "ws://127.0.0.1:8080".to_string()
         };
-        
+
         tracing::debug!("[CONNECT] WebSocket client connecting to: {}", url);
-        
+
         // Connect to WebSocket server
         let (ws_stream, _) = connect_async(&url).await?;
-        
+
         tracing::debug!("[SUCCESS] WebSocket client connected to: {}", url);
-        
+
         // Create event sender
-        let (event_sender, _) = broadcast::channel(1000);
-        
+        let (event_sender, _) = broadcast::channel(8192);
+
         // Create WebSocket adapter
         WebSocketAdapter::new_with_stream(config, ws_stream, event_sender).await
     }
-} 
+}
