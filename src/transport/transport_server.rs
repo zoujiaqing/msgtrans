@@ -2,55 +2,76 @@ use crate::{
     command::TransportStats,
     event::ServerEvent,
     transport::{
-        config::TransportConfig, connection_state::ConnectionStateManager,
+        config::TransportConfig,
+        connection_state::ConnectionStateManager,
         lockfree::LockFreeHashMap,
+        session_actor::{SessionHandle, SessionHandler, DEFAULT_ACTOR_BUFFER_SIZE},
     },
     Packet, SessionId, TransportError,
 };
 /// Server-side transport layer implementation
 ///
-/// Provides multi-protocol server support, managing sessions and connections
+/// Provides multi-protocol server support, managing sessions and connections.
+///
+/// ## Architecture
+///
+/// The server supports two modes:
+/// 1. **Legacy Mode**: Uses broadcast channel for backward compatibility
+/// 2. **Actor Mode**: Uses per-connection actors for high throughput (recommended)
+///
+/// ### Actor Mode Architecture
+/// ```text
+/// Connection → mpsc(bounded) → SessionActor → SessionHandler
+/// ```
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
 /// TransportServer - multi-protocol server
 ///
-/// [TARGET] Design goals:
+/// Design goals:
 /// - Multi-protocol support
 /// - High-concurrency connection management
-/// - Unified event system
+/// - Per-connection actor model (new!)
+/// - Optional legacy event system for backward compatibility
 pub struct TransportServer {
     /// Configuration
     config: TransportConfig,
-    /// [CORE] Session to transport layer mapping (unified using Transport abstraction)
+    /// Session to transport layer mapping
     transports: Arc<LockFreeHashMap<SessionId, Arc<crate::transport::transport::Transport>>>,
+    /// Session handles for actor model
+    session_handles: Arc<LockFreeHashMap<SessionId, SessionHandle>>,
     /// Session ID generator
     session_id_generator: Arc<std::sync::atomic::AtomicU64>,
-    /// Server statistics (using lockfree)
+    /// Server statistics
     stats: Arc<LockFreeHashMap<SessionId, TransportStats>>,
-    /// Event broadcaster
+    /// Event broadcaster (legacy mode)
     event_sender: broadcast::Sender<ServerEvent>,
     /// Whether it's running
     is_running: Arc<std::sync::atomic::AtomicBool>,
-    /// [CONFIG] Protocol configuration - changed to server-specific configuration
+    /// Protocol configuration
     protocol_configs:
         std::collections::HashMap<String, Box<dyn crate::protocol::adapter::DynServerConfig>>,
     /// Connection state manager
     state_manager: ConnectionStateManager,
-    /// [NEW] Request tracker - supports server sending requests to clients
+    /// Request tracker
     request_tracker: Arc<crate::transport::transport::RequestTracker>,
-    /// [NEW] Message ID counter - for automatic message ID generation
+    /// Message ID counter
     message_id_counter: std::sync::atomic::AtomicU32,
+    /// Session handler for actor mode
+    session_handler: Option<Arc<dyn SessionHandler>>,
+    /// Buffer size for actor channels
+    actor_buffer_size: usize,
 }
 
 impl TransportServer {
-    /// Create new TransportServer
+    /// Create new TransportServer (legacy mode)
     pub async fn new(config: TransportConfig) -> Result<Self, TransportError> {
         let (event_sender, _) = broadcast::channel(8192);
 
         Ok(Self {
             config,
             transports: Arc::new(LockFreeHashMap::new()),
+            session_handles: Arc::new(LockFreeHashMap::new()),
             session_id_generator: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             stats: Arc::new(LockFreeHashMap::new()),
             event_sender,
@@ -60,11 +81,13 @@ impl TransportServer {
             request_tracker: Arc::new(
                 crate::transport::transport::RequestTracker::new_with_start_id(10000),
             ),
-            message_id_counter: std::sync::atomic::AtomicU32::new(20000), // Server uses higher ID range
+            message_id_counter: std::sync::atomic::AtomicU32::new(20000),
+            session_handler: None,
+            actor_buffer_size: DEFAULT_ACTOR_BUFFER_SIZE,
         })
     }
 
-    /// [INTERNAL] Internal method: create server with protocol configuration (called by TransportServerBuilder)
+    /// Create server with protocol configuration (legacy mode)
     pub async fn new_with_protocols(
         config: TransportConfig,
         protocol_configs: std::collections::HashMap<
@@ -77,6 +100,7 @@ impl TransportServer {
         Ok(Self {
             config,
             transports: Arc::new(LockFreeHashMap::new()),
+            session_handles: Arc::new(LockFreeHashMap::new()),
             session_id_generator: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             stats: Arc::new(LockFreeHashMap::new()),
             event_sender,
@@ -86,8 +110,46 @@ impl TransportServer {
             request_tracker: Arc::new(
                 crate::transport::transport::RequestTracker::new_with_start_id(10000),
             ),
-            message_id_counter: std::sync::atomic::AtomicU32::new(20000), // Server uses higher ID range
+            message_id_counter: std::sync::atomic::AtomicU32::new(20000),
+            session_handler: None,
+            actor_buffer_size: DEFAULT_ACTOR_BUFFER_SIZE,
         })
+    }
+
+    /// Create server with protocol configuration and handler (actor mode - recommended)
+    pub async fn new_with_protocols_and_handler(
+        config: TransportConfig,
+        protocol_configs: std::collections::HashMap<
+            String,
+            Box<dyn crate::protocol::adapter::DynServerConfig>,
+        >,
+        handler: Arc<dyn SessionHandler>,
+        buffer_size: Option<usize>,
+    ) -> Result<Self, TransportError> {
+        let (event_sender, _) = broadcast::channel(64); // Small buffer, not used in actor mode
+
+        Ok(Self {
+            config,
+            transports: Arc::new(LockFreeHashMap::new()),
+            session_handles: Arc::new(LockFreeHashMap::new()),
+            session_id_generator: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            stats: Arc::new(LockFreeHashMap::new()),
+            event_sender,
+            is_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            protocol_configs,
+            state_manager: ConnectionStateManager::new(),
+            request_tracker: Arc::new(
+                crate::transport::transport::RequestTracker::new_with_start_id(10000),
+            ),
+            message_id_counter: std::sync::atomic::AtomicU32::new(20000),
+            session_handler: Some(handler),
+            actor_buffer_size: buffer_size.unwrap_or(DEFAULT_ACTOR_BUFFER_SIZE),
+        })
+    }
+
+    /// Check if server is using actor mode
+    pub fn is_actor_mode(&self) -> bool {
+        self.session_handler.is_some()
     }
 
     /// [LOCKFREE] Send packet to specified session - lock-free version
@@ -997,6 +1059,9 @@ impl Clone for TransportServer {
             state_manager: self.state_manager.clone(),
             request_tracker: self.request_tracker.clone(),
             message_id_counter: std::sync::atomic::AtomicU32::new(20000), // Re-initialize on clone
+            session_handles: self.session_handles.clone(),
+            session_handler: self.session_handler.clone(),
+            actor_buffer_size: self.actor_buffer_size,
         }
     }
 }

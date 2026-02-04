@@ -272,9 +272,9 @@ impl<C> WebSocketAdapter<C> {
                     // [SEND] Handle outgoing data - zero-copy optimization
                     packet = send_queue.recv() => {
                         if let Some(packet) = packet {
+                            // Use zero-copy serialization
                             let serialized_data = packet.to_bytes();
-                            // [PERF] Optimization: use into() conversion to avoid extra copy (if possible)
-                            let message = Message::Binary(serialized_data.into());
+                            let message = Message::Binary(serialized_data.to_vec());
 
                             match stream.send(message).await {
                                 Ok(_) => {

@@ -473,7 +473,7 @@ async fn run_client(
     tracing::debug!("[Client {}] Disconnected", client_id);
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging - use ERROR level to reduce noise during load testing
     tracing_subscriber::fmt()

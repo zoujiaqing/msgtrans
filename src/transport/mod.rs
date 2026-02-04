@@ -1,3 +1,4 @@
+pub mod client;
 /// [TRANSPORT] High-performance transport layer module
 ///
 /// Provides unified transport abstraction with support for multiple protocols,
@@ -7,7 +8,7 @@
 /// - **Backend Performance**: Lock-free connection pools and optimized memory management
 /// - **Frontend Compatibility**: Unified API with backward compatibility
 /// - **Progressive Enhancement**: Smart components ready for seamless integration
-/// 
+///
 /// ## High-Performance Component Architecture
 /// ```
 /// ┌─────────────────────────────────────────────────────────────┐
@@ -20,42 +21,39 @@
 /// │ Zero Config      │ Ready for Upgrade │ Detailed Monitoring   │
 /// └─────────────────┴───────────────────┴───────────────────────┘
 /// ```
-/// 
+///
 /// ## User Experience
-/// - **Zero Configuration**: `TransportClientBuilder::new().build()` and 
+/// - **Zero Configuration**: `TransportClientBuilder::new().build()` and
 ///   `TransportServerBuilder::new().build()` automatically enable optimizations
 /// - **Full Backward Compatibility**: Existing code works without modification
-/// - **Transparent Performance**: Memory allocation and connection management 
+/// - **Transparent Performance**: Memory allocation and connection management
 ///   automatically use high-performance implementations
-
 pub mod config;
-pub mod pool;
+pub mod connection_state;
 pub mod expert_config;
-pub mod client;
+pub mod pool;
+pub mod request_manager;
 pub mod server;
 pub mod transport;
 pub mod transport_server;
-pub mod connection_state;
-pub mod request_manager;
 
 // [CORE] High-performance components (enabled by default)
+pub mod actor;
+pub mod connection_factory;
 pub mod lockfree;
 pub mod lockfree_connection;
-pub mod connection_factory;
 pub mod memory_pool;
 pub mod protocol_adapter;
-pub mod actor;
+pub mod session_actor;
 
 // [EXPORTS] Re-export core APIs with unified architecture
-pub use transport::Transport;
-pub use transport_server::TransportServer;
 pub use client::{
-    TransportClientBuilder, 
-    TransportClient,
-    ConnectionPoolConfig, RetryConfig, LoadBalancerConfig, CircuitBreakerConfig,
-    ConnectionOptions, ConnectionPriority
+    CircuitBreakerConfig, ConnectionOptions, ConnectionPoolConfig, ConnectionPriority,
+    LoadBalancerConfig, RetryConfig, TransportClient, TransportClientBuilder,
 };
 pub use server::TransportServerBuilder;
+pub use transport::Transport;
+pub use transport_server::TransportServer;
 
 // [CONFIG] Configuration exports
 pub use config::TransportConfig;
@@ -65,63 +63,49 @@ pub use crate::protocol::adapter::ProtocolAdapter as ProtocolAdapterTrait;
 
 // [OPTIMIZED] Optimized component exports with unified naming
 pub use memory_pool::{
-    OptimizedMemoryPool as MemoryPool,
-    OptimizedMemoryStats as MemoryStats, 
-    OptimizedMemoryStatsSnapshot as MemoryStatsSnapshot,
-    MemoryPoolEvent, BufferSize
+    BufferSize, MemoryPoolEvent, OptimizedMemoryPool as MemoryPool,
+    OptimizedMemoryStats as MemoryStats, OptimizedMemoryStatsSnapshot as MemoryStatsSnapshot,
 };
 
 pub use protocol_adapter::{
-    FlumePoweredProtocolAdapter as ProtocolAdapter,
-    LockFreeProtocolStats as ProtocolStats, 
+    create_test_packet, FlumePoweredProtocolAdapter as ProtocolAdapter,
+    LockFreeProtocolStats as ProtocolStats, PerformanceMetrics, ProtocolEvent,
     ProtocolStatsSnapshot,
-    ProtocolEvent, 
-    PerformanceMetrics,
-    create_test_packet
 };
 
 pub use actor::{
+    ActorCommand, ActorEvent, ActorManager, LockFreeActorStats as ActorStats,
     OptimizedActor as Actor,
-    ActorManager, ActorCommand, ActorEvent, 
-    LockFreeActorStats as ActorStats
 };
 
 // [POOL] Connection pool exports
-pub use pool::{
-    ConnectionPool, ExpansionStrategy, PoolDetailedStatus,
-    OptimizedPoolStatsSnapshot
-};
+pub use pool::{ConnectionPool, ExpansionStrategy, OptimizedPoolStatsSnapshot, PoolDetailedStatus};
 
 // [EXPERT] Expert configuration exports
-pub use expert_config::{
-    SmartPoolConfig, PerformanceConfig, ExpertConfig
-};
+pub use expert_config::{ExpertConfig, PerformanceConfig, SmartPoolConfig};
 
 // [BUILDER] Client and server builder exports
 pub use server::{
-    AcceptorConfig, BackpressureStrategy, RateLimiterConfig, ServerMiddleware,
-    ServerOptions, LoggingMiddleware, AuthMiddleware
+    AcceptorConfig, AuthMiddleware, BackpressureStrategy, LoggingMiddleware, RateLimiterConfig,
+    ServerMiddleware, ServerOptions,
 };
 
 // [LOCKFREE] Lock-free core component exports
 pub use lockfree::{
-    LockFreeHashMap, LockFreeQueue, LockFreeCounter,
-    LockFreeStats, QueueStats, CounterStats
+    CounterStats, LockFreeCounter, LockFreeHashMap, LockFreeQueue, LockFreeStats, QueueStats,
 };
 
 // [CONNECTION] Lock-free connection exports
 pub use lockfree_connection::{
-    LockFreeConnection, LockFreeConnectionStats, LockFreeConnectionCommand
+    LockFreeConnection, LockFreeConnectionCommand, LockFreeConnectionStats,
 };
 
 // [STATE] Connection state management exports
-pub use connection_state::{
-    ConnectionState, ConnectionStateManager
-};
+pub use connection_state::{ConnectionState, ConnectionStateManager};
 
+use crate::packet::CompressionType;
 use bytes::Bytes;
 use std::time::Duration;
-use crate::packet::CompressionType;
 
 /// Transport options for customizing send/request behavior
 #[derive(Default, Clone, Debug)]
@@ -143,45 +127,44 @@ impl TransportOptions {
     pub fn new() -> Self {
         Self::default()
     }
-    
+
     /// Set timeout duration
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self
     }
-    
+
     /// Set compression algorithm
     pub fn with_compression(mut self, compression: CompressionType) -> Self {
         self.compression = Some(compression);
         self
     }
-    
+
     /// Set business type
     pub fn with_biz_type(mut self, biz_type: u8) -> Self {
         self.biz_type = Some(biz_type);
         self
     }
-    
+
     /// Set extended header
     pub fn with_ext_header(mut self, ext_header: Bytes) -> Self {
         self.ext_header = Some(ext_header);
         self
     }
-    
+
     /// Set message ID
     pub fn with_message_id(mut self, message_id: u32) -> Self {
         self.message_id = Some(message_id);
         self
     }
-    
-
 }
 
 pub use connection_factory::{
-    ConnectionFactory, 
-    ConnectionResult, 
-    ConnectionConfig,
-    ConnectionMetrics,
+    ConnectionConfig, ConnectionFactory, ConnectionMetrics, ConnectionResult,
 };
 
-
+// [ACTOR] Session actor model exports
+pub use session_actor::{
+    create_session_actor, Responder, SessionActor, SessionHandle, SessionHandler, SessionSender,
+    DEFAULT_ACTOR_BUFFER_SIZE,
+};

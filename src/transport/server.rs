@@ -1,15 +1,9 @@
 /// Server-side transport layer module
-/// 
+///
 /// Provides transport layer API specifically for server-side listening
-
 use std::time::Duration;
 
-use crate::{
-    SessionId,
-    error::TransportError,
-    transport::config::TransportConfig,
-
-};
+use crate::{error::TransportError, transport::config::TransportConfig, SessionId};
 
 // Import new TransportServer
 use super::transport_server::TransportServer;
@@ -93,7 +87,12 @@ pub struct TransportServerBuilder {
     graceful_shutdown: Option<Duration>,
     transport_config: TransportConfig,
     /// Protocol configuration storage - server supports multi-protocol listening
-    protocol_configs: std::collections::HashMap<String, Box<dyn crate::protocol::adapter::DynServerConfig>>,
+    protocol_configs:
+        std::collections::HashMap<String, Box<dyn crate::protocol::adapter::DynServerConfig>>,
+    /// Session handler for actor mode
+    session_handler: Option<std::sync::Arc<dyn super::session_actor::SessionHandler>>,
+    /// Buffer size for actor channels
+    actor_buffer_size: Option<usize>,
 }
 
 impl TransportServerBuilder {
@@ -107,76 +106,112 @@ impl TransportServerBuilder {
             graceful_shutdown: Some(Duration::from_secs(30)),
             transport_config: TransportConfig::default(),
             protocol_configs: std::collections::HashMap::new(),
+            session_handler: None,
+            actor_buffer_size: None,
         }
     }
-    
+
     /// Server-specific: bind timeout
     pub fn bind_timeout(mut self, timeout: Duration) -> Self {
         self.bind_timeout = timeout;
         self
     }
-    
+
     /// Server-specific: maximum connections
     pub fn max_connections(mut self, max: usize) -> Self {
         self.max_connections = max;
         self
     }
-    
+
     /// Server-specific: acceptor thread count
     pub fn acceptor_threads(mut self, threads: usize) -> Self {
         self.acceptor_config.threads = threads;
         self
     }
-    
+
     /// Server-specific: backpressure strategy
     pub fn backpressure_strategy(mut self, strategy: BackpressureStrategy) -> Self {
         self.acceptor_config.backpressure = strategy;
         self
     }
-    
+
     /// Server-specific: rate limiter
     pub fn rate_limiter(mut self, config: RateLimiterConfig) -> Self {
         self.rate_limiter = Some(config);
         self
     }
-    
+
     /// Server-specific: middleware
     pub fn with_middleware<M: ServerMiddleware + 'static>(mut self, middleware: M) -> Self {
         self.middleware_stack.push(Box::new(middleware));
         self
     }
-    
+
     /// Server-specific: graceful shutdown timeout
     pub fn graceful_shutdown(mut self, timeout: Option<Duration>) -> Self {
         self.graceful_shutdown = timeout;
         self
     }
-    
+
     /// Set transport layer base configuration
     pub fn transport_config(mut self, config: TransportConfig) -> Self {
         self.transport_config = config;
         self
     }
-    
+
     /// Unified protocol configuration interface - server supports multi-protocol
-    pub fn with_protocol<T: crate::protocol::adapter::DynServerConfig>(mut self, config: T) -> Self {
+    pub fn with_protocol<T: crate::protocol::adapter::DynServerConfig>(
+        mut self,
+        config: T,
+    ) -> Self {
         let protocol_name = config.protocol_name().to_string();
-        self.protocol_configs.insert(protocol_name, Box::new(config));
+        self.protocol_configs
+            .insert(protocol_name, Box::new(config));
         self
     }
-    
+
+    /// Set session handler for actor mode (recommended for high throughput)
+    ///
+    /// When a handler is set, the server operates in actor mode where each
+    /// connection gets its own dedicated queue and worker task.
+    pub fn with_handler(
+        mut self,
+        handler: std::sync::Arc<dyn super::session_actor::SessionHandler>,
+    ) -> Self {
+        self.session_handler = Some(handler);
+        self
+    }
+
+    /// Set buffer size for actor channels (default: 2048)
+    pub fn actor_buffer_size(mut self, size: usize) -> Self {
+        self.actor_buffer_size = Some(size);
+        self
+    }
+
     /// Build server-side transport layer - returns TransportServer
     pub async fn build(self) -> Result<TransportServer, TransportError> {
-        // Create base configuration and build new TransportServer, pass protocol configurations
         let transport_config = self.transport_config.clone();
         let protocol_configs = self.protocol_configs;
-        
-        let transport_server = super::transport_server::TransportServer::new_with_protocols(
-            transport_config, 
-            protocol_configs
-        ).await?;
-        
-        tracing::info!("[SUCCESS] TransportServer build completed, protocol configurations included");
+
+        let transport_server = if let Some(handler) = self.session_handler {
+            // Actor mode
+            super::transport_server::TransportServer::new_with_protocols_and_handler(
+                transport_config,
+                protocol_configs,
+                handler,
+                self.actor_buffer_size,
+            )
+            .await?
+        } else {
+            // Legacy mode
+            super::transport_server::TransportServer::new_with_protocols(
+                transport_config,
+                protocol_configs,
+            )
+            .await?
+        };
+
+        tracing::info!("[SUCCESS] TransportServer build completed");
         Ok(transport_server)
     }
 }
@@ -197,7 +232,7 @@ enum ServerControlCommand {
 }
 
 /// Hybrid architecture server transport
-/// 
+///
 /// Uses optimized data structures and traditional structured code:
 /// - Lock-free session management (HashMap replacement)
 /// - Crossbeam synchronous control channel (Actor system simplification)
@@ -205,29 +240,29 @@ enum ServerControlCommand {
 pub struct ServerTransport {
     /// Lock-free session management (replacement for Arc<RwLock<HashMap>>)
     sessions: Arc<LockFreeHashMap<SessionId, Transport>>,
-    
+
     /// Crossbeam synchronous control channel (replacement for Tokio)
     control_tx: CrossbeamSender<ServerControlCommand>,
     control_rx: Option<CrossbeamReceiver<ServerControlCommand>>,
-    
+
     // Temporarily removed: unified session manager (with event stream support)
     // session_manager: Arc<SimplifiedSessionManager>,
-    
+
     /// Server instance management (keep Tokio Mutex for low-frequency operations)
     servers: Arc<Mutex<HashMap<String, Box<dyn Server>>>>,
-    
+
     /// Server configuration
     acceptor_config: AcceptorConfig,
     rate_limiter: Option<RateLimiterConfig>,
     middleware_stack: Vec<Box<dyn ServerMiddleware>>,
     graceful_shutdown: Option<Duration>,
-    
+
     /// Protocol configuration - for creating server listeners
     protocol_configs: std::collections::HashMap<String, Box<dyn crate::protocol::adapter::DynProtocolConfig>>,
-    
+
     /// Global Actor manager - shared by all Transport instances
     global_actor_manager: Arc<crate::transport::actor::ActorManager>,
-    
+
     /// Session ID generator
     session_id_generator: Arc<AtomicU64>,
 }
@@ -248,7 +283,7 @@ impl LoggingMiddleware {
             level: tracing::Level::INFO,
         }
     }
-    
+
     pub fn with_level(mut self, level: tracing::Level) -> Self {
         self.level = level;
         self
@@ -259,7 +294,7 @@ impl ServerMiddleware for LoggingMiddleware {
     fn name(&self) -> &'static str {
         "logging"
     }
-    
+
     fn process(&self, session_id: SessionId) -> Result<(), TransportError> {
         match self.level {
             tracing::Level::DEBUG => tracing::debug!("Processing session: {:?}", session_id),
@@ -279,15 +314,11 @@ pub struct AuthMiddleware {
 
 impl AuthMiddleware {
     pub fn new() -> Self {
-        Self {
-            required: true,
-        }
+        Self { required: true }
     }
-    
+
     pub fn optional() -> Self {
-        Self {
-            required: false,
-        }
+        Self { required: false }
     }
 }
 
@@ -295,7 +326,7 @@ impl ServerMiddleware for AuthMiddleware {
     fn name(&self) -> &'static str {
         "auth"
     }
-    
+
     fn process(&self, session_id: SessionId) -> Result<(), TransportError> {
         if self.required {
             tracing::debug!("Authentication check: {:?}", session_id);
@@ -303,4 +334,4 @@ impl ServerMiddleware for AuthMiddleware {
         }
         Ok(())
     }
-} 
+}

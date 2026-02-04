@@ -561,12 +561,19 @@ impl<C> QuicAdapter<C> {
                 }
             });
 
-            // Spawn dedicated WRITE task
+            // Spawn dedicated WRITE task with batching optimization
             let write_session_id = session_id.clone();
             let write_event_sender = event_sender.clone();
             let write_shutdown_flag = shutdown_flag.clone();
             let write_task = tokio::spawn(async move {
                 let mut send_stream = send_stream;
+
+                // Batch write optimization constants
+                const WRITE_BATCH_SIZE: usize = 32;
+
+                // Pre-allocate batch buffer and write buffer
+                let mut batch = Vec::with_capacity(WRITE_BATCH_SIZE);
+                let mut write_buf = bytes::BytesMut::with_capacity(64 * 1024); // 64KB write buffer
 
                 loop {
                     if write_shutdown_flag.load(std::sync::atomic::Ordering::Relaxed) {
@@ -574,66 +581,67 @@ impl<C> QuicAdapter<C> {
                         break;
                     }
 
-                    match send_queue.recv().await {
-                        Some(packet) => {
-                            let current_session_id = SessionId(
-                                write_session_id.load(std::sync::atomic::Ordering::SeqCst),
-                            );
-                            let packet_id = packet.header.message_id;
-                            let data = packet.to_bytes();
-                            let frame_len = data.len() as u32;
-                            let header = frame_len.to_be_bytes();
+                    batch.clear();
 
-                            // Write header + payload
-                            if let Err(e) = send_stream.write_all(&header).await {
-                                tracing::error!(
-                                    "[ERROR] Failed to write frame header: {:?} (session: {})",
-                                    e,
-                                    current_session_id
-                                );
-                                let close_event = TransportEvent::ConnectionClosed {
-                                    reason: crate::error::CloseReason::Error(format!(
-                                        "Write error: {:?}",
-                                        e
-                                    )),
-                                };
-                                let _ = write_event_sender.send(close_event);
-                                break;
-                            }
+                    // Batch receive: collect up to WRITE_BATCH_SIZE packets
+                    let count = send_queue.recv_many(&mut batch, WRITE_BATCH_SIZE).await;
 
-                            if let Err(e) = send_stream.write_all(&data).await {
-                                tracing::error!(
-                                    "[ERROR] Failed to write frame payload: {:?} (session: {})",
-                                    e,
-                                    current_session_id
-                                );
-                                let close_event = TransportEvent::ConnectionClosed {
-                                    reason: crate::error::CloseReason::Error(format!(
-                                        "Write error: {:?}",
-                                        e
-                                    )),
-                                };
-                                let _ = write_event_sender.send(close_event);
-                                break;
-                            }
+                    if count == 0 {
+                        // send_queue closed
+                        tracing::debug!("[CLOSE] Send queue closed");
+                        let _ = send_stream.finish();
+                        break;
+                    }
 
-                            tracing::debug!(
-                                "[SEND] QUIC frame sent: {} bytes (ID: {}, session: {})",
-                                data.len(),
-                                packet_id,
-                                current_session_id
-                            );
+                    let current_session_id =
+                        SessionId(write_session_id.load(std::sync::atomic::Ordering::SeqCst));
 
-                            let event = TransportEvent::MessageSent { packet_id };
-                            if let Err(e) = write_event_sender.send(event) {
-                                tracing::warn!("[SEND] Failed to send sent event: {:?}", e);
-                            }
-                        }
-                        None => {
-                            // send_queue closed
-                            tracing::debug!("[CLOSE] Send queue closed");
-                            let _ = send_stream.finish();
-                            break;
+                    // Batch serialize all packets into write buffer
+                    write_buf.clear();
+                    let mut packet_ids = Vec::with_capacity(count);
+
+                    for packet in batch.drain(..) {
+                        let packet_id = packet.header.message_id;
+                        packet_ids.push(packet_id);
+
+                        // Zero-copy serialization
+                        let data = packet.to_bytes();
+                        let frame_len = data.len() as u32;
+
+                        // Append header + payload to write buffer
+                        write_buf.extend_from_slice(&frame_len.to_be_bytes());
+                        write_buf.extend_from_slice(&data);
+                    }
+
+                    // Single write for entire batch
+                    if let Err(e) = send_stream.write_all(&write_buf).await {
+                        tracing::error!(
+                            "[ERROR] Failed to write batch: {:?} (session: {})",
+                            e,
+                            current_session_id
+                        );
+                        let close_event = TransportEvent::ConnectionClosed {
+                            reason: crate::error::CloseReason::Error(format!(
+                                "Write error: {:?}",
+                                e
+                            )),
+                        };
+                        let _ = write_event_sender.send(close_event);
+                        break;
+                    }
+
+                    tracing::debug!(
+                        "[SEND] QUIC batch sent: {} packets, {} bytes (session: {})",
+                        packet_ids.len(),
+                        write_buf.len(),
+                        current_session_id
+                    );
+
+                    // Send confirmation events for all packets in batch
+                    for packet_id in packet_ids {
+                        let event = TransportEvent::MessageSent { packet_id };
+                        if let Err(e) = write_event_sender.send(event) {
+                            tracing::warn!("[SEND] Failed to send sent event: {:?}", e);
                         }
                     }
                 }

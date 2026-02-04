@@ -3,17 +3,50 @@
 //! Usage:
 //!   cargo run --example load_test_server --release
 //!
-//! This is a minimal echo server optimized for maximum throughput.
-//! It removes all println! statements and unnecessary allocations.
+//! This is an echo server using the Actor model for maximum throughput.
+//! Each connection gets its own dedicated queue and worker task, eliminating
+//! global contention and enabling natural backpressure.
+//!
+//! Architecture:
+//!   Connection → mpsc(bounded) → SessionActor → EchoHandler
+//!
 //! Use with load_test client for benchmarking.
 
+use async_trait::async_trait;
 use msgtrans::{
-    event::ServerEvent, protocol::QuicServerConfig, protocol::TcpServerConfig,
-    protocol::WebSocketServerConfig, tokio, transport::TransportServerBuilder,
+    packet::Packet,
+    protocol::QuicServerConfig,
+    protocol::TcpServerConfig,
+    protocol::WebSocketServerConfig,
+    tokio,
+    transport::{SessionHandler, SessionSender, TransportServerBuilder},
+    SessionId,
 };
 use std::sync::Arc;
 
-#[tokio::main]
+/// Echo handler - implements SessionHandler trait
+///
+/// This is a minimal echo handler that directly echoes back received messages.
+/// No broadcast channel, no global contention, just pure per-connection processing.
+struct EchoHandler;
+
+#[async_trait]
+impl SessionHandler for EchoHandler {
+    async fn on_message(&self, _session_id: SessionId, packet: Packet, sender: SessionSender) {
+        // Echo the payload back using the sender
+        let _ = sender.send_data(packet.payload).await;
+    }
+
+    async fn on_connected(&self, session_id: SessionId) {
+        tracing::debug!("[CONNECT] Session {} connected", session_id);
+    }
+
+    async fn on_disconnected(&self, session_id: SessionId, _reason: msgtrans::error::CloseReason) {
+        tracing::debug!("[DISCONNECT] Session {} disconnected", session_id);
+    }
+}
+
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Minimal logging - only errors
     tracing_subscriber::fmt()
@@ -22,13 +55,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Load Test Server - High-performance Echo Server");
     println!("================================================");
+    println!();
+    println!("Architecture: Connection -> mpsc(4096) -> SessionActor -> Handler");
+    println!();
 
     let tcp_config = TcpServerConfig::new("127.0.0.1:8001")?;
     let websocket_config = WebSocketServerConfig::new("127.0.0.1:8002")?;
     let quic_config = QuicServerConfig::new("127.0.0.1:8003")?;
 
+    // Create echo handler
+    let handler = Arc::new(EchoHandler);
+
+    // Build server with actor mode
     let transport = TransportServerBuilder::new()
         .max_connections(10000)
+        .with_handler(handler) // Enable actor mode
+        .actor_buffer_size(4096) // Buffer size per connection
         .with_protocol(tcp_config)
         .with_protocol(websocket_config)
         .with_protocol(quic_config)
@@ -40,51 +82,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  WebSocket: 127.0.0.1:8002");
     println!("  QUIC:      127.0.0.1:8003");
     println!();
-
-    let transport = Arc::new(transport);
-    let transport_for_serve = transport.clone();
-
-    // Subscribe to events BEFORE serve() to ensure we don't miss any
-    let mut events = transport.subscribe_events();
-
-    // Single dispatcher - handles echo directly without intermediate queue
-    // This avoids the overhead of task spawning and channel communication
-    let transport_clone = transport.clone();
-    let dispatcher_handle = tokio::spawn(async move {
-        while let Ok(event) = events.recv().await {
-            match event {
-                ServerEvent::MessageReceived {
-                    session_id,
-                    context,
-                } => {
-                    // Clone data first before consuming context
-                    let data = context.data.clone();
-                    if context.is_request() {
-                        // Direct respond for requests - this is synchronous and fast
-                        context.respond(data);
-                    } else {
-                        // For one-way messages, spawn a task to avoid blocking the event loop
-                        let transport = transport_clone.clone();
-                        tokio::spawn(async move {
-                            let _ = transport.send(session_id, &data).await;
-                        });
-                    }
-                }
-                _ => {}
-            }
-        }
-    });
-
+    println!("Mode: Actor (per-connection mpsc)");
     println!("Server running... Press Ctrl+C to stop.");
 
-    let server_result = transport_for_serve.serve().await;
-
-    // Cleanup
-    dispatcher_handle.abort();
-
-    if let Err(e) = server_result {
-        eprintln!("Server error: {:?}", e);
-    }
+    // In actor mode, we don't need to subscribe to events or spawn a dispatcher
+    // Each connection has its own actor that calls our handler directly
+    transport.serve().await?;
 
     Ok(())
 }

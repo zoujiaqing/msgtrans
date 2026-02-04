@@ -497,17 +497,18 @@ impl<C> TcpAdapter<C> {
         })
     }
 
-    /// Write packet to stream
+    /// Write packet to stream (zero-copy optimized)
     async fn write_packet_to_stream(
         write_half: &mut tokio::net::tcp::OwnedWriteHalf,
         packet: &Packet,
     ) -> Result<(), TcpError> {
+        // Use zero-copy serialization
         let packet_bytes = packet.to_bytes();
         write_half
             .write_all(&packet_bytes)
             .await
             .map_err(TcpError::Io)?;
-        write_half.flush().await.map_err(TcpError::Io)?;
+        // Note: Flush removed for batching - let TCP Nagle or explicit flush handle it
         Ok(())
     }
 }
