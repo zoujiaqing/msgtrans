@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 /// Lock-free optimization enhancement module - focused on first-stage lock-free optimization
 ///
@@ -10,9 +9,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crossbeam::epoch::{self, Atomic, Owned};
-use crossbeam::utils::CachePadded;
 use crossbeam_channel::{unbounded, Receiver, Sender};
+use dashmap::DashMap;
 
 use crate::error::TransportError;
 
@@ -24,20 +22,10 @@ where
     K: Hash + Eq + Clone + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
 {
-    /// Shard array to reduce contention
-    shards: Vec<CachePadded<LockFreeShard<K, V>>>,
-    /// Number of shards (must be a power of 2)
-    shard_count: usize,
+    /// Concurrent map with internal sharding
+    map: DashMap<K, V>,
     /// Operation statistics
     stats: Arc<LockFreeStats>,
-}
-
-/// Lock-free shard
-struct LockFreeShard<K, V> {
-    /// Atomic pointer to HashMap
-    map: Atomic<HashMap<K, V>>,
-    /// Version number for CAS operations
-    version: AtomicU64,
 }
 
 /// Lock-free statistics
@@ -65,215 +53,69 @@ where
 
     /// Create lock-free hash map with specified capacity
     pub fn with_capacity(shard_count: usize) -> Self {
-        let shard_count = shard_count.next_power_of_two();
-        let mut shards = Vec::with_capacity(shard_count);
-
-        for _ in 0..shard_count {
-            shards.push(CachePadded::new(LockFreeShard {
-                map: Atomic::new(HashMap::new()),
-                version: AtomicU64::new(0),
-            }));
-        }
+        let shard_count = shard_count.max(1).next_power_of_two();
 
         Self {
-            shards,
-            shard_count,
+            map: DashMap::with_shard_amount(shard_count),
             stats: Arc::new(LockFreeStats::new()),
         }
-    }
-
-    /// Get shard index
-    fn shard_index(&self, key: &K) -> usize {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        key.hash(&mut hasher);
-        (hasher.finish() as usize) & (self.shard_count - 1)
     }
 
     /// Wait-free read - core optimization point
     pub fn get(&self, key: &K) -> Option<V> {
         let start = Instant::now();
-        self.stats.reads.fetch_add(1, Ordering::Relaxed);
-
-        let shard_idx = self.shard_index(key);
-        let shard = &self.shards[shard_idx];
-
-        let guard = epoch::pin();
-        let map_ptr = shard.map.load(Ordering::Acquire, &guard);
-
-        let result = if map_ptr.is_null() {
-            None
-        } else {
-            unsafe { map_ptr.as_ref() }.unwrap().get(key).cloned()
-        };
-
-        // Record latency
+        let read_count = self.stats.reads.fetch_add(1, Ordering::Relaxed) + 1;
+        let result = self.map.get(key).map(|v| v.clone());
         let latency = start.elapsed().as_nanos() as u64;
-        self.stats
-            .avg_read_latency_ns
-            .store(latency, Ordering::Relaxed);
+
+        // Maintain a running average instead of storing only the last sample.
+        let mut current = self.stats.avg_read_latency_ns.load(Ordering::Relaxed);
+        loop {
+            let next = if read_count <= 1 {
+                latency
+            } else if latency >= current {
+                current + (latency - current) / read_count
+            } else {
+                current - (current - latency) / read_count
+            };
+            match self.stats.avg_read_latency_ns.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
 
         result
     }
 
-    /// Lock-free write using CAS operations
+    /// Concurrent write
     pub fn insert(&self, key: K, value: V) -> Result<Option<V>, TransportError> {
         self.stats.writes.fetch_add(1, Ordering::Relaxed);
-
-        let shard_idx = self.shard_index(&key);
-        let shard = &self.shards[shard_idx];
-
-        let mut retry_count = 0;
-        const MAX_RETRIES: usize = 100;
-
-        loop {
-            let guard = epoch::pin();
-            let current_ptr = shard.map.load(Ordering::Acquire, &guard);
-
-            // Create new HashMap
-            let mut new_map = if current_ptr.is_null() {
-                HashMap::new()
-            } else {
-                unsafe { current_ptr.as_ref() }.unwrap().clone()
-            };
-
-            let old_value = new_map.insert(key.clone(), value.clone());
-
-            // Attempt CAS update
-            let new_ptr = Owned::new(new_map);
-            match shard.map.compare_exchange_weak(
-                current_ptr,
-                new_ptr,
-                Ordering::Release,
-                Ordering::Relaxed,
-                &guard,
-            ) {
-                Ok(_) => {
-                    // Successfully update version number
-                    shard.version.fetch_add(1, Ordering::Relaxed);
-
-                    // Defer release of old data
-                    if !current_ptr.is_null() {
-                        unsafe {
-                            guard.defer_unchecked(move || {
-                                drop(current_ptr.into_owned());
-                            });
-                        }
-                    }
-
-                    return Ok(old_value);
-                }
-                Err(_) => {
-                    retry_count += 1;
-                    if retry_count >= MAX_RETRIES {
-                        return Err(TransportError::resource_error(
-                            "lockfree_insert",
-                            retry_count,
-                            MAX_RETRIES,
-                        ));
-                    }
-                    self.stats.cas_retries.fetch_add(1, Ordering::Relaxed);
-
-                    // Backoff strategy
-                    if retry_count > 10 {
-                        std::thread::yield_now();
-                    }
-                }
-            }
-        }
+        Ok(self.map.insert(key, value))
     }
 
-    /// Lock-free remove
+    /// Concurrent remove
     pub fn remove(&self, key: &K) -> Result<Option<V>, TransportError> {
         self.stats.writes.fetch_add(1, Ordering::Relaxed);
-
-        let shard_idx = self.shard_index(key);
-        let shard = &self.shards[shard_idx];
-
-        let mut retry_count = 0;
-        const MAX_RETRIES: usize = 100;
-
-        loop {
-            let guard = epoch::pin();
-            let current_ptr = shard.map.load(Ordering::Acquire, &guard);
-
-            if current_ptr.is_null() {
-                return Ok(None);
-            }
-
-            let mut new_map = unsafe { current_ptr.as_ref() }.unwrap().clone();
-            let old_value = new_map.remove(key);
-
-            let new_ptr = Owned::new(new_map);
-            match shard.map.compare_exchange_weak(
-                current_ptr,
-                new_ptr,
-                Ordering::Release,
-                Ordering::Relaxed,
-                &guard,
-            ) {
-                Ok(_) => {
-                    shard.version.fetch_add(1, Ordering::Relaxed);
-
-                    unsafe {
-                        guard.defer_unchecked(move || {
-                            drop(current_ptr.into_owned());
-                        });
-                    }
-
-                    return Ok(old_value);
-                }
-                Err(_) => {
-                    retry_count += 1;
-                    if retry_count >= MAX_RETRIES {
-                        return Err(TransportError::resource_error(
-                            "lockfree_remove",
-                            retry_count,
-                            MAX_RETRIES,
-                        ));
-                    }
-                    self.stats.cas_retries.fetch_add(1, Ordering::Relaxed);
-
-                    if retry_count > 10 {
-                        std::thread::yield_now();
-                    }
-                }
-            }
-        }
+        Ok(self.map.remove(key).map(|(_, v)| v))
     }
 
     /// Get all key-value pairs snapshot for async operations
     pub fn snapshot(&self) -> Result<Vec<(K, V)>, String> {
-        let mut result = Vec::new();
-
-        for shard in &self.shards {
-            let guard = epoch::pin();
-            let map_ptr = shard.map.load(Ordering::Acquire, &guard);
-
-            if !map_ptr.is_null() {
-                let map = unsafe { map_ptr.as_ref() }.unwrap();
-                for (k, v) in map.iter() {
-                    result.push((k.clone(), v.clone()));
-                }
-            }
-        }
-
-        Ok(result)
+        Ok(self
+            .map
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect())
     }
 
     /// Get number of entries
     pub fn len(&self) -> usize {
-        let mut count = 0;
-
-        for shard in &self.shards {
-            let guard = epoch::pin();
-            let map_ptr = shard.map.load(Ordering::Acquire, &guard);
-
-            if !map_ptr.is_null() {
-                count += unsafe { map_ptr.as_ref() }.unwrap().len();
-            }
-        }
-
-        count
+        self.map.len()
     }
 
     /// Check if empty
@@ -283,21 +125,7 @@ where
 
     /// Get all keys for iteration
     pub fn keys(&self) -> Result<Vec<K>, String> {
-        let mut all_keys = Vec::new();
-
-        for shard in &self.shards {
-            let guard = epoch::pin();
-            let map_ptr = shard.map.load(Ordering::Acquire, &guard);
-
-            if !map_ptr.is_null() {
-                let map = unsafe { map_ptr.as_ref() }.unwrap();
-                for key in map.keys() {
-                    all_keys.push(key.clone());
-                }
-            }
-        }
-
-        Ok(all_keys)
+        Ok(self.map.iter().map(|entry| entry.key().clone()).collect())
     }
 
     /// Traverse operation - replacement for RwLock::read().await iter()
@@ -305,16 +133,8 @@ where
     where
         F: FnMut(&K, &V),
     {
-        for shard in &self.shards {
-            let guard = epoch::pin();
-            let map_ptr = shard.map.load(Ordering::Acquire, &guard);
-
-            if !map_ptr.is_null() {
-                let map = unsafe { map_ptr.as_ref() }.unwrap();
-                for (k, v) in map.iter() {
-                    f(k, v);
-                }
-            }
+        for entry in self.map.iter() {
+            f(entry.key(), entry.value());
         }
 
         Ok(())

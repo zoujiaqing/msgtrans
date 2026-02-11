@@ -35,7 +35,13 @@ impl ConnectionStateManager {
     /// Add new connection
     pub fn add_connection(&self, session_id: SessionId) {
         let state = Arc::new(Mutex::new(ConnectionState::Connected));
-        self.states.insert(session_id, state);
+        if let Err(e) = self.states.insert(session_id, state) {
+            tracing::error!(
+                "[ERROR] Failed to insert connection state for session {}: {:?}",
+                session_id,
+                e
+            );
+        }
     }
 
     /// Try to start closing connection
@@ -86,7 +92,13 @@ impl ConnectionStateManager {
 
     /// Remove connection state
     pub fn remove_connection(&self, session_id: SessionId) {
-        self.states.remove(&session_id);
+        if let Err(e) = self.states.remove(&session_id) {
+            tracing::warn!(
+                "[WARN] Failed to remove connection state for session {}: {:?}",
+                session_id,
+                e
+            );
+        }
     }
 
     /// Get all connection states (for debugging)

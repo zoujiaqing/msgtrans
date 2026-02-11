@@ -2,7 +2,6 @@ use crate::{
     command::ConnectionInfo, error::TransportError, event::TransportEvent, packet::Packet,
     Connection, SessionId,
 };
-use crossbeam::channel::{unbounded, Receiver, Sender};
 /// Lock-free connection object - Solves Arc<Mutex<Connection>> lock contention issues
 ///
 /// Design approach:
@@ -13,7 +12,7 @@ use crossbeam::channel::{unbounded, Receiver, Sender};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{broadcast, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 /// Lock-free connection commands
 #[derive(Debug)]
@@ -96,7 +95,7 @@ pub struct LockFreeConnection {
     /// Connection state (atomic operation)
     is_connected: AtomicBool,
     /// Command sender (lock-free)
-    command_tx: Sender<LockFreeConnectionCommand>,
+    command_tx: mpsc::Sender<LockFreeConnectionCommand>,
     /// Event broadcaster
     event_tx: broadcast::Sender<TransportEvent>,
     /// Statistics information (atomic operations)
@@ -117,7 +116,7 @@ impl LockFreeConnection {
         session_id: SessionId,
         buffer_size: usize,
     ) -> (Self, tokio::task::JoinHandle<()>) {
-        let (command_tx, command_rx) = unbounded();
+        let (command_tx, command_rx) = mpsc::channel(buffer_size.max(1));
         let (event_tx, _) = broadcast::channel(buffer_size);
         let stats = Arc::new(LockFreeConnectionStats::new());
 
@@ -163,7 +162,7 @@ impl LockFreeConnection {
     /// Background connection worker - Handles all actual connection operations
     async fn connection_worker(
         mut connection: Box<dyn Connection>,
-        command_rx: Receiver<LockFreeConnectionCommand>,
+        mut command_rx: mpsc::Receiver<LockFreeConnectionCommand>,
         event_tx: broadcast::Sender<TransportEvent>,
         stats: Arc<LockFreeConnectionStats>,
     ) {
@@ -173,7 +172,7 @@ impl LockFreeConnection {
         );
 
         // Process command queue
-        while let Ok(command) = command_rx.recv() {
+        while let Some(command) = command_rx.recv().await {
             stats.update_queue_depth(command_rx.len() as u64);
 
             match command {
@@ -295,6 +294,7 @@ impl LockFreeConnection {
         // Non-blocking send command
         self.command_tx
             .send(command)
+            .await
             .map_err(|_| TransportError::connection_error("Connection closed", false))?;
 
         // Wait for response
@@ -311,6 +311,7 @@ impl LockFreeConnection {
 
         self.command_tx
             .send(command)
+            .await
             .map_err(|_| TransportError::connection_error("Connection closed", false))?;
 
         let result = response_rx
@@ -332,6 +333,7 @@ impl LockFreeConnection {
 
         self.command_tx
             .send(command)
+            .await
             .map_err(|_| TransportError::connection_error("Connection closed", false))?;
 
         response_rx
@@ -371,7 +373,7 @@ impl LockFreeConnection {
 
     /// Get command queue depth
     pub fn queue_depth(&self) -> usize {
-        self.command_tx.len()
+        self.stats.queue_depth.load(Ordering::Relaxed) as usize
     }
 
     /// Check if connection is healthy

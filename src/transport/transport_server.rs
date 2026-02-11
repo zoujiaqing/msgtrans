@@ -391,8 +391,25 @@ impl TransportServer {
         transport.set_connection(connection, session_id).await;
 
         // Insert into transport layer mapping
-        self.transports.insert(session_id, transport.clone());
-        self.stats.insert(session_id, TransportStats::new());
+        if let Err(e) = self.transports.insert(session_id, transport.clone()) {
+            tracing::error!(
+                "[ERROR] Failed to register transport for session {}: {:?}",
+                session_id,
+                e
+            );
+            let _ = transport.disconnect().await;
+            return session_id;
+        }
+        if let Err(e) = self.stats.insert(session_id, TransportStats::new()) {
+            tracing::error!(
+                "[ERROR] Failed to register stats for session {}: {:?}",
+                session_id,
+                e
+            );
+            let _ = self.transports.remove(&session_id);
+            let _ = transport.disconnect().await;
+            return session_id;
+        }
 
         // Register connection state
         self.state_manager.add_connection(session_id);
@@ -483,9 +500,27 @@ impl TransportServer {
 
     /// Remove session
     pub async fn remove_session(&self, session_id: SessionId) -> Result<(), TransportError> {
-        self.transports.remove(&session_id);
-        self.session_handles.remove(&session_id);
-        self.stats.remove(&session_id);
+        if let Err(e) = self.transports.remove(&session_id) {
+            tracing::warn!(
+                "[WARN] Failed to remove transport for session {}: {:?}",
+                session_id,
+                e
+            );
+        }
+        if let Err(e) = self.session_handles.remove(&session_id) {
+            tracing::warn!(
+                "[WARN] Failed to remove session actor handle for session {}: {:?}",
+                session_id,
+                e
+            );
+        }
+        if let Err(e) = self.stats.remove(&session_id) {
+            tracing::warn!(
+                "[WARN] Failed to remove stats for session {}: {:?}",
+                session_id,
+                e
+            );
+        }
         self.state_manager.remove_connection(session_id);
         tracing::info!("[REMOVE] TransportServer removed session: {}", session_id);
         Ok(())
