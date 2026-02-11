@@ -1,24 +1,24 @@
 /// Protocol abstraction layer module
-/// 
+///
 /// Provides abstractions for protocol configuration, adapters, and factories
-
 pub mod adapter;
-pub mod protocol;
 pub mod client_config;
-pub mod server_config;
+pub mod protocol;
 pub mod protocol_adapter;
+pub mod server_config;
 
 // Re-export core types
-pub use adapter::{ProtocolAdapter, AdapterStats};
-pub use protocol::{ProtocolFactory, ProtocolRegistry, BoxFuture, ProtocolSet, StandardProtocols, PluginManager};
+pub use adapter::{AdapterStats, ProtocolAdapter};
+pub use protocol::{
+    BoxFuture, PluginManager, ProtocolFactory, ProtocolRegistry, ProtocolSet, StandardProtocols,
+};
 
 // Re-export configuration types
-pub use client_config::{TcpClientConfig, WebSocketClientConfig, QuicClientConfig, RetryConfig};
-pub use server_config::{TcpServerConfig, WebSocketServerConfig, QuicServerConfig};
+pub use client_config::{QuicClientConfig, RetryConfig, TcpClientConfig, WebSocketClientConfig};
+pub use server_config::{QuicServerConfig, TcpServerConfig, WebSocketServerConfig};
 
 // Re-export adapter configuration
 pub use adapter::{
-    ProtocolConfig, ConfigError, 
-    DynProtocolConfig, DynServerConfig, DynClientConfig,
-    ServerConfig, ClientConfig
-}; 
+    ClientConfig, ConfigError, DynClientConfig, DynProtocolConfig, DynServerConfig, ProtocolConfig,
+    ServerConfig,
+};

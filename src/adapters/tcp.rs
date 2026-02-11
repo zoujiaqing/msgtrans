@@ -68,6 +68,8 @@ const MAX_EXT_HEADER_SIZE: usize = 64 * 1024;
 const MAX_RESYNC_SCAN_DISTANCE: usize = 4096;
 /// Fixed header size
 const FIXED_HEADER_SIZE: usize = 16;
+/// Bound send queue to prevent unbounded memory growth under slow peers.
+const SEND_QUEUE_CAPACITY: usize = 8192;
 
 /// Optimized TCP read buffer with frame resync capability
 ///
@@ -309,7 +311,7 @@ pub struct TcpAdapter<C> {
     /// Connection information
     connection_info: ConnectionInfo,
     /// Send queue
-    send_queue: mpsc::UnboundedSender<Packet>,
+    send_queue: mpsc::Sender<Packet>,
     /// Event sender
     event_sender: broadcast::Sender<TransportEvent>,
     /// Shutdown signal sender
@@ -341,7 +343,7 @@ impl<C> TcpAdapter<C> {
         let session_id = Arc::new(std::sync::atomic::AtomicU64::new(0)); // Temporary ID, will be set later
 
         // Create communication channels
-        let (send_queue_tx, send_queue_rx) = mpsc::unbounded_channel();
+        let (send_queue_tx, send_queue_rx) = mpsc::channel(SEND_QUEUE_CAPACITY);
         let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel();
 
         // Start event loop
@@ -377,7 +379,7 @@ impl<C> TcpAdapter<C> {
     async fn start_event_loop(
         stream: TcpStream,
         session_id: Arc<std::sync::atomic::AtomicU64>,
-        mut send_queue: mpsc::UnboundedReceiver<Packet>,
+        mut send_queue: mpsc::Receiver<Packet>,
         mut shutdown_signal: mpsc::UnboundedReceiver<()>,
         event_sender: broadcast::Sender<TransportEvent>,
     ) -> tokio::task::JoinHandle<()> {
@@ -391,38 +393,19 @@ impl<C> TcpAdapter<C> {
 
             // Split read/write streams
             let (mut read_half, mut write_half) = stream.into_split();
+            // Keep read buffer across iterations to correctly handle sticky/partial packets.
+            let mut read_buffer = OptimizedReadBuffer::new(8192);
 
-            loop {
+            'event_loop: loop {
                 // Get current session ID
                 let current_session_id =
                     SessionId(session_id.load(std::sync::atomic::Ordering::SeqCst));
 
                 tokio::select! {
                     // [RECV] Handle receive data - using optimized buffer method
-                    read_result = async {
-                        let mut temp_buffer = OptimizedReadBuffer::new(8192);
-                        match temp_buffer.fill_from_stream(&mut read_half).await {
-                            Ok(0) => Ok(None), // Connection closed
-                            Ok(_) => {
-                                // Try to parse packet
-                                temp_buffer.try_parse_next_packet()
-                            }
-                            Err(e) => Err(e),
-                        }
-                    } => {
+                    read_result = read_buffer.fill_from_stream(&mut read_half) => {
                         match read_result {
-                            Ok(Some(packet)) => {
-                                tracing::debug!("[RECV] TCP received packet: {} bytes (session: {})", packet.payload.len(), current_session_id);
-                                tracing::debug!("[DETAIL] Packet details: ID={}, type={:?}, payload_len={}", packet.header.message_id, packet.header.packet_type, packet.payload.len());
-
-                                // Send receive event
-                                let event = TransportEvent::MessageReceived(packet);
-
-                                if let Err(e) = event_sender.send(event) {
-                                    tracing::warn!("[RECV] Failed to send receive event: {:?}", e);
-                                }
-                            }
-                            Ok(None) => {
+                            Ok(0) => {
                                 tracing::debug!("[RECV] Peer actively closed TCP connection (session: {})", current_session_id);
                                 // Peer actively closed: notify upper layer that connection is closed for resource cleanup
                                 let close_event = TransportEvent::ConnectionClosed { reason: crate::error::CloseReason::Normal };
@@ -433,6 +416,33 @@ impl<C> TcpAdapter<C> {
                                     tracing::debug!("[NOTIFY] Notified upper layer of connection close: session {}", current_session_id);
                                 }
                                 break;
+                            }
+                            Ok(_) => {
+                                // Parse all complete packets currently in the buffer.
+                                loop {
+                                    match read_buffer.try_parse_next_packet() {
+                                        Ok(Some(packet)) => {
+                                            tracing::debug!("[RECV] TCP received packet: {} bytes (session: {})", packet.payload.len(), current_session_id);
+                                            tracing::debug!("[DETAIL] Packet details: ID={}, type={:?}, payload_len={}", packet.header.message_id, packet.header.packet_type, packet.payload.len());
+
+                                            // Send receive event
+                                            let event = TransportEvent::MessageReceived(packet);
+
+                                            if let Err(e) = event_sender.send(event) {
+                                                tracing::warn!("[RECV] Failed to send receive event: {:?}", e);
+                                            }
+                                        }
+                                        Ok(None) => break,
+                                        Err(e) => {
+                                            tracing::error!("[RECV] TCP parse error: {:?} (session: {})", e, current_session_id);
+                                            let close_event = TransportEvent::ConnectionClosed {
+                                                reason: crate::error::CloseReason::Error(format!("{:?}", e)),
+                                            };
+                                            let _ = event_sender.send(close_event);
+                                            break 'event_loop;
+                                        }
+                                    }
+                                }
                             }
                             Err(e) => {
                                 tracing::error!("[RECV] TCP connection error: {:?} (session: {})", e, current_session_id);
@@ -554,6 +564,7 @@ impl ProtocolAdapter for TcpAdapter<TcpClientConfig> {
         // Send packet through queue, event loop will handle actual sending
         self.send_queue
             .send(packet)
+            .await
             .map_err(|_| TcpError::ConnectionClosed)?;
 
         Ok(())
@@ -627,6 +638,7 @@ impl ProtocolAdapter for TcpAdapter<TcpServerConfig> {
         // Send packet through queue, event loop will handle actual sending
         self.send_queue
             .send(packet)
+            .await
             .map_err(|_| TcpError::ConnectionClosed)?;
 
         Ok(())

@@ -1,9 +1,8 @@
+use serde::{Deserialize, Serialize};
 /// Expert-level configuration - Advanced Builder configuration options
-/// 
+///
 /// Provides fine-grained performance tuning, monitoring and resilience configuration options for advanced users
-
 use std::time::Duration;
-use serde::{Serialize, Deserialize};
 
 use super::pool::ExpansionStrategy;
 use crate::error::TransportError;
@@ -36,8 +35,8 @@ impl Default for SmartPoolConfig {
         Self {
             initial_size: 100,
             max_size: 2000,
-            expansion_threshold: 0.8,   // 80% usage rate triggers expansion
-            shrink_threshold: 0.3,      // 30% usage rate triggers shrinking
+            expansion_threshold: 0.8, // 80% usage rate triggers expansion
+            shrink_threshold: 0.3,    // 30% usage rate triggers shrinking
             expansion_cooldown: Duration::from_secs(30),
             shrink_cooldown: Duration::from_secs(60),
             min_connections: 10,
@@ -62,7 +61,7 @@ impl SmartPoolConfig {
             expansion_factors: vec![2.5, 2.0, 1.5, 1.2, 1.1],
         }
     }
-    
+
     /// Create conservative configuration preset
     pub fn conservative() -> Self {
         Self {
@@ -77,42 +76,63 @@ impl SmartPoolConfig {
             expansion_factors: vec![1.5, 1.3, 1.2, 1.1],
         }
     }
-    
+
     /// Validate configuration validity
     pub fn validate(&self) -> Result<(), TransportError> {
         if self.initial_size == 0 {
-            return Err(TransportError::config_error("smart_pool", "initial_size must be > 0"));
+            return Err(TransportError::config_error(
+                "smart_pool",
+                "initial_size must be > 0",
+            ));
         }
-        
+
         if self.max_size < self.initial_size {
-            return Err(TransportError::config_error("smart_pool", "max_size must be >= initial_size"));
+            return Err(TransportError::config_error(
+                "smart_pool",
+                "max_size must be >= initial_size",
+            ));
         }
-        
+
         if self.expansion_threshold <= 0.0 || self.expansion_threshold >= 1.0 {
-            return Err(TransportError::config_error("smart_pool", "expansion_threshold must be in (0.0, 1.0)"));
+            return Err(TransportError::config_error(
+                "smart_pool",
+                "expansion_threshold must be in (0.0, 1.0)",
+            ));
         }
-        
+
         if self.shrink_threshold <= 0.0 || self.shrink_threshold >= 1.0 {
-            return Err(TransportError::config_error("smart_pool", "shrink_threshold must be in (0.0, 1.0)"));
+            return Err(TransportError::config_error(
+                "smart_pool",
+                "shrink_threshold must be in (0.0, 1.0)",
+            ));
         }
-        
+
         if self.expansion_threshold <= self.shrink_threshold {
-            return Err(TransportError::config_error("smart_pool", "expansion_threshold must be > shrink_threshold"));
+            return Err(TransportError::config_error(
+                "smart_pool",
+                "expansion_threshold must be > shrink_threshold",
+            ));
         }
-        
+
         if self.expansion_factors.is_empty() {
-            return Err(TransportError::config_error("smart_pool", "expansion_factors cannot be empty"));
+            return Err(TransportError::config_error(
+                "smart_pool",
+                "expansion_factors cannot be empty",
+            ));
         }
-        
+
         for factor in &self.expansion_factors {
             if *factor <= 1.0 {
-                return Err(TransportError::config_error("smart_pool", "all expansion_factors must be > 1.0"));
+                return Err(TransportError::config_error(
+                    "smart_pool",
+                    "all expansion_factors must be > 1.0",
+                ));
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Convert to ExpansionStrategy
     pub fn to_expansion_strategy(&self) -> ExpansionStrategy {
         ExpansionStrategy {
@@ -166,7 +186,7 @@ impl PerformanceConfig {
             auto_report_interval: Some(Duration::from_secs(600)), // 10 minutes
         }
     }
-    
+
     /// Create development environment configuration preset
     pub fn development() -> Self {
         Self {
@@ -178,21 +198,30 @@ impl PerformanceConfig {
             auto_report_interval: Some(Duration::from_secs(60)), // 1 minute
         }
     }
-    
+
     /// Validate configuration validity
     pub fn validate(&self) -> Result<(), TransportError> {
         if self.sampling_interval.as_millis() < 10 {
-            return Err(TransportError::config_error("performance", "sampling_interval must be >= 10ms"));
+            return Err(TransportError::config_error(
+                "performance",
+                "sampling_interval must be >= 10ms",
+            ));
         }
-        
+
         if self.monitoring_retention.as_secs() < 60 {
-            return Err(TransportError::config_error("performance", "monitoring_retention must be >= 60 seconds"));
+            return Err(TransportError::config_error(
+                "performance",
+                "monitoring_retention must be >= 60 seconds",
+            ));
         }
-        
+
         if self.metrics_history_size == 0 {
-            return Err(TransportError::config_error("performance", "metrics_history_size must be > 0"));
+            return Err(TransportError::config_error(
+                "performance",
+                "metrics_history_size must be > 0",
+            ));
         }
-        
+
         Ok(())
     }
 }
@@ -220,20 +249,20 @@ impl ExpertConfig {
     pub fn new() -> Self {
         Self::default()
     }
-    
+
     /// Validate all configurations
     pub fn validate(&self) -> Result<(), TransportError> {
         if let Some(ref config) = self.smart_pool {
             config.validate()?;
         }
-        
+
         if let Some(ref config) = self.performance {
             config.validate()?;
         }
-        
+
         Ok(())
     }
-    
+
     /// Check if any expert configuration is enabled
     pub fn has_expert_config(&self) -> bool {
         self.smart_pool.is_some() || self.performance.is_some()

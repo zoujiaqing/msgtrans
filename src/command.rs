@@ -1,5 +1,5 @@
+use crate::{error::TransportError, packet::Packet, SessionId};
 use tokio::sync::oneshot;
-use crate::{SessionId, error::TransportError, packet::Packet};
 
 /// Unified abstraction for transport layer commands
 #[derive(Debug)]
@@ -10,48 +10,48 @@ pub enum TransportCommand {
         packet: Packet,
         response_tx: oneshot::Sender<Result<(), TransportError>>,
     },
-    
+
     /// Close connection
     Close {
         session_id: SessionId,
         response_tx: oneshot::Sender<Result<(), TransportError>>,
     },
-    
+
     /// Configuration update
     Configure {
         config: ConfigUpdate,
         response_tx: oneshot::Sender<Result<(), TransportError>>,
     },
-    
+
     /// Get statistics information
     GetStats {
         response_tx: oneshot::Sender<TransportStats>,
     },
-    
+
     /// Get connection information
     GetConnectionInfo {
         session_id: SessionId,
         response_tx: oneshot::Sender<Result<ConnectionInfo, TransportError>>,
     },
-    
+
     /// Get all active sessions
     GetActiveSessions {
         response_tx: oneshot::Sender<Vec<SessionId>>,
     },
-    
+
     /// Force disconnect session
     ForceDisconnect {
         session_id: SessionId,
         reason: String,
         response_tx: oneshot::Sender<Result<(), TransportError>>,
     },
-    
+
     /// Pause session
     PauseSession {
         session_id: SessionId,
         response_tx: oneshot::Sender<Result<(), TransportError>>,
     },
-    
+
     /// Resume session
     ResumeSession {
         session_id: SessionId,
@@ -116,45 +116,45 @@ impl TransportStats {
     pub fn new() -> Self {
         Default::default()
     }
-    
+
     pub fn update_activity(&mut self) {
         self.last_activity = std::time::SystemTime::now();
     }
-    
+
     pub fn record_packet_sent(&mut self, size: usize) {
         self.packets_sent += 1;
         self.bytes_sent += size as u64;
         self.update_activity();
     }
-    
+
     pub fn record_packet_received(&mut self, size: usize) {
         self.packets_received += 1;
         self.bytes_received += size as u64;
         self.update_activity();
     }
-    
+
     pub fn record_connection_opened(&mut self) {
         self.active_connections += 1;
         self.total_connections += 1;
         self.update_activity();
     }
-    
+
     pub fn record_connection_closed(&mut self) {
         if self.active_connections > 0 {
             self.active_connections -= 1;
         }
         self.update_activity();
     }
-    
+
     pub fn record_error(&mut self) {
         self.errors += 1;
         self.update_activity();
     }
-    
+
     pub fn uptime(&self) -> std::time::Duration {
         self.start_time.elapsed().unwrap_or_default()
     }
-    
+
     pub fn idle_time(&self) -> std::time::Duration {
         self.last_activity.elapsed().unwrap_or_default()
     }
@@ -213,23 +213,23 @@ impl ConnectionInfo {
     pub fn update_activity(&mut self) {
         self.last_activity = std::time::SystemTime::now();
     }
-    
+
     pub fn record_packet_sent(&mut self, size: usize) {
         self.packets_sent += 1;
         self.bytes_sent += size as u64;
         self.update_activity();
     }
-    
+
     pub fn record_packet_received(&mut self, size: usize) {
         self.packets_received += 1;
         self.bytes_received += size as u64;
         self.update_activity();
     }
-    
+
     pub fn connection_duration(&self) -> std::time::Duration {
         self.established_at.elapsed().unwrap_or_default()
     }
-    
+
     pub fn idle_duration(&self) -> std::time::Duration {
         self.last_activity.elapsed().unwrap_or_default()
     }
@@ -266,14 +266,14 @@ impl std::fmt::Display for ConnectionState {
 }
 
 /// Protocol-specific command trait
-/// 
+///
 /// This trait allows each protocol to define its own specific command types
 pub trait ProtocolCommand: Send + std::fmt::Debug + 'static {
     type Response: Send;
-    
+
     /// Convert to generic transport command
     fn into_transport_command(self) -> TransportCommand;
-    
+
     /// Execute command
     fn execute(self) -> impl std::future::Future<Output = Self::Response> + Send;
 }
@@ -283,7 +283,13 @@ pub struct CommandBuilder;
 
 impl CommandBuilder {
     /// Create send command
-    pub fn send(session_id: SessionId, packet: Packet) -> (TransportCommand, oneshot::Receiver<Result<(), TransportError>>) {
+    pub fn send(
+        session_id: SessionId,
+        packet: Packet,
+    ) -> (
+        TransportCommand,
+        oneshot::Receiver<Result<(), TransportError>>,
+    ) {
         let (response_tx, response_rx) = oneshot::channel();
         let command = TransportCommand::Send {
             session_id,
@@ -292,9 +298,14 @@ impl CommandBuilder {
         };
         (command, response_rx)
     }
-    
+
     /// Create close command
-    pub fn close(session_id: SessionId) -> (TransportCommand, oneshot::Receiver<Result<(), TransportError>>) {
+    pub fn close(
+        session_id: SessionId,
+    ) -> (
+        TransportCommand,
+        oneshot::Receiver<Result<(), TransportError>>,
+    ) {
         let (response_tx, response_rx) = oneshot::channel();
         let command = TransportCommand::Close {
             session_id,
@@ -302,16 +313,21 @@ impl CommandBuilder {
         };
         (command, response_rx)
     }
-    
+
     /// Create get statistics command
     pub fn get_stats() -> (TransportCommand, oneshot::Receiver<TransportStats>) {
         let (response_tx, response_rx) = oneshot::channel();
         let command = TransportCommand::GetStats { response_tx };
         (command, response_rx)
     }
-    
+
     /// Create get connection info command
-    pub fn get_connection_info(session_id: SessionId) -> (TransportCommand, oneshot::Receiver<Result<ConnectionInfo, TransportError>>) {
+    pub fn get_connection_info(
+        session_id: SessionId,
+    ) -> (
+        TransportCommand,
+        oneshot::Receiver<Result<ConnectionInfo, TransportError>>,
+    ) {
         let (response_tx, response_rx) = oneshot::channel();
         let command = TransportCommand::GetConnectionInfo {
             session_id,
@@ -319,16 +335,22 @@ impl CommandBuilder {
         };
         (command, response_rx)
     }
-    
+
     /// Create get active sessions command
     pub fn get_active_sessions() -> (TransportCommand, oneshot::Receiver<Vec<SessionId>>) {
         let (response_tx, response_rx) = oneshot::channel();
         let command = TransportCommand::GetActiveSessions { response_tx };
         (command, response_rx)
     }
-    
+
     /// Create force disconnect command
-    pub fn force_disconnect(session_id: SessionId, reason: String) -> (TransportCommand, oneshot::Receiver<Result<(), TransportError>>) {
+    pub fn force_disconnect(
+        session_id: SessionId,
+        reason: String,
+    ) -> (
+        TransportCommand,
+        oneshot::Receiver<Result<(), TransportError>>,
+    ) {
         let (response_tx, response_rx) = oneshot::channel();
         let command = TransportCommand::ForceDisconnect {
             session_id,
@@ -350,41 +372,47 @@ impl CommandExecutor {
         packet: Packet,
     ) -> Result<(), TransportError> {
         let (command, response_rx) = CommandBuilder::send(session_id, packet);
-        
-        command_tx.send(command)
+
+        command_tx
+            .send(command)
             .await
             .map_err(|_| TransportError::connection_error("Channel closed", false))?;
-        
-        response_rx.await
+
+        response_rx
+            .await
             .map_err(|_| TransportError::connection_error("Channel closed", false))?
     }
-    
+
     /// Close connection and wait for result
     pub async fn close_and_wait(
         command_tx: &tokio::sync::mpsc::Sender<TransportCommand>,
         session_id: SessionId,
     ) -> Result<(), TransportError> {
         let (command, response_rx) = CommandBuilder::close(session_id);
-        
-        command_tx.send(command)
+
+        command_tx
+            .send(command)
             .await
             .map_err(|_| TransportError::connection_error("Channel closed", false))?;
-        
-        response_rx.await
+
+        response_rx
+            .await
             .map_err(|_| TransportError::connection_error("Channel closed", false))?
     }
-    
+
     /// Get statistics information
     pub async fn get_stats(
         command_tx: &tokio::sync::mpsc::Sender<TransportCommand>,
     ) -> Result<TransportStats, TransportError> {
         let (command, response_rx) = CommandBuilder::get_stats();
-        
-        command_tx.send(command)
+
+        command_tx
+            .send(command)
             .await
             .map_err(|_| TransportError::connection_error("Channel closed", false))?;
-        
-        response_rx.await
+
+        response_rx
+            .await
             .map_err(|_| TransportError::connection_error("Channel closed", false))
     }
-} 
+}

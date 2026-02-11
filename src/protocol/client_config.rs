@@ -1,18 +1,13 @@
-/// 客户端协议配置
-/// 
-/// 专门用于客户端的协议配置，与服务端配置完全分离
-
-use std::time::Duration;
-use serde::{Serialize, Deserialize};
-use crate::protocol::{ConfigError, ProtocolConfig};
 use crate::protocol::adapter::DynProtocolConfig;
+use crate::protocol::{ConfigError, ProtocolConfig};
+use serde::{Deserialize, Serialize};
+/// 客户端协议配置
+///
+/// 专门用于客户端的协议配置，与服务端配置完全分离
+use std::time::Duration;
 
+use crate::{transport::transport::Transport, SessionId, TransportError};
 use std::sync::Arc;
-use crate::{
-    transport::transport::Transport,
-    SessionId,
-    TransportError,
-};
 
 /// TCP客户端配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,7 +88,7 @@ impl ProtocolConfig for TcpClientConfig {
                 suggestion: "set a positive value".to_string(),
             });
         }
-        
+
         if self.write_buffer_size == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "write_buffer_size".to_string(),
@@ -102,7 +97,7 @@ impl ProtocolConfig for TcpClientConfig {
                 suggestion: "set a positive value".to_string(),
             });
         }
-        
+
         if self.retry_config.max_retries > 100 {
             return Err(ConfigError::InvalidValue {
                 field: "max_retries".to_string(),
@@ -111,14 +106,14 @@ impl ProtocolConfig for TcpClientConfig {
                 suggestion: "use a reasonable value (< 100)".to_string(),
             });
         }
-        
+
         Ok(())
     }
-    
+
     fn default_config() -> Self {
         Self::default()
     }
-    
+
     fn merge(mut self, other: Self) -> Self {
         if other.target_address.port() != 80 {
             self.target_address = other.target_address;
@@ -157,101 +152,101 @@ impl ProtocolConfig for TcpClientConfig {
 impl TcpClientConfig {
     /// 创建新的TCP客户端配置
     pub fn new(target_address: &str) -> Result<Self, ConfigError> {
-        let addr = target_address.parse()
+        let addr = target_address
+            .parse()
             .map_err(|e| ConfigError::InvalidAddress {
                 address: target_address.to_string(),
                 reason: format!("Invalid target address: {}", e),
                 source: Some(Box::new(e)),
             })?;
-        
+
         Ok(Self {
             target_address: addr,
             ..Self::default()
         })
     }
-    
+
     /// 创建默认配置（用于需要默认地址的场景）
     pub fn default_config() -> Self {
         Self::default()
     }
-    
+
     /// 设置目标服务器地址
     pub fn with_target_address<A: Into<std::net::SocketAddr>>(mut self, addr: A) -> Self {
         self.target_address = addr.into();
         self
     }
-    
+
     /// 从字符串设置目标地址
     pub fn with_target_str(mut self, addr: &str) -> Result<Self, ConfigError> {
-        self.target_address = addr.parse()
-            .map_err(|e| ConfigError::InvalidAddress {
-                address: addr.to_string(),
-                reason: format!("Invalid target address: {}", e),
-                source: Some(Box::new(e)),
-            })?;
+        self.target_address = addr.parse().map_err(|e| ConfigError::InvalidAddress {
+            address: addr.to_string(),
+            reason: format!("Invalid target address: {}", e),
+            source: Some(Box::new(e)),
+        })?;
         Ok(self)
     }
-    
+
     /// 设置连接超时时间
     pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = timeout;
         self
     }
-    
+
     /// 设置TCP_NODELAY选项
     pub fn with_nodelay(mut self, nodelay: bool) -> Self {
         self.nodelay = nodelay;
         self
     }
-    
+
     /// 设置keepalive时间
     pub fn with_keepalive(mut self, keepalive: Option<Duration>) -> Self {
         self.keepalive = keepalive;
         self
     }
-    
+
     /// 设置读缓冲区大小
     pub fn with_read_buffer_size(mut self, size: usize) -> Self {
         self.read_buffer_size = size;
         self
     }
-    
+
     /// 设置写缓冲区大小
     pub fn with_write_buffer_size(mut self, size: usize) -> Self {
         self.write_buffer_size = size;
         self
     }
-    
+
     /// 设置读超时时间
     pub fn with_read_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.read_timeout = timeout;
         self
     }
-    
+
     /// 设置写超时时间
     pub fn with_write_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.write_timeout = timeout;
         self
     }
-    
+
     /// 设置重连配置
     pub fn with_retry_config(mut self, config: RetryConfig) -> Self {
         self.retry_config = config;
         self
     }
-    
+
     /// 设置本地绑定地址
     pub fn with_local_bind_address(mut self, addr: Option<std::net::SocketAddr>) -> Self {
         self.local_bind_address = addr;
         self
     }
-    
+
     /// 构建配置（验证并返回）
     pub fn build(self) -> Result<Self, ConfigError> {
         ProtocolConfig::validate(&self)?;
         Ok(self)
     }
-    
+
     /// 高性能客户端预设
     pub fn high_performance(target_address: &str) -> Result<Self, ConfigError> {
         Ok(Self::new(target_address)?
@@ -261,7 +256,7 @@ impl TcpClientConfig {
             .with_connect_timeout(Duration::from_secs(5))
             .with_keepalive(Some(Duration::from_secs(30))))
     }
-    
+
     /// 低延迟客户端预设
     pub fn low_latency(target_address: &str) -> Result<Self, ConfigError> {
         Ok(Self::new(target_address)?
@@ -270,7 +265,7 @@ impl TcpClientConfig {
             .with_write_buffer_size(4096)
             .with_connect_timeout(Duration::from_secs(3)))
     }
-    
+
     /// 可靠连接客户端预设
     pub fn reliable(target_address: &str) -> Result<Self, ConfigError> {
         Ok(Self::new(target_address)?
@@ -338,7 +333,7 @@ impl ProtocolConfig for WebSocketClientConfig {
                 suggestion: "use a valid WebSocket URL".to_string(),
             });
         }
-        
+
         if self.max_frame_size == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "max_frame_size".to_string(),
@@ -347,7 +342,7 @@ impl ProtocolConfig for WebSocketClientConfig {
                 suggestion: "set a positive value".to_string(),
             });
         }
-        
+
         if self.max_message_size == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "max_message_size".to_string(),
@@ -356,14 +351,14 @@ impl ProtocolConfig for WebSocketClientConfig {
                 suggestion: "set a positive value".to_string(),
             });
         }
-        
+
         Ok(())
     }
-    
+
     fn default_config() -> Self {
         Self::default()
     }
-    
+
     fn merge(mut self, other: Self) -> Self {
         if other.target_url != "ws://localhost:80/" {
             self.target_url = other.target_url;
@@ -410,102 +405,102 @@ impl WebSocketClientConfig {
                 suggestion: "use a valid WebSocket URL like 'ws://127.0.0.1:8080/path'".to_string(),
             });
         }
-        
+
         Ok(Self {
             target_url: target_url.to_string(),
             ..Self::default()
         })
     }
-    
+
     /// 创建默认配置（用于需要默认URL的场景）
     pub fn default_config() -> Self {
         Self::default()
     }
-    
+
     /// 设置目标URL
     pub fn with_target_url<S: Into<String>>(mut self, url: S) -> Self {
         self.target_url = url.into();
         self
     }
-    
+
     /// 设置连接超时时间
     pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = timeout;
         self
     }
-    
+
     /// 添加请求头
     pub fn with_header<K: Into<String>, V: Into<String>>(mut self, key: K, value: V) -> Self {
         self.headers.insert(key.into(), value.into());
         self
     }
-    
+
     /// 设置所有请求头
     pub fn with_headers(mut self, headers: std::collections::HashMap<String, String>) -> Self {
         self.headers = headers;
         self
     }
-    
+
     /// 设置子协议
     pub fn with_subprotocols(mut self, subprotocols: Vec<String>) -> Self {
         self.subprotocols = subprotocols;
         self
     }
-    
+
     /// 设置最大帧大小
     pub fn with_max_frame_size(mut self, size: usize) -> Self {
         self.max_frame_size = size;
         self
     }
-    
+
     /// 设置最大消息大小
     pub fn with_max_message_size(mut self, size: usize) -> Self {
         self.max_message_size = size;
         self
     }
-    
+
     /// 设置ping间隔
     pub fn with_ping_interval(mut self, interval: Option<Duration>) -> Self {
         self.ping_interval = interval;
         self
     }
-    
+
     /// 设置pong超时
     pub fn with_pong_timeout(mut self, timeout: Duration) -> Self {
         self.pong_timeout = timeout;
         self
     }
-    
+
     /// 设置重连配置
     pub fn with_retry_config(mut self, config: RetryConfig) -> Self {
         self.retry_config = config;
         self
     }
-    
+
     /// 设置TLS验证
     pub fn with_verify_tls(mut self, verify: bool) -> Self {
         self.verify_tls = verify;
         self
     }
-    
+
     /// 构建配置（验证并返回）
     pub fn build(self) -> Result<Self, ConfigError> {
         ProtocolConfig::validate(&self)?;
         Ok(self)
     }
-    
+
     /// JSON API客户端预设
     pub fn json_api(target_url: &str) -> Result<Self, ConfigError> {
         let mut headers = std::collections::HashMap::new();
         headers.insert("Content-Type".to_string(), "application/json".to_string());
-        
+
         Ok(Self::new(target_url)?
             .with_headers(headers)
             .with_subprotocols(vec!["json".to_string()])
             .with_max_frame_size(16 * 1024)
             .with_max_message_size(512 * 1024))
     }
-    
+
     /// 实时通信客户端预设
     pub fn realtime(target_url: &str) -> Result<Self, ConfigError> {
         Ok(Self::new(target_url)?
@@ -514,13 +509,13 @@ impl WebSocketClientConfig {
             .with_max_frame_size(8 * 1024)
             .with_connect_timeout(Duration::from_secs(5)))
     }
-    
+
     /// 文件传输客户端预设
     pub fn file_transfer(target_url: &str) -> Result<Self, ConfigError> {
         Ok(Self::new(target_url)?
-            .with_max_frame_size(1024 * 1024)  // 1MB
-            .with_max_message_size(100 * 1024 * 1024)  // 100MB
-            .with_ping_interval(None)  // 禁用ping以减少干扰
+            .with_max_frame_size(1024 * 1024) // 1MB
+            .with_max_message_size(100 * 1024 * 1024) // 100MB
+            .with_ping_interval(None) // 禁用ping以减少干扰
             .with_connect_timeout(Duration::from_secs(30)))
     }
 }
@@ -558,7 +553,7 @@ impl Default for QuicClientConfig {
             target_address: "127.0.0.1:443".parse().unwrap(),
             server_name: None,
             connect_timeout: Duration::from_secs(10),
-            verify_certificate: false,  // 默认不验证证书，适合开发环境
+            verify_certificate: false, // 默认不验证证书，适合开发环境
             ca_cert_pem: None,
             max_concurrent_streams: 100,
             max_idle_timeout: Duration::from_secs(30),
@@ -580,14 +575,14 @@ impl ProtocolConfig for QuicClientConfig {
                 suggestion: "set a positive value".to_string(),
             });
         }
-        
+
         Ok(())
     }
-    
+
     fn default_config() -> Self {
         Self::default()
     }
-    
+
     fn merge(mut self, other: Self) -> Self {
         if other.target_address.port() != 443 {
             self.target_address = other.target_address;
@@ -629,107 +624,107 @@ impl ProtocolConfig for QuicClientConfig {
 impl QuicClientConfig {
     /// 创建新的QUIC客户端配置
     pub fn new(target_address: &str) -> Result<Self, ConfigError> {
-        let addr = target_address.parse()
+        let addr = target_address
+            .parse()
             .map_err(|e| ConfigError::InvalidAddress {
                 address: target_address.to_string(),
                 reason: format!("Invalid target address: {}", e),
                 source: Some(Box::new(e)),
             })?;
-        
+
         Ok(Self {
             target_address: addr,
             ..Self::default()
         })
     }
-    
+
     /// 创建默认配置（用于需要默认地址的场景）
     pub fn default_config() -> Self {
         Self::default()
     }
-    
+
     /// 设置目标服务器地址
     pub fn with_target_address<A: Into<std::net::SocketAddr>>(mut self, addr: A) -> Self {
         self.target_address = addr.into();
         self
     }
-    
+
     /// 从字符串设置目标地址
     pub fn with_target_str(mut self, addr: &str) -> Result<Self, ConfigError> {
-        self.target_address = addr.parse()
-            .map_err(|e| ConfigError::InvalidAddress {
-                address: addr.to_string(),
-                reason: format!("Invalid target address: {}", e),
-                source: Some(Box::new(e)),
-            })?;
+        self.target_address = addr.parse().map_err(|e| ConfigError::InvalidAddress {
+            address: addr.to_string(),
+            reason: format!("Invalid target address: {}", e),
+            source: Some(Box::new(e)),
+        })?;
         Ok(self)
     }
-    
+
     /// 设置服务器名称（用于TLS验证）
     pub fn with_server_name<S: Into<String>>(mut self, name: S) -> Self {
         self.server_name = Some(name.into());
         self
     }
-    
+
     /// 设置连接超时时间
     pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = timeout;
         self
     }
-    
+
     /// 设置证书验证
     pub fn with_verify_certificate(mut self, verify: bool) -> Self {
         self.verify_certificate = verify;
         self
     }
-    
+
     /// 设置自定义CA证书
     pub fn with_ca_cert_pem<S: Into<String>>(mut self, cert_pem: S) -> Self {
         self.ca_cert_pem = Some(cert_pem.into());
         self
     }
-    
+
     /// 设置最大并发流数
     pub fn with_max_concurrent_streams(mut self, count: u64) -> Self {
         self.max_concurrent_streams = count;
         self
     }
-    
+
     /// 设置最大空闲时间
     pub fn with_max_idle_timeout(mut self, timeout: Duration) -> Self {
         self.max_idle_timeout = timeout;
         self
     }
-    
+
     /// 设置keepalive间隔
     pub fn with_keep_alive_interval(mut self, interval: Option<Duration>) -> Self {
         self.keep_alive_interval = interval;
         self
     }
-    
+
     /// 设置初始RTT估值
     pub fn with_initial_rtt(mut self, rtt: Duration) -> Self {
         self.initial_rtt = rtt;
         self
     }
-    
+
     /// 设置重连配置
     pub fn with_retry_config(mut self, config: RetryConfig) -> Self {
         self.retry_config = config;
         self
     }
-    
+
     /// 设置本地绑定地址
     pub fn with_local_bind_address(mut self, addr: Option<std::net::SocketAddr>) -> Self {
         self.local_bind_address = addr;
         self
     }
-    
+
     /// 构建配置（验证并返回）
     pub fn build(self) -> Result<Self, ConfigError> {
         ProtocolConfig::validate(&self)?;
         Ok(self)
     }
-    
+
     /// 高性能客户端预设
     pub fn high_performance(target_address: &str) -> Result<Self, ConfigError> {
         Ok(Self::new(target_address)?
@@ -737,7 +732,7 @@ impl QuicClientConfig {
             .with_initial_rtt(Duration::from_millis(20))
             .with_connect_timeout(Duration::from_secs(5)))
     }
-    
+
     /// 低延迟客户端预设
     pub fn low_latency(target_address: &str) -> Result<Self, ConfigError> {
         Ok(Self::new(target_address)?
@@ -745,7 +740,7 @@ impl QuicClientConfig {
             .with_keep_alive_interval(Some(Duration::from_secs(5)))
             .with_max_idle_timeout(Duration::from_secs(10)))
     }
-    
+
     /// 不安全客户端预设（仅用于测试）
     pub fn insecure(target_address: &str) -> Result<Self, ConfigError> {
         Ok(Self::new(target_address)?
@@ -758,15 +753,15 @@ impl DynProtocolConfig for QuicClientConfig {
     fn protocol_name(&self) -> &'static str {
         "quic"
     }
-    
+
     fn validate_dyn(&self) -> Result<(), ConfigError> {
         ProtocolConfig::validate(self)
     }
-    
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
-    
+
     fn clone_dyn(&self) -> Box<dyn DynProtocolConfig> {
         Box::new(self.clone())
     }
@@ -774,17 +769,26 @@ impl DynProtocolConfig for QuicClientConfig {
 
 /// 🔧 新增：实现 WebSocket 客户端专用配置
 impl crate::protocol::adapter::DynClientConfig for WebSocketClientConfig {
-    fn build_connection_dyn(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Box<dyn crate::Connection>, crate::error::TransportError>> + Send + '_>> {
+    fn build_connection_dyn(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<Box<dyn crate::Connection>, crate::error::TransportError>,
+                > + Send
+                + '_,
+        >,
+    > {
         Box::pin(async move {
             let connection = crate::protocol::adapter::ClientConfig::build_connection(self).await?;
             Ok(Box::new(connection) as Box<dyn crate::Connection>)
         })
     }
-    
+
     fn get_target_info(&self) -> String {
         self.target_url.clone()
     }
-    
+
     fn clone_client_dyn(&self) -> Box<dyn crate::protocol::adapter::DynClientConfig> {
         Box::new(self.clone())
     }
@@ -792,17 +796,26 @@ impl crate::protocol::adapter::DynClientConfig for WebSocketClientConfig {
 
 /// 🔧 新增：实现 TCP 客户端专用配置
 impl crate::protocol::adapter::DynClientConfig for TcpClientConfig {
-    fn build_connection_dyn(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Box<dyn crate::Connection>, crate::error::TransportError>> + Send + '_>> {
+    fn build_connection_dyn(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<Box<dyn crate::Connection>, crate::error::TransportError>,
+                > + Send
+                + '_,
+        >,
+    > {
         Box::pin(async move {
             let connection = crate::protocol::adapter::ClientConfig::build_connection(self).await?;
             Ok(Box::new(connection) as Box<dyn crate::Connection>)
         })
     }
-    
+
     fn get_target_info(&self) -> String {
         self.target_address.to_string()
     }
-    
+
     fn clone_client_dyn(&self) -> Box<dyn crate::protocol::adapter::DynClientConfig> {
         Box::new(self.clone())
     }
@@ -810,17 +823,26 @@ impl crate::protocol::adapter::DynClientConfig for TcpClientConfig {
 
 /// 🔧 新增：实现 QUIC 客户端专用配置
 impl crate::protocol::adapter::DynClientConfig for QuicClientConfig {
-    fn build_connection_dyn(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Box<dyn crate::Connection>, crate::error::TransportError>> + Send + '_>> {
+    fn build_connection_dyn(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<Box<dyn crate::Connection>, crate::error::TransportError>,
+                > + Send
+                + '_,
+        >,
+    > {
         Box::pin(async move {
             let connection = crate::protocol::adapter::ClientConfig::build_connection(self).await?;
             Ok(Box::new(connection) as Box<dyn crate::Connection>)
         })
     }
-    
+
     fn get_target_info(&self) -> String {
         self.target_address.to_string()
     }
-    
+
     fn clone_client_dyn(&self) -> Box<dyn crate::protocol::adapter::DynClientConfig> {
         Box::new(self.clone())
     }
@@ -830,15 +852,15 @@ impl DynProtocolConfig for TcpClientConfig {
     fn protocol_name(&self) -> &'static str {
         "tcp"
     }
-    
+
     fn validate_dyn(&self) -> Result<(), ConfigError> {
         ProtocolConfig::validate(self)
     }
-    
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
-    
+
     fn clone_dyn(&self) -> Box<dyn DynProtocolConfig> {
         Box::new(self.clone())
     }
@@ -848,15 +870,15 @@ impl DynProtocolConfig for WebSocketClientConfig {
     fn protocol_name(&self) -> &'static str {
         "websocket"
     }
-    
+
     fn validate_dyn(&self) -> Result<(), ConfigError> {
         ProtocolConfig::validate(self)
     }
-    
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
-    
+
     fn clone_dyn(&self) -> Box<dyn DynProtocolConfig> {
         Box::new(self.clone())
     }
@@ -870,14 +892,20 @@ pub trait ConnectableConfig {
 impl ConnectableConfig for TcpClientConfig {
     async fn connect(self, transport: Arc<Transport>) -> Result<SessionId, TransportError> {
         tracing::info!("🔌 TCP 客户端开始连接到 {}", self.target_address);
-        
+
         let session_id = SessionId(1); // 客户端使用固定 session_id
         let connection = crate::protocol::adapter::ClientConfig::build_connection(&self).await?;
-        
+
         // 将连接设置到 Transport 中
-        transport.set_connection(Box::new(connection), session_id).await;
-        tracing::info!("✅ TCP 客户端连接成功: {} -> 会话ID: {}", self.target_address, session_id);
-        
+        transport
+            .set_connection(Box::new(connection), session_id)
+            .await;
+        tracing::info!(
+            "✅ TCP 客户端连接成功: {} -> 会话ID: {}",
+            self.target_address,
+            session_id
+        );
+
         Ok(session_id)
     }
 }
@@ -885,14 +913,20 @@ impl ConnectableConfig for TcpClientConfig {
 impl ConnectableConfig for WebSocketClientConfig {
     async fn connect(self, transport: Arc<Transport>) -> Result<SessionId, TransportError> {
         tracing::info!("🔌 WebSocket 客户端开始连接到 {}", self.target_url);
-        
+
         let session_id = SessionId(1); // 客户端使用固定 session_id
         let connection = crate::protocol::adapter::ClientConfig::build_connection(&self).await?;
-        
+
         // 将连接设置到 Transport 中
-        transport.set_connection(Box::new(connection), session_id).await;
-        tracing::info!("✅ WebSocket 客户端连接成功: {} -> 会话ID: {}", self.target_url, session_id);
-        
+        transport
+            .set_connection(Box::new(connection), session_id)
+            .await;
+        tracing::info!(
+            "✅ WebSocket 客户端连接成功: {} -> 会话ID: {}",
+            self.target_url,
+            session_id
+        );
+
         Ok(session_id)
     }
 }
@@ -900,14 +934,20 @@ impl ConnectableConfig for WebSocketClientConfig {
 impl ConnectableConfig for QuicClientConfig {
     async fn connect(self, transport: Arc<Transport>) -> Result<SessionId, TransportError> {
         tracing::info!("🔌 QUIC 客户端开始连接到 {}", self.target_address);
-        
+
         let session_id = SessionId(1); // 客户端使用固定 session_id
         let connection = crate::protocol::adapter::ClientConfig::build_connection(&self).await?;
-        
+
         // 将连接设置到 Transport 中
-        transport.set_connection(Box::new(connection), session_id).await;
-        tracing::info!("✅ QUIC 客户端连接成功: {} -> 会话ID: {}", self.target_address, session_id);
-        
+        transport
+            .set_connection(Box::new(connection), session_id)
+            .await;
+        tracing::info!(
+            "✅ QUIC 客户端连接成功: {} -> 会话ID: {}",
+            self.target_address,
+            session_id
+        );
+
         Ok(session_id)
     }
-} 
+}

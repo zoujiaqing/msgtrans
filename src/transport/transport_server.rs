@@ -5,7 +5,9 @@ use crate::{
         config::TransportConfig,
         connection_state::ConnectionStateManager,
         lockfree::LockFreeHashMap,
-        session_actor::{SessionHandle, SessionHandler, DEFAULT_ACTOR_BUFFER_SIZE},
+        session_actor::{
+            create_session_actor, SessionHandle, SessionHandler, DEFAULT_ACTOR_BUFFER_SIZE,
+        },
     },
     Packet, SessionId, TransportError,
 };
@@ -232,7 +234,10 @@ impl TransportServer {
         }
     }
 
-    /// [REQUEST] Send request to specified session and wait for response - using Transport's request method
+    /// [REQUEST] Send request to specified session and wait for response.
+    ///
+    /// Uses TransportServer's own request tracker so responses are matched
+    /// consistently at the server layer.
     pub async fn request_to_session(
         &self,
         session_id: SessionId,
@@ -244,38 +249,47 @@ impl TransportServer {
             packet.header.message_id
         );
 
-        if let Some(transport) = self.transports.get(&session_id) {
-            // [STATUS] Status check - through Transport abstraction
-            if !transport.is_connected().await {
-                tracing::warn!(
-                    "[WARN] Session {} connection closed, cannot send request",
-                    session_id
-                );
-                let _ = self.remove_session(session_id).await;
-                return Err(TransportError::connection_error("Connection closed", false));
-            }
-
-            // [DIRECT] Directly use Transport's request method, it will correctly manage RequestTracker
-            match transport.request(packet).await {
-                Ok(response) => {
-                    tracing::debug!(
-                        "[SUCCESS] Session {} received response (response ID: {})",
-                        session_id,
-                        response.header.message_id
-                    );
-                    Ok(response)
-                }
-                Err(e) => {
-                    tracing::error!("[ERROR] Session {} request failed: {:?}", session_id, e);
-                    Err(e)
-                }
-            }
-        } else {
+        if self.transports.get(&session_id).is_none() {
             tracing::warn!(
                 "[WARN] Session {} does not exist in connection mapping",
                 session_id
             );
-            Err(TransportError::connection_error("Session not found", false))
+            return Err(TransportError::connection_error("Session not found", false));
+        }
+
+        if packet.header.packet_type != crate::packet::PacketType::Request {
+            return Err(TransportError::connection_error(
+                "Not a Request packet",
+                false,
+            ));
+        }
+
+        let message_id = packet.header.message_id;
+        let (_, rx) = self.request_tracker.register_with_id(message_id);
+
+        if let Err(e) = self.send_to_session(session_id, packet).await {
+            self.request_tracker.remove(message_id);
+            tracing::error!("[ERROR] Session {} request send failed: {:?}", session_id, e);
+            return Err(e);
+        }
+
+        match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
+            Ok(Ok(response)) => {
+                tracing::debug!(
+                    "[SUCCESS] Session {} received response (response ID: {})",
+                    session_id,
+                    response.header.message_id
+                );
+                Ok(response)
+            }
+            Ok(Err(_)) => {
+                self.request_tracker.remove(message_id);
+                Err(TransportError::connection_error("Connection closed", false))
+            }
+            Err(_) => {
+                self.request_tracker.remove(message_id);
+                Err(TransportError::connection_error("Request timeout", false))
+            }
         }
     }
 
@@ -383,6 +397,32 @@ impl TransportServer {
         // Register connection state
         self.state_manager.add_connection(session_id);
 
+        // Actor mode: create per-session actor and keep a handle for event forwarding.
+        let actor_handle = if let Some(handler) = &self.session_handler {
+            let (handle, actor) = create_session_actor(
+                session_id,
+                transport.clone(),
+                handler.clone(),
+                self.actor_buffer_size,
+            );
+            match self.session_handles.insert(session_id, handle.clone()) {
+                Ok(_) => {
+                    tokio::spawn(actor.run());
+                    Some(handle)
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "[ERROR] Failed to register session actor handle for {}: {:?}",
+                        session_id,
+                        e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // [LOOP] Start event consumption loop, converting TransportEvent to ServerEvent
         // [FIX] Use the pre-subscribed event receiver to ensure no messages are lost
         if let Some(mut event_receiver) = event_receiver_opt {
@@ -395,9 +435,32 @@ impl TransportServer {
                         session_id,
                         transport_event
                     );
-                    server_clone
-                        .handle_transport_event(session_id, transport_event)
-                        .await;
+                    if let Some(handle) = &actor_handle {
+                        // In actor mode, complete server-side request futures first.
+                        if let crate::event::TransportEvent::MessageReceived(packet) = &transport_event
+                        {
+                            if packet.header.packet_type == crate::packet::PacketType::Response
+                                && server_clone
+                                    .request_tracker
+                                    .complete(packet.header.message_id, packet.clone())
+                            {
+                                continue;
+                            }
+                        }
+
+                        if let Err(e) = handle.send_event(transport_event).await {
+                            tracing::warn!(
+                                "[WARN] Failed to forward event to actor for session {}: {:?}",
+                                session_id,
+                                e
+                            );
+                            break;
+                        }
+                    } else {
+                        server_clone
+                            .handle_transport_event(session_id, transport_event)
+                            .await;
+                    }
                 }
                 tracing::info!(
                     "[END] TransportServer event consumption loop ended for session {}",
@@ -421,6 +484,7 @@ impl TransportServer {
     /// Remove session
     pub async fn remove_session(&self, session_id: SessionId) -> Result<(), TransportError> {
         self.transports.remove(&session_id);
+        self.session_handles.remove(&session_id);
         self.stats.remove(&session_id);
         self.state_manager.remove_connection(session_id);
         tracing::info!("[REMOVE] TransportServer removed session: {}", session_id);

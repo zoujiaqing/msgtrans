@@ -1,10 +1,9 @@
+use crate::SessionId;
 /// Connection state management
-/// 
+///
 /// Used for unified connection closing mechanism, preventing duplicate closing and race conditions
-
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use crate::SessionId;
 
 /// Connection state
 #[derive(Debug, Clone, PartialEq)]
@@ -18,10 +17,11 @@ pub enum ConnectionState {
 }
 
 /// Connection state manager
-/// 
+///
 /// Provides thread-safe state management, preventing duplicate closing
 pub struct ConnectionStateManager {
-    states: Arc<crate::transport::lockfree::LockFreeHashMap<SessionId, Arc<Mutex<ConnectionState>>>>,
+    states:
+        Arc<crate::transport::lockfree::LockFreeHashMap<SessionId, Arc<Mutex<ConnectionState>>>>,
 }
 
 impl ConnectionStateManager {
@@ -31,15 +31,15 @@ impl ConnectionStateManager {
             states: Arc::new(crate::transport::lockfree::LockFreeHashMap::new()),
         }
     }
-    
+
     /// Add new connection
     pub fn add_connection(&self, session_id: SessionId) {
         let state = Arc::new(Mutex::new(ConnectionState::Connected));
         self.states.insert(session_id, state);
     }
-    
+
     /// Try to start closing connection
-    /// 
+    ///
     /// Returns true if closing can be started, false if already closing or closed
     pub async fn try_start_closing(&self, session_id: SessionId) -> bool {
         if let Some(state_lock) = self.states.get(&session_id) {
@@ -55,7 +55,7 @@ impl ConnectionStateManager {
             false
         }
     }
-    
+
     /// Mark connection as closed
     pub async fn mark_closed(&self, session_id: SessionId) {
         if let Some(state_lock) = self.states.get(&session_id) {
@@ -63,7 +63,7 @@ impl ConnectionStateManager {
             *state = ConnectionState::Closed;
         }
     }
-    
+
     /// Check if connection should ignore messages
     pub async fn should_ignore_messages(&self, session_id: SessionId) -> bool {
         if let Some(state_lock) = self.states.get(&session_id) {
@@ -73,7 +73,7 @@ impl ConnectionStateManager {
             true // Unknown connection, ignore messages
         }
     }
-    
+
     /// Get connection state
     pub async fn get_state(&self, session_id: SessionId) -> Option<ConnectionState> {
         if let Some(state_lock) = self.states.get(&session_id) {
@@ -83,12 +83,12 @@ impl ConnectionStateManager {
             None
         }
     }
-    
+
     /// Remove connection state
     pub fn remove_connection(&self, session_id: SessionId) {
         self.states.remove(&session_id);
     }
-    
+
     /// Get all connection states (for debugging)
     pub async fn get_all_states(&self) -> Vec<(SessionId, ConnectionState)> {
         let mut result = Vec::new();
@@ -122,4 +122,4 @@ impl std::fmt::Debug for ConnectionStateManager {
             .field("states_count", &self.states.len())
             .finish()
     }
-} 
+}

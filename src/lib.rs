@@ -8,10 +8,9 @@
 #![allow(non_upper_case_globals)]
 
 /// msgtrans - Unified multi-protocol transport library
-/// 
+///
 /// This is a modern, high-performance Rust transport library providing unified interfaces for TCP, WebSocket and QUIC protocols.
 /// Designed based on Actor pattern, completely eliminates callback hell and provides type-safe event-driven API.
-
 // Transport layer
 pub mod transport;
 
@@ -22,10 +21,10 @@ pub mod adapters;
 pub mod protocol;
 
 // Core types
-pub mod packet;
-pub mod event;
-pub mod error;
 pub mod command;
+pub mod error;
+pub mod event;
+pub mod packet;
 pub mod stream;
 
 // New modules
@@ -44,12 +43,12 @@ impl SessionId {
     pub fn new(id: u64) -> Self {
         Self(id)
     }
-    
+
     /// Get raw ID value
     pub fn as_u64(&self) -> u64 {
         self.0
     }
-    
+
     /// Generate next session ID
     pub fn next(&self) -> Self {
         Self(self.0.wrapping_add(1))
@@ -75,35 +74,56 @@ impl From<SessionId> for u64 {
 }
 
 // Re-export core types
-pub use packet::{Packet, PacketType, PacketError};
-pub use event::{TransportEvent, ClientEvent, TcpEvent, WebSocketEvent, QuicEvent};
-pub use error::{TransportError, CloseReason};
-pub use command::{TransportCommand, TransportStats, ConnectionInfo};
-pub use stream::{EventStream, PacketStream, ClientEventStream};
+pub use command::{ConnectionInfo, TransportCommand, TransportStats};
+pub use error::{CloseReason, TransportError};
+pub use event::{ClientEvent, QuicEvent, TcpEvent, TransportEvent, WebSocketEvent};
+pub use packet::{Packet, PacketError, PacketType};
+pub use stream::{ClientEventStream, EventStream, PacketStream};
 
 pub use transport::{
-    TransportConfig, ExpertConfig, SmartPoolConfig, PerformanceConfig,
+    AcceptorConfig,
+    // High-performance components
+    Actor,
+    ActorManager,
+    BackpressureStrategy,
+    CircuitBreakerConfig,
+    // Connection pool and memory management
+    ConnectionPool,
+    // Advanced configuration
+    ConnectionPoolConfig,
+    ExpertConfig,
+    LoadBalancerConfig,
+    LockFreeCounter,
+    // LockFree base components
+    LockFreeHashMap,
+    LockFreeQueue,
+    MemoryPool,
+    MemoryStats,
+    MemoryStatsSnapshot,
+    PerformanceConfig,
+    ProtocolAdapter,
+    ProtocolStats,
+    RateLimiterConfig,
+    RetryConfig,
+    SmartPoolConfig,
     // Core transport types
-    Transport, TransportServer,
-    // Builders
-    TransportClientBuilder, TransportServerBuilder, 
+    Transport,
     // Client and server
     TransportClient,
-    // Advanced configuration
-    ConnectionPoolConfig, RetryConfig, LoadBalancerConfig, CircuitBreakerConfig,
-    AcceptorConfig, BackpressureStrategy, RateLimiterConfig,
-    // Connection pool and memory management
-    ConnectionPool, MemoryPool, MemoryStats, MemoryStatsSnapshot,
-    // High-performance components
-    Actor, ActorManager, ProtocolAdapter, ProtocolStats,
-    // LockFree base components
-    LockFreeHashMap, LockFreeQueue, LockFreeCounter,
+    // Builders
+    TransportClientBuilder,
+    TransportConfig,
+    TransportServer,
+    TransportServerBuilder,
 };
 
-pub use protocol::{TcpClientConfig, TcpServerConfig, WebSocketClientConfig, WebSocketServerConfig, QuicClientConfig, QuicServerConfig, ServerConfig, ClientConfig};
+pub use protocol::{
+    ClientConfig, QuicClientConfig, QuicServerConfig, ServerConfig, TcpClientConfig,
+    TcpServerConfig, WebSocketClientConfig, WebSocketServerConfig,
+};
 // Re-export new abstractions
-pub use connection::{Connection, Server, ConnectionFactory};
-pub use plugin::{ProtocolPlugin, PluginManager, PluginInfo};
+pub use connection::{Connection, ConnectionFactory, Server};
+pub use plugin::{PluginInfo, PluginManager, ProtocolPlugin};
 
 // Re-export tokio for user convenience
 pub use tokio;

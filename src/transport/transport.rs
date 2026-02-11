@@ -85,6 +85,9 @@ impl RequestTracker {
             false
         }
     }
+    pub fn remove(&self, id: u32) -> bool {
+        self.pending.remove(&id).is_some()
+    }
     pub fn clear(&self) {
         self.pending.clear();
     }
@@ -402,7 +405,10 @@ impl Transport {
         match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
             Ok(Ok(resp)) => Ok(resp),
             Ok(Err(_)) => Err(TransportError::connection_error("Connection closed", false)),
-            Err(_) => Err(TransportError::connection_error("Request timeout", false)),
+            Err(_) => {
+                self.request_tracker.remove(client_message_id);
+                Err(TransportError::connection_error("Request timeout", false))
+            }
         }
     }
 
@@ -442,7 +448,7 @@ impl Transport {
                             packet.header.packet_type,
                             packet.header.biz_type
                         );
-                        let completed = self.request_tracker.complete(id, packet);
+                        let completed = self.request_tracker.complete(id, packet.clone());
                         tracing::info!(
                             "[PROC] Response packet processing result: ID={}, completed={}",
                             id,
@@ -450,6 +456,10 @@ impl Transport {
                         );
                         if !completed {
                             tracing::warn!("[WARN] Response packet ID={} not found in request tracker, may be timeout or duplicate", id);
+                            // Forward unmatched responses so higher layers can handle them.
+                            let _ = self
+                                .event_sender
+                                .send(crate::event::TransportEvent::MessageReceived(packet));
                         }
                     }
 
@@ -601,6 +611,7 @@ impl Transport {
                 Err(TransportError::connection_error("Connection closed", false))
             }
             Err(_) => {
+                self.request_tracker.remove(message_id);
                 tracing::warn!(
                     "[WARN] Request timeout: message_id={}, timeout={:?}",
                     message_id,

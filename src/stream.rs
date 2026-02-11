@@ -1,16 +1,12 @@
+use crate::{event::TransportEvent, packet::Packet, SessionId};
+use futures::{Stream, StreamExt};
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use futures::{Stream, StreamExt};
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::BroadcastStream;
-use crate::{
-    SessionId,
-    event::TransportEvent,
-    packet::Packet,
-};
 
 /// Unified event stream
-/// 
+///
 /// Provides streaming access to transport events, supporting filtering and transformation
 pub struct EventStream {
     /// Internal broadcast stream
@@ -27,21 +23,24 @@ impl EventStream {
             session_filter: None,
         }
     }
-    
+
     /// Create event stream with session filter
-    pub fn with_session_filter(receiver: broadcast::Receiver<TransportEvent>, session_id: SessionId) -> Self {
+    pub fn with_session_filter(
+        receiver: broadcast::Receiver<TransportEvent>,
+        session_id: SessionId,
+    ) -> Self {
         Self {
             inner: BroadcastStream::new(receiver),
             session_filter: Some(session_id),
         }
     }
-    
+
     /// Filter events for specific session
     pub fn filter_session(mut self, session_id: SessionId) -> Self {
         self.session_filter = Some(session_id);
         self
     }
-    
+
     /// Get next connection event
     pub async fn next_connection_event(&mut self) -> Option<TransportEvent> {
         while let Some(result) = self.inner.next().await {
@@ -53,7 +52,7 @@ impl EventStream {
         }
         None
     }
-    
+
     /// Get next data event
     pub async fn next_data_event(&mut self) -> Option<TransportEvent> {
         while let Some(result) = self.inner.next().await {
@@ -65,7 +64,7 @@ impl EventStream {
         }
         None
     }
-    
+
     /// Get next error event
     pub async fn next_error_event(&mut self) -> Option<TransportEvent> {
         while let Some(result) = self.inner.next().await {
@@ -77,7 +76,7 @@ impl EventStream {
         }
         None
     }
-    
+
     /// Check if event should be emitted (based on filter)
     fn should_emit_event(&self, event: &TransportEvent) -> bool {
         match self.session_filter {
@@ -94,7 +93,7 @@ impl EventStream {
 
 impl Stream for EventStream {
     type Item = TransportEvent;
-    
+
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
             match Pin::new(&mut self.inner).poll_next(cx) {
@@ -120,7 +119,7 @@ impl Stream for EventStream {
 }
 
 /// Generic receiver
-/// 
+///
 /// Solves Future state management issues in the original Stream trait implementation
 /// Avoids recreating Future on poll_next by maintaining Future state
 pub struct GenericReceiver<T> {
@@ -139,17 +138,17 @@ impl<T: Send + 'static> GenericReceiver<T> {
             recv_future: None,
         }
     }
-    
+
     /// Non-blocking attempt to receive
     pub fn try_recv(&mut self) -> Result<T, mpsc::error::TryRecvError> {
         self.receiver.try_recv()
     }
-    
+
     /// Asynchronous receive
     pub async fn recv(&mut self) -> Option<T> {
         self.receiver.recv().await
     }
-    
+
     /// Close receiver
     pub fn close(&mut self) {
         self.receiver.close();
@@ -158,7 +157,7 @@ impl<T: Send + 'static> GenericReceiver<T> {
 
 impl<T: Send + 'static> Stream for GenericReceiver<T> {
     type Item = T;
-    
+
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         // Poll receiver directly
         self.receiver.poll_recv(cx)
@@ -166,7 +165,7 @@ impl<T: Send + 'static> Stream for GenericReceiver<T> {
 }
 
 /// Packet stream
-/// 
+///
 /// Stream specifically for handling packets
 pub struct PacketStream {
     /// Internal event stream
@@ -180,14 +179,17 @@ impl PacketStream {
             event_stream: EventStream::new(receiver),
         }
     }
-    
+
     /// Create packet stream with session filter
-    pub fn with_session_filter(receiver: broadcast::Receiver<TransportEvent>, session_id: SessionId) -> Self {
+    pub fn with_session_filter(
+        receiver: broadcast::Receiver<TransportEvent>,
+        session_id: SessionId,
+    ) -> Self {
         Self {
             event_stream: EventStream::with_session_filter(receiver, session_id),
         }
     }
-    
+
     /// Get next packet
     pub async fn next_packet(&mut self) -> Option<Packet> {
         while let Some(event) = self.event_stream.next().await {
@@ -201,7 +203,7 @@ impl PacketStream {
 
 impl Stream for PacketStream {
     type Item = Packet;
-    
+
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
             match Pin::new(&mut self.event_stream).poll_next(cx) {
@@ -223,7 +225,7 @@ impl Stream for PacketStream {
 }
 
 /// Connection event stream
-/// 
+///
 /// Specifically handles connection establishment and closing events
 pub struct ConnectionStream {
     /// Internal event stream
@@ -237,7 +239,7 @@ impl ConnectionStream {
             event_stream: EventStream::new(receiver),
         }
     }
-    
+
     /// Get next connection event
     pub async fn next_connection(&mut self) -> Option<ConnectionEvent> {
         while let Some(event) = self.event_stream.next().await {
@@ -257,7 +259,7 @@ impl ConnectionStream {
 
 impl Stream for ConnectionStream {
     type Item = ConnectionEvent;
-    
+
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
             match Pin::new(&mut self.event_stream).poll_next(cx) {
@@ -286,13 +288,15 @@ impl Stream for ConnectionStream {
 #[derive(Debug, Clone)]
 pub enum ConnectionEvent {
     /// Connection established
-    Established { info: crate::command::ConnectionInfo },
+    Established {
+        info: crate::command::ConnectionInfo,
+    },
     /// Connection closed
     Closed { reason: crate::CloseReason },
 }
 
 /// Stream factory
-/// 
+///
 /// Provides convenient methods for creating various types of streams
 pub struct StreamFactory;
 
@@ -301,52 +305,52 @@ impl StreamFactory {
     pub fn event_stream(receiver: broadcast::Receiver<TransportEvent>) -> EventStream {
         EventStream::new(receiver)
     }
-    
+
     /// Create packet stream
     pub fn packet_stream(receiver: broadcast::Receiver<TransportEvent>) -> PacketStream {
         PacketStream::new(receiver)
     }
-    
+
     /// Create connection stream
     pub fn connection_stream(receiver: broadcast::Receiver<TransportEvent>) -> ConnectionStream {
         ConnectionStream::new(receiver)
     }
-    
+
     /// Create session-filtered event stream
     pub fn session_event_stream(
-        receiver: broadcast::Receiver<TransportEvent>, 
-        session_id: SessionId
+        receiver: broadcast::Receiver<TransportEvent>,
+        session_id: SessionId,
     ) -> EventStream {
         EventStream::with_session_filter(receiver, session_id)
     }
-    
+
     /// Create session-filtered packet stream
     pub fn session_packet_stream(
-        receiver: broadcast::Receiver<TransportEvent>, 
-        session_id: SessionId
+        receiver: broadcast::Receiver<TransportEvent>,
+        session_id: SessionId,
     ) -> PacketStream {
         PacketStream::with_session_filter(receiver, session_id)
     }
-    
+
     /// Create client event stream (hide session ID)
-    pub fn client_event_stream(receiver: tokio::sync::broadcast::Receiver<crate::event::TransportEvent>) -> ClientEventStream {
+    pub fn client_event_stream(
+        receiver: tokio::sync::broadcast::Receiver<crate::event::TransportEvent>,
+    ) -> ClientEventStream {
         ClientEventStream::new(receiver)
     }
 }
 
 /// Stream combinator
-/// 
+///
 /// Provides stream combination and transformation functionality
 pub struct StreamCombinator;
 
 impl StreamCombinator {
     /// Merge multiple event streams
-    pub fn merge_event_streams(
-        streams: Vec<EventStream>
-    ) -> impl Stream<Item = TransportEvent> {
+    pub fn merge_event_streams(streams: Vec<EventStream>) -> impl Stream<Item = TransportEvent> {
         futures::stream::select_all(streams)
     }
-    
+
     /// Convert event stream to packet stream
     pub fn events_to_packets(event_stream: EventStream) -> impl Stream<Item = Packet> {
         event_stream.filter_map(|event| async move {
@@ -356,11 +360,9 @@ impl StreamCombinator {
             }
         })
     }
-    
+
     /// Convert event stream to connection event stream
-    pub fn events_to_connections(
-        event_stream: EventStream
-    ) -> impl Stream<Item = ConnectionEvent> {
+    pub fn events_to_connections(event_stream: EventStream) -> impl Stream<Item = ConnectionEvent> {
         event_stream.filter_map(|event| async move {
             match event {
                 TransportEvent::ConnectionEstablished { info } => {
@@ -379,10 +381,10 @@ impl StreamCombinator {
 pub trait ReceiverExt {
     /// Convert to event stream
     fn into_event_stream(self) -> EventStream;
-    
+
     /// Convert to packet stream
     fn into_packet_stream(self) -> PacketStream;
-    
+
     /// Convert to connection stream
     fn into_connection_stream(self) -> ConnectionStream;
 }
@@ -391,11 +393,11 @@ impl ReceiverExt for broadcast::Receiver<TransportEvent> {
     fn into_event_stream(self) -> EventStream {
         EventStream::new(self)
     }
-    
+
     fn into_packet_stream(self) -> PacketStream {
         PacketStream::new(self)
     }
-    
+
     fn into_connection_stream(self) -> ConnectionStream {
         ConnectionStream::new(self)
     }
@@ -411,20 +413,27 @@ impl ClientEventStream {
     pub fn new(receiver: tokio::sync::broadcast::Receiver<crate::event::TransportEvent>) -> Self {
         Self { inner: receiver }
     }
-    
+
     /// Receive next client event
-    pub async fn next(&mut self) -> Result<crate::event::ClientEvent, crate::error::TransportError> {
+    pub async fn next(
+        &mut self,
+    ) -> Result<crate::event::ClientEvent, crate::error::TransportError> {
         loop {
             match self.inner.recv().await {
                 Ok(transport_event) => {
                     // Convert to client event, filter out irrelevant events
-                    if let Some(client_event) = crate::event::ClientEvent::from_transport_event(transport_event) {
+                    if let Some(client_event) =
+                        crate::event::ClientEvent::from_transport_event(transport_event)
+                    {
                         return Ok(client_event);
                     }
                     // If it's an irrelevant event, continue looping to wait for next event
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    return Err(crate::error::TransportError::connection_error("Event stream closed", false));
+                    return Err(crate::error::TransportError::connection_error(
+                        "Event stream closed",
+                        false,
+                    ));
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                     // Event stream lagged, continue receiving
@@ -433,14 +442,18 @@ impl ClientEventStream {
             }
         }
     }
-    
+
     /// Try to receive event (non-blocking)
-    pub fn try_next(&mut self) -> Result<Option<crate::event::ClientEvent>, crate::error::TransportError> {
+    pub fn try_next(
+        &mut self,
+    ) -> Result<Option<crate::event::ClientEvent>, crate::error::TransportError> {
         loop {
             match self.inner.try_recv() {
                 Ok(transport_event) => {
                     // Convert to client event, filter out irrelevant events
-                    if let Some(client_event) = crate::event::ClientEvent::from_transport_event(transport_event) {
+                    if let Some(client_event) =
+                        crate::event::ClientEvent::from_transport_event(transport_event)
+                    {
                         return Ok(Some(client_event));
                     }
                     // If it's an irrelevant event, continue looping
@@ -449,7 +462,10 @@ impl ClientEventStream {
                     return Ok(None);
                 }
                 Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
-                    return Err(crate::error::TransportError::connection_error("Event stream closed", false));
+                    return Err(crate::error::TransportError::connection_error(
+                        "Event stream closed",
+                        false,
+                    ));
                 }
                 Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
                     // Event stream lagged, continue receiving
@@ -458,4 +474,4 @@ impl ClientEventStream {
             }
         }
     }
-} 
+}

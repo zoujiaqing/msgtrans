@@ -18,6 +18,9 @@ use crate::{
     ConnectionInfo, SessionId,
 };
 
+/// Bound send queue to prevent unbounded memory growth under backpressure.
+const SEND_QUEUE_CAPACITY: usize = 8192;
+
 /// WebSocket message processing result
 enum MessageProcessResult {
     /// Received data packet
@@ -79,7 +82,7 @@ pub struct WebSocketAdapter<C> {
     /// Connection information
     connection_info: ConnectionInfo,
     /// Send queue
-    send_queue: mpsc::UnboundedSender<Packet>,
+    send_queue: mpsc::Sender<Packet>,
     /// Event sender
     event_sender: broadcast::Sender<TransportEvent>,
     /// Shutdown signal sender
@@ -93,7 +96,7 @@ pub struct WebSocketAdapter<C> {
 impl<C> WebSocketAdapter<C> {
     pub fn new(config: C) -> Self {
         let (event_sender, _) = broadcast::channel(8192);
-        let (send_queue_tx, _) = mpsc::unbounded_channel();
+        let (send_queue_tx, _) = mpsc::channel(SEND_QUEUE_CAPACITY);
         let (shutdown_tx, _) = mpsc::unbounded_channel();
 
         Self {
@@ -124,7 +127,7 @@ impl<C> WebSocketAdapter<C> {
         let is_connected = Arc::new(std::sync::atomic::AtomicBool::new(true));
 
         // Create communication channels
-        let (send_queue_tx, send_queue_rx) = mpsc::unbounded_channel();
+        let (send_queue_tx, send_queue_rx) = mpsc::channel(SEND_QUEUE_CAPACITY);
         let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel();
 
         // Start event loop
@@ -161,7 +164,7 @@ impl<C> WebSocketAdapter<C> {
         mut stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
         session_id: Arc<std::sync::atomic::AtomicU64>,
         is_connected: Arc<std::sync::atomic::AtomicBool>,
-        mut send_queue: mpsc::UnboundedReceiver<Packet>,
+        mut send_queue: mpsc::Receiver<Packet>,
         mut shutdown_signal: mpsc::UnboundedReceiver<()>,
         event_sender: broadcast::Sender<TransportEvent>,
     ) -> tokio::task::JoinHandle<()> {
@@ -399,6 +402,7 @@ where
         // Use send queue instead of direct sending
         self.send_queue
             .send(packet)
+            .await
             .map_err(|_| WebSocketError::ConnectionClosed)?;
         Ok(())
     }

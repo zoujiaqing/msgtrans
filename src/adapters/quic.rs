@@ -27,6 +27,9 @@ use crate::{
     SessionId,
 };
 
+/// Bound send queue to prevent unbounded memory growth under slow links.
+const SEND_QUEUE_CAPACITY: usize = 8192;
+
 #[derive(Debug, thiserror::Error)]
 pub enum QuicError {
     #[error("Quinn connection error: {0}")]
@@ -316,7 +319,7 @@ pub struct QuicAdapter<C> {
     stats: AdapterStats,
     connection_info: ConnectionInfo,
     /// Send queue
-    send_queue: mpsc::UnboundedSender<Packet>,
+    send_queue: mpsc::Sender<Packet>,
     /// Event sender
     event_sender: broadcast::Sender<TransportEvent>,
     /// Shutdown signal sender
@@ -348,7 +351,7 @@ impl<C> QuicAdapter<C> {
         }
 
         // Create communication channels
-        let (send_queue_tx, send_queue_rx) = mpsc::unbounded_channel();
+        let (send_queue_tx, send_queue_rx) = mpsc::channel(SEND_QUEUE_CAPACITY);
         let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel();
 
         // Start event loop
@@ -398,7 +401,7 @@ impl<C> QuicAdapter<C> {
     async fn start_event_loop(
         connection: Connection,
         session_id: Arc<std::sync::atomic::AtomicU64>,
-        mut send_queue: mpsc::UnboundedReceiver<Packet>,
+        mut send_queue: mpsc::Receiver<Packet>,
         mut shutdown_signal: mpsc::UnboundedReceiver<()>,
         event_sender: broadcast::Sender<TransportEvent>,
         is_server: bool,
@@ -719,6 +722,7 @@ impl ProtocolAdapter for QuicAdapter<QuicClientConfig> {
     async fn send(&mut self, packet: Packet) -> Result<(), Self::Error> {
         self.send_queue
             .send(packet)
+            .await
             .map_err(|_| QuicError::ConnectionClosed)?;
         Ok(())
     }
@@ -780,6 +784,7 @@ impl ProtocolAdapter for QuicAdapter<QuicServerConfig> {
     async fn send(&mut self, packet: Packet) -> Result<(), Self::Error> {
         self.send_queue
             .send(packet)
+            .await
             .map_err(|_| QuicError::ConnectionClosed)?;
         Ok(())
     }

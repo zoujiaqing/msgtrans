@@ -1,5 +1,5 @@
+use crate::{event::TransportEvent, SessionId};
 use std::time::Duration;
-use crate::{SessionId, event::TransportEvent};
 
 /// Connection close reason
 #[derive(Debug, Clone)]
@@ -19,37 +19,28 @@ pub enum CloseReason {
 pub enum TransportError {
     /// Connection-related errors
     #[error("Connection error: {reason} (retryable: {retryable})")]
-    Connection { 
-        reason: String, 
-        retryable: bool,
-    },
-    
+    Connection { reason: String, retryable: bool },
+
     /// Protocol-related errors
     #[error("Protocol error ({protocol}): {reason}")]
-    Protocol { 
-        protocol: String, 
-        reason: String,
-    },
-    
+    Protocol { protocol: String, reason: String },
+
     /// Configuration-related errors
     #[error("Configuration error in field '{field}': {reason}")]
-    Configuration { 
-        field: String, 
-        reason: String,
-    },
-    
+    Configuration { field: String, reason: String },
+
     /// Resource-related errors
     #[error("Resource '{resource}' exceeded: current {current}, limit {limit}")]
-    Resource { 
-        resource: String, 
-        current: usize, 
+    Resource {
+        resource: String,
+        current: usize,
         limit: usize,
     },
-    
+
     /// Timeout errors
     #[error("Operation '{operation}' timeout after {duration:?}")]
-    Timeout { 
-        operation: String, 
+    Timeout {
+        operation: String,
         duration: Duration,
     },
 }
@@ -59,19 +50,19 @@ impl TransportError {
     pub fn is_retryable(&self) -> bool {
         match self {
             TransportError::Connection { retryable, .. } => *retryable,
-            TransportError::Protocol { .. } => true,  // Protocol errors are usually retryable
+            TransportError::Protocol { .. } => true, // Protocol errors are usually retryable
             TransportError::Configuration { .. } => false, // Configuration errors are not retryable
-            TransportError::Resource { .. } => true,  // Resource errors are retryable (wait for resource release)
-            TransportError::Timeout { .. } => true,   // Timeouts are retryable
+            TransportError::Resource { .. } => true, // Resource errors are retryable (wait for resource release)
+            TransportError::Timeout { .. } => true,  // Timeouts are retryable
         }
     }
-    
+
     /// Get suggested retry delay
     pub fn retry_delay(&self) -> Option<Duration> {
         if !self.is_retryable() {
             return None;
         }
-        
+
         match self {
             TransportError::Connection { .. } => Some(Duration::from_millis(1000)),
             TransportError::Protocol { .. } => Some(Duration::from_millis(100)),
@@ -80,7 +71,7 @@ impl TransportError {
             _ => None,
         }
     }
-    
+
     /// Get error code
     pub fn error_code(&self) -> &'static str {
         match self {
@@ -91,7 +82,7 @@ impl TransportError {
             TransportError::Timeout { .. } => "TIMEOUT_ERROR",
         }
     }
-    
+
     /// Add session context
     pub fn with_session(mut self, session_id: SessionId) -> Self {
         match &mut self {
@@ -99,17 +90,17 @@ impl TransportError {
                 if !reason.contains("session:") {
                     *reason = format!("{} (session: {})", reason, session_id);
                 }
-            },
+            }
             TransportError::Protocol { reason, .. } => {
                 if !reason.contains("session:") {
                     *reason = format!("{} (session: {})", reason, session_id);
                 }
-            },
+            }
             _ => {} // Other error types don't need session information
         }
         self
     }
-    
+
     /// 添加操作上下文
     pub fn with_operation(mut self, op: &'static str) -> Self {
         match &mut self {
@@ -117,17 +108,17 @@ impl TransportError {
                 if !reason.contains("operation:") {
                     *reason = format!("{} (operation: {})", reason, op);
                 }
-            },
+            }
             TransportError::Protocol { reason, .. } => {
                 if !reason.contains("operation:") {
                     *reason = format!("{} (operation: {})", reason, op);
                 }
-            },
+            }
             TransportError::Timeout { operation, .. } => {
                 if operation.is_empty() {
                     *operation = op.to_string();
                 }
-            },
+            }
             _ => {}
         }
         self
@@ -143,7 +134,7 @@ impl TransportError {
             retryable,
         }
     }
-    
+
     /// 创建协议错误
     pub fn protocol_error(protocol: impl Into<String>, reason: impl Into<String>) -> Self {
         Self::Protocol {
@@ -151,7 +142,7 @@ impl TransportError {
             reason: reason.into(),
         }
     }
-    
+
     /// 创建配置错误
     pub fn config_error(field: impl Into<String>, reason: impl Into<String>) -> Self {
         Self::Configuration {
@@ -159,7 +150,7 @@ impl TransportError {
             reason: reason.into(),
         }
     }
-    
+
     /// 创建资源错误
     pub fn resource_error(resource: impl Into<String>, current: usize, limit: usize) -> Self {
         Self::Resource {
@@ -168,7 +159,7 @@ impl TransportError {
             limit,
         }
     }
-    
+
     /// 创建超时错误
     pub fn timeout_error(operation: impl Into<String>, duration: Duration) -> Self {
         Self::Timeout {
@@ -182,14 +173,14 @@ impl TransportError {
 impl From<std::io::Error> for TransportError {
     fn from(error: std::io::Error) -> Self {
         let retryable = match error.kind() {
-            std::io::ErrorKind::ConnectionRefused |
-            std::io::ErrorKind::ConnectionAborted |
-            std::io::ErrorKind::ConnectionReset |
-            std::io::ErrorKind::TimedOut |
-            std::io::ErrorKind::Interrupted => true,
+            std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::Interrupted => true,
             _ => false,
         };
-        
+
         TransportError::Connection {
             reason: format!("IO error: {}", error),
             retryable,
@@ -210,9 +201,7 @@ impl From<String> for TransportError {
 
 impl From<TransportError> for TransportEvent {
     fn from(error: TransportError) -> Self {
-        TransportEvent::TransportError {
-            error,
-        }
+        TransportEvent::TransportError { error }
     }
 }
 
@@ -232,7 +221,7 @@ pub struct ErrorStats {
 impl ErrorStats {
     pub fn record_error(&mut self, error: TransportError) {
         self.total_errors += 1;
-        
+
         match &error {
             TransportError::Connection { .. } => self.connection_errors += 1,
             TransportError::Protocol { .. } => self.protocol_errors += 1,
@@ -240,14 +229,14 @@ impl ErrorStats {
             TransportError::Resource { .. } => self.resource_errors += 1,
             TransportError::Timeout { .. } => self.timeout_errors += 1,
         }
-        
+
         self.last_error = Some(error);
     }
-    
+
     pub fn record_retry(&mut self) {
         self.retries += 1;
     }
-    
+
     pub fn clear(&mut self) {
         *self = Self::default();
     }
@@ -276,14 +265,14 @@ impl TransportError {
                 } else {
                     ErrorSeverity::Medium
                 }
-            },
+            }
             TransportError::Connection { retryable, .. } => {
                 if *retryable {
                     ErrorSeverity::Medium
                 } else {
                     ErrorSeverity::High
                 }
-            },
+            }
             TransportError::Protocol { .. } => ErrorSeverity::Medium,
             TransportError::Timeout { .. } => ErrorSeverity::Medium,
         }
@@ -299,7 +288,7 @@ impl TransportError {
             retryable: true,
         }
     }
-    
+
     /// 兼容旧的Protocol错误格式
     pub fn protocol_legacy(reason: impl Into<String>) -> Self {
         Self::Protocol {
@@ -307,4 +296,4 @@ impl TransportError {
             reason: reason.into(),
         }
     }
-} 
+}
