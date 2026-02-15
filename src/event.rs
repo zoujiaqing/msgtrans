@@ -87,7 +87,7 @@ impl TransportEvent {
             TransportEvent::ServerStopped => None,
             TransportEvent::ClientConnected { .. } => None,
             TransportEvent::ClientDisconnected => None,
-            TransportEvent::RequestReceived(..) => None,
+            TransportEvent::RequestReceived(context) => context.peer,
         }
     }
 

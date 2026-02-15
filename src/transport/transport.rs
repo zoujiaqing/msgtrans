@@ -20,9 +20,13 @@ use dashmap::DashMap;
 /// - Used by TransportClient (single connection) and TransportServer (multi-connection management)
 use std::sync::{
     atomic::{AtomicU32, Ordering},
-    Arc,
+    Arc, OnceLock,
 };
-use tokio::sync::{broadcast, oneshot, Mutex};
+use tokio::sync::{broadcast, oneshot, Mutex, OnceCell};
+
+static SHARED_PROTOCOL_REGISTRY: OnceCell<Arc<ProtocolRegistry>> = OnceCell::const_new();
+static SHARED_CONNECTION_POOL: OnceCell<Arc<ConnectionPool>> = OnceCell::const_new();
+static SHARED_MEMORY_POOL: OnceLock<Arc<OptimizedMemoryPool>> = OnceLock::new();
 
 /// [TARGET] Single connection transport abstraction - properly aligned with architecture design
 pub struct Transport {
@@ -98,13 +102,26 @@ impl Transport {
     pub async fn new(config: TransportConfig) -> Result<Self, TransportError> {
         tracing::info!("[PERF] Creating Transport");
 
-        // Create protocol registry
-        let protocol_registry = Arc::new(create_standard_registry().await?);
+        // Reuse heavy shared resources across all Transport instances.
+        let protocol_registry = SHARED_PROTOCOL_REGISTRY
+            .get_or_try_init(|| async {
+                let registry = create_standard_registry().await?;
+                Ok::<Arc<ProtocolRegistry>, TransportError>(Arc::new(registry))
+            })
+            .await?
+            .clone();
 
-        // Create connection pool and memory pool (simplified version)
-        let connection_pool = Arc::new(ConnectionPool::new(2, 10).initialize_pool().await?);
+        let connection_pool = SHARED_CONNECTION_POOL
+            .get_or_try_init(|| async {
+                let pool = ConnectionPool::new(2, 10).initialize_pool().await?;
+                Ok::<Arc<ConnectionPool>, TransportError>(Arc::new(pool))
+            })
+            .await?
+            .clone();
 
-        let memory_pool = Arc::new(OptimizedMemoryPool::new());
+        let memory_pool = SHARED_MEMORY_POOL
+            .get_or_init(|| Arc::new(OptimizedMemoryPool::new()))
+            .clone();
 
         let (event_sender, _) = broadcast::channel(8192);
 

@@ -153,7 +153,10 @@ impl Server for TcpServerWrapper {
     }
 
     async fn shutdown(&mut self) -> Result<(), TransportError> {
-        Ok(())
+        self.inner
+            .shutdown()
+            .await
+            .map_err(|e| TransportError::config_error("tcp", &e.to_string()))
     }
 }
 
@@ -417,8 +420,10 @@ impl Server for WebSocketServerWrapper {
     }
 
     async fn shutdown(&mut self) -> Result<(), TransportError> {
-        // WebSocket server graceful shutdown logic
-        Ok(())
+        self.inner
+            .shutdown()
+            .await
+            .map_err(|e| TransportError::config_error("websocket", &e.to_string()))
     }
 }
 
@@ -562,8 +567,10 @@ impl Server for QuicServerWrapper {
     }
 
     async fn shutdown(&mut self) -> Result<(), TransportError> {
-        // QUIC servers usually don't need special shutdown logic
-        Ok(())
+        self.inner
+            .shutdown()
+            .await
+            .map_err(|e| TransportError::config_error("quic", &e.to_string()))
     }
 }
 

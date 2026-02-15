@@ -731,7 +731,7 @@ impl TcpServerBuilder {
         );
 
         Ok(TcpServer {
-            listener,
+            listener: Some(listener),
             config: self.config,
         })
     }
@@ -745,7 +745,7 @@ impl Default for TcpServerBuilder {
 
 /// TCP server
 pub(crate) struct TcpServer {
-    listener: TcpListener,
+    listener: Option<TcpListener>,
     config: TcpServerConfig,
 }
 
@@ -755,7 +755,11 @@ impl TcpServer {
     }
 
     pub(crate) async fn accept(&mut self) -> Result<TcpAdapter<TcpServerConfig>, TcpError> {
-        let (stream, peer_addr) = self.listener.accept().await?;
+        let listener = self
+            .listener
+            .as_mut()
+            .ok_or_else(|| TcpError::Config("TCP server is shut down".to_string()))?;
+        let (stream, peer_addr) = listener.accept().await?;
 
         tracing::debug!("[CONNECT] TCP new connection from: {}", peer_addr);
 
@@ -763,7 +767,17 @@ impl TcpServer {
     }
 
     pub(crate) fn local_addr(&self) -> Result<std::net::SocketAddr, TcpError> {
-        Ok(self.listener.local_addr()?)
+        let listener = self
+            .listener
+            .as_ref()
+            .ok_or_else(|| TcpError::Config("TCP server is shut down".to_string()))?;
+        Ok(listener.local_addr()?)
+    }
+
+    pub(crate) async fn shutdown(&mut self) -> Result<(), TcpError> {
+        // Explicitly drop listener to release port without waiting for task drop.
+        self.listener.take();
+        Ok(())
     }
 }
 

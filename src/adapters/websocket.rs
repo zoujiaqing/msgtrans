@@ -533,6 +533,12 @@ impl<C: 'static> WebSocketServer<C> {
             Err(WebSocketError::Config("Server not bound".to_string()))
         }
     }
+
+    pub(crate) async fn shutdown(&mut self) -> Result<(), WebSocketError> {
+        // Explicitly drop listener to release TCP port.
+        self.listener.take();
+        Ok(())
+    }
 }
 
 pub(crate) struct WebSocketClientBuilder<C> {

@@ -935,6 +935,16 @@ impl QuicServer {
     pub(crate) fn local_addr(&self) -> Result<SocketAddr, QuicError> {
         self.endpoint.local_addr().map_err(QuicError::Io)
     }
+
+    pub(crate) async fn shutdown(&mut self) -> Result<(), QuicError> {
+        // Actively close endpoint to release UDP port quickly on shutdown.
+        self.endpoint.close(0u32.into(), b"server shutdown");
+
+        // Wait briefly for QUIC internals to drain; don't block shutdown forever.
+        let _ = tokio::time::timeout(Duration::from_secs(2), self.endpoint.wait_idle()).await;
+
+        Ok(())
+    }
 }
 
 pub(crate) struct QuicClientBuilder {

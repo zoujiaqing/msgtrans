@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crossbeam_channel::{unbounded, Receiver, Sender};
 use dashmap::DashMap;
+use flume::{unbounded, Receiver, Sender};
 
 use crate::error::TransportError;
 

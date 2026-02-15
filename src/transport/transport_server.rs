@@ -27,6 +27,7 @@ use crate::{
 /// ```
 use std::sync::Arc;
 use tokio::sync::broadcast;
+const LISTENER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// TransportServer - multi-protocol server
 ///
@@ -374,13 +375,21 @@ impl TransportServer {
     pub async fn add_session(&self, connection: Box<dyn crate::Connection>) -> SessionId {
         // [FIX] Use existing session ID from connection instead of generating new one
         let session_id = connection.session_id();
+        let mut connection = connection;
 
         // [CREATE] Create Transport instance
-        let transport = Arc::new(
-            crate::transport::transport::Transport::new(self.config.clone())
-                .await
-                .unwrap(),
-        );
+        let transport = match crate::transport::transport::Transport::new(self.config.clone()).await {
+            Ok(transport) => Arc::new(transport),
+            Err(e) => {
+                tracing::error!(
+                    "[ERROR] Failed to create Transport for session {}: {:?}",
+                    session_id,
+                    e
+                );
+                let _ = connection.close().await;
+                return session_id;
+            }
+        };
 
         // [FIX] Subscribe to event stream BEFORE setting connection
         // This ensures that when adapter's event loop starts, there's already a subscriber ready
@@ -833,61 +842,98 @@ impl TransportServer {
             let mut accept_count = 0u64;
 
             loop {
+                if !server_clone
+                    .is_running
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    tracing::info!(
+                        "[STOP] {} listener received stop signal",
+                        protocol_name
+                    );
+                    break;
+                }
+
                 tracing::debug!(
                     "[LOOP] {} waiting for connections... (accept count: {})",
                     protocol_name,
                     accept_count
                 );
 
-                match server.accept().await {
-                    Ok(mut connection) => {
-                        accept_count += 1;
-                        tracing::info!(
-                            "[SUCCESS] {} accept successful! Connection #{}",
-                            protocol_name,
-                            accept_count
-                        );
-
-                        // Get connection info
-                        let connection_info = connection.connection_info();
-                        let peer_addr = connection_info.peer_addr;
-
-                        tracing::info!(
-                            "[CONNECT] New {} connection #{}: {}",
-                            protocol_name,
-                            accept_count,
-                            peer_addr
-                        );
-
-                        // Generate new session ID and set to connection
-                        let session_id = server_clone.generate_session_id();
-                        connection.set_session_id(session_id);
-                        tracing::info!(
-                            "[ID] Generated session ID for {} connection: {}",
-                            protocol_name,
-                            session_id
-                        );
-
-                        // Add to session management
-                        let actual_session_id = server_clone.add_session(connection).await;
-
-                        // Send connection established event
-                        let connect_event = ServerEvent::ConnectionEstablished {
-                            session_id: actual_session_id,
-                            info: connection_info,
-                        };
-                        let _ = server_clone.event_sender.send(connect_event);
-                        tracing::info!("[EVENT] {} connection event sent", protocol_name);
+                match tokio::time::timeout(LISTENER_POLL_INTERVAL, server.accept()).await {
+                    Err(_) => {
+                        // Poll timeout, loop again and check stop flag.
+                        continue;
                     }
-                    Err(e) => {
-                        tracing::error!(
-                            "[ERROR] {} accept connection failed: {:?}",
-                            protocol_name,
-                            e
-                        );
-                        break;
-                    }
+                    Ok(accept_result) => match accept_result {
+                        Ok(mut connection) => {
+                            accept_count += 1;
+                            tracing::info!(
+                                "[SUCCESS] {} accept successful! Connection #{}",
+                                protocol_name,
+                                accept_count
+                            );
+
+                            // Get connection info
+                            let connection_info = connection.connection_info();
+                            let peer_addr = connection_info.peer_addr;
+
+                            tracing::info!(
+                                "[CONNECT] New {} connection #{}: {}",
+                                protocol_name,
+                                accept_count,
+                                peer_addr
+                            );
+
+                            // Generate new session ID and set to connection
+                            let session_id = server_clone.generate_session_id();
+                            connection.set_session_id(session_id);
+                            tracing::info!(
+                                "[ID] Generated session ID for {} connection: {}",
+                                protocol_name,
+                                session_id
+                            );
+
+                            // Add to session management
+                            let actual_session_id = server_clone.add_session(connection).await;
+
+                            // Send connection established event
+                            let connect_event = ServerEvent::ConnectionEstablished {
+                                session_id: actual_session_id,
+                                info: connection_info,
+                            };
+                            let _ = server_clone.event_sender.send(connect_event);
+                            tracing::info!("[EVENT] {} connection event sent", protocol_name);
+                        }
+                        Err(e) => {
+                            if !server_clone
+                                .is_running
+                                .load(std::sync::atomic::Ordering::SeqCst)
+                            {
+                                tracing::info!(
+                                    "[STOP] {} listener stopping after accept exit: {:?}",
+                                    protocol_name,
+                                    e
+                                );
+                                break;
+                            }
+                            tracing::warn!(
+                                "[WARN] {} accept connection failed, continue listening: {:?}",
+                                protocol_name,
+                                e
+                            );
+                            tokio::time::sleep(LISTENER_POLL_INTERVAL).await;
+                            continue;
+                        }
+                    },
                 }
+            }
+
+            if let Err(e) = server.shutdown().await {
+                tracing::warn!(
+                    "[WARN] {} server shutdown failed: {:?}",
+                    protocol_name,
+                    e
+                );
             }
 
             tracing::info!("[STOP] {} server stopped", protocol_name);
@@ -910,17 +956,17 @@ impl TransportServer {
         session_id: SessionId,
         transport_event: crate::event::TransportEvent,
     ) {
-        tracing::info!(
+        tracing::debug!(
             "[HANDLER] handle_transport_event: session {}, event: {:?}",
             session_id,
             transport_event
         );
         match transport_event {
             crate::event::TransportEvent::MessageReceived(packet) => {
-                tracing::info!("[RECV] Received MessageReceived event, packet type: {:?}, ID: {}, biz_type: {}", packet.header.packet_type, packet.header.message_id, packet.header.biz_type);
+                tracing::debug!("[RECV] Received MessageReceived event, packet type: {:?}, ID: {}, biz_type: {}", packet.header.packet_type, packet.header.message_id, packet.header.biz_type);
                 match packet.header.packet_type {
                     crate::packet::PacketType::Request => {
-                        tracing::info!(
+                        tracing::debug!(
                             "[REQUEST] Handling Request type packet (ID: {}, biz_type: {})",
                             packet.header.message_id,
                             packet.header.biz_type
@@ -942,7 +988,7 @@ impl TransportServer {
                                 let request_message_id = packet.header.message_id;
                                 let request_biz_type = packet.header.biz_type;
                                 tokio::spawn(async move {
-                                    tracing::info!("[RESPOND] Creating response packet: request_id={}, request_biz_type={}, response_size={} bytes", request_message_id, request_biz_type, response_data.len());
+                                    tracing::debug!("[RESPOND] Creating response packet: request_id={}, request_biz_type={}, response_size={} bytes", request_message_id, request_biz_type, response_data.len());
                                     let response_packet = crate::packet::Packet {
                                         header: crate::packet::FixedHeader {
                                             version: 1,
@@ -960,7 +1006,7 @@ impl TransportServer {
                                     match server.send_to_session(session_id, response_packet).await
                                     {
                                         Ok(_) => {
-                                            tracing::info!("[SUCCESS] Response sent successfully: session={}, request_id={}", session_id, request_message_id);
+                                            tracing::debug!("[SUCCESS] Response sent successfully: session={}, request_id={}", session_id, request_message_id);
                                         }
                                         Err(e) => {
                                             tracing::error!("[ERROR] Failed to send response: session={}, request_id={}, error={:?}", session_id, request_message_id, e);
@@ -981,11 +1027,11 @@ impl TransportServer {
                             session_id,
                             context,
                         };
-                        tracing::info!("[SEND] Preparing to send ServerEvent::MessageReceived (session: {}, ID: {}, biz_type: {})", session_id, packet.header.message_id, packet.header.biz_type);
+                        tracing::debug!("[SEND] Preparing to send ServerEvent::MessageReceived (session: {}, ID: {}, biz_type: {})", session_id, packet.header.message_id, packet.header.biz_type);
 
                         match self.event_sender.send(event) {
                             Ok(receivers) => {
-                                tracing::info!("[SUCCESS] ServerEvent sent successfully, receiver count: {} (session: {}, ID: {})", receivers, session_id, packet.header.message_id);
+                                tracing::debug!("[SUCCESS] ServerEvent sent successfully, receiver count: {} (session: {}, ID: {})", receivers, session_id, packet.header.message_id);
                             }
                             Err(e) => {
                                 tracing::error!(

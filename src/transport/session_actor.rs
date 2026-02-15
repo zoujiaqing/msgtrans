@@ -6,13 +6,13 @@
 //!
 //! Architecture:
 //! ```text
-//! Connection → mpsc(bounded) → SessionActor → SessionHandler
+//! Connection → flume(bounded) → SessionActor → SessionHandler
 //! ```
 
 use crate::{event::TransportEvent, packet::Packet, transport::transport::Transport, SessionId};
 use async_trait::async_trait;
+use flume::{bounded, Receiver, Sender};
 use std::sync::Arc;
-use tokio::sync::mpsc;
 
 /// Session handler trait - business layer implements this to receive messages
 ///
@@ -179,7 +179,7 @@ impl Responder {
 #[derive(Clone)]
 pub struct SessionHandle {
     /// Channel to send events to the actor
-    pub(crate) tx: mpsc::Sender<TransportEvent>,
+    pub(crate) tx: Sender<TransportEvent>,
     /// Reference to the transport for sending
     pub(crate) transport: Arc<Transport>,
 }
@@ -191,8 +191,11 @@ impl SessionHandle {
     pub async fn send_event(
         &self,
         event: TransportEvent,
-    ) -> Result<(), mpsc::error::SendError<TransportEvent>> {
-        self.tx.send(event).await
+    ) -> Result<(), tokio::sync::mpsc::error::SendError<TransportEvent>> {
+        self.tx
+            .send_async(event)
+            .await
+            .map_err(|e| tokio::sync::mpsc::error::SendError(e.0))
     }
 
     /// Get the transport for this session
@@ -216,7 +219,7 @@ const BATCH_SIZE: usize = 64;
 pub struct SessionActor {
     session_id: SessionId,
     transport: Arc<Transport>,
-    rx: mpsc::Receiver<TransportEvent>,
+    rx: Receiver<TransportEvent>,
     handler: Arc<dyn SessionHandler>,
 }
 
@@ -225,7 +228,7 @@ impl SessionActor {
     pub fn new(
         session_id: SessionId,
         transport: Arc<Transport>,
-        rx: mpsc::Receiver<TransportEvent>,
+        rx: Receiver<TransportEvent>,
         handler: Arc<dyn SessionHandler>,
     ) -> Self {
         Self {
@@ -258,12 +261,17 @@ impl SessionActor {
         loop {
             batch.clear();
 
-            // Batch receive: wait for at least 1 event, collect up to BATCH_SIZE
-            let count = self.rx.recv_many(&mut batch, BATCH_SIZE).await;
-
-            if count == 0 {
-                // Channel closed
-                break;
+            // Batch receive: wait for first event, then drain up to BATCH_SIZE.
+            match self.rx.recv_async().await {
+                Ok(first) => batch.push(first),
+                Err(_) => break,
+            }
+            while batch.len() < BATCH_SIZE {
+                match self.rx.try_recv() {
+                    Ok(next) => batch.push(next),
+                    Err(flume::TryRecvError::Empty) => break,
+                    Err(flume::TryRecvError::Disconnected) => break,
+                }
             }
 
             // Process batch
@@ -325,7 +333,7 @@ pub fn create_session_actor(
     handler: Arc<dyn SessionHandler>,
     buffer_size: usize,
 ) -> (SessionHandle, SessionActor) {
-    let (tx, rx) = mpsc::channel(buffer_size);
+    let (tx, rx) = bounded(buffer_size);
 
     let handle = SessionHandle {
         tx,

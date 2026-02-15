@@ -17,9 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{
-    unbounded as crossbeam_unbounded, Receiver as CrossbeamReceiver, Sender as CrossbeamSender,
-};
+use flume::{unbounded as flume_unbounded, Receiver as FlumeReceiver, Sender as FlumeSender};
 use tokio::sync::RwLock;
 
 use crate::error::TransportError;
@@ -37,8 +35,8 @@ pub struct ConnectionPool {
     available_connections: Arc<LockFreeQueue<ConnectionId>>,
 
     /// [SYNC] Crossbeam synchronous control
-    pool_control_tx: CrossbeamSender<PoolControlCommand>,
-    pool_control_rx: CrossbeamReceiver<PoolControlCommand>,
+    pool_control_tx: FlumeSender<PoolControlCommand>,
+    pool_control_rx: FlumeReceiver<PoolControlCommand>,
 
     /// [EVENT] Tokio event broadcasting
     pub event_broadcaster: tokio::sync::broadcast::Sender<PoolEvent>,
@@ -91,22 +89,22 @@ pub enum ConnectionState {
 #[derive(Debug)]
 pub enum PoolControlCommand {
     GetConnection {
-        response_tx: crossbeam_channel::Sender<Result<ConnectionId, TransportError>>,
+        response_tx: FlumeSender<Result<ConnectionId, TransportError>>,
     },
     ReturnConnection {
         connection_id: ConnectionId,
-        response_tx: crossbeam_channel::Sender<Result<(), TransportError>>,
+        response_tx: FlumeSender<Result<(), TransportError>>,
     },
     CreateConnection {
         count: usize,
-        response_tx: crossbeam_channel::Sender<Result<Vec<ConnectionId>, TransportError>>,
+        response_tx: FlumeSender<Result<Vec<ConnectionId>, TransportError>>,
     },
     RemoveConnection {
         connection_id: ConnectionId,
-        response_tx: crossbeam_channel::Sender<Result<(), TransportError>>,
+        response_tx: FlumeSender<Result<(), TransportError>>,
     },
     GetStats {
-        response_tx: crossbeam_channel::Sender<OptimizedPoolStatsSnapshot>,
+        response_tx: FlumeSender<OptimizedPoolStatsSnapshot>,
     },
 }
 
@@ -239,7 +237,7 @@ impl Clone for ConnectionPool {
 impl ConnectionPool {
     /// [PERF] Create optimized intelligent connection pool
     pub fn new(initial_size: usize, max_size: usize) -> Self {
-        let (pool_control_tx, pool_control_rx) = crossbeam_unbounded();
+        let (pool_control_tx, pool_control_rx) = flume_unbounded();
         let (event_broadcaster, _) = tokio::sync::broadcast::channel(8192);
 
         Self {

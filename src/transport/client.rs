@@ -1,10 +1,13 @@
 use bytes::Bytes;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 /// Client transport layer module
 ///
 /// Provides transport layer API specifically designed for client connections
 use std::time::Duration;
-use tokio::sync::RwLock;
+use tokio::{sync::RwLock, task::JoinHandle};
 
 use crate::{
     error::TransportError, protocol::adapter::DynClientConfig, transport::config::TransportConfig,
@@ -232,6 +235,8 @@ pub struct TransportClient {
     event_sender: tokio::sync::broadcast::Sender<crate::event::ClientEvent>,
     // [TARGET] Message ID counter - For automatic message ID generation
     message_id_counter: std::sync::atomic::AtomicU32,
+    event_forwarding_running: Arc<AtomicBool>,
+    event_forwarding_task: Arc<RwLock<Option<JoinHandle<()>>>>,
 }
 
 impl TransportClient {
@@ -247,6 +252,8 @@ impl TransportClient {
             current_session_id: Arc::new(RwLock::new(None)),
             event_sender: tokio::sync::broadcast::channel(8192).0,
             message_id_counter: std::sync::atomic::AtomicU32::new(1),
+            event_forwarding_running: Arc::new(AtomicBool::new(false)),
+            event_forwarding_task: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -269,7 +276,10 @@ impl TransportClient {
         // Update current session ID (internal use)
         let mut current_session = self.current_session_id.write().await;
         *current_session = Some(session_id);
+        drop(current_session);
 
+        // Ensure stale forwarding task is not reused across reconnects.
+        self.stop_event_forwarding().await;
         // [START] Start event forwarding task, converting Transport events to ClientEvent
         self.start_event_forwarding().await?;
 
@@ -401,6 +411,7 @@ impl TransportClient {
 
             // Use Transport's unified close method
             self.inner.close_session(session_id).await?;
+            self.stop_event_forwarding().await;
 
             Ok(())
         } else {
@@ -419,6 +430,7 @@ impl TransportClient {
 
             // Use Transport's force close method
             self.inner.force_close_session(session_id).await?;
+            self.stop_event_forwarding().await;
 
             Ok(())
         } else {
@@ -567,13 +579,23 @@ impl TransportClient {
 
     /// [START] Start event forwarding task
     async fn start_event_forwarding(&self) -> Result<(), TransportError> {
+        if self
+            .event_forwarding_running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            tracing::debug!("[SKIP] Event forwarding task already running");
+            return Ok(());
+        }
+
         // Get Transport's event stream
         if let Some(mut transport_events) = self.inner.get_event_stream().await {
             let client_event_sender = self.event_sender.clone();
             let transport_for_response = self.inner.clone();
+            let forwarding_running = self.event_forwarding_running.clone();
 
             // Start forwarding task
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 tracing::debug!("[LOOP] TransportClient event forwarding task started");
 
                 while let Ok(transport_event) = transport_events.recv().await {
@@ -665,16 +687,27 @@ impl TransportClient {
                     }
                 }
 
+                forwarding_running.store(false, Ordering::SeqCst);
                 tracing::debug!("[END] TransportClient event forwarding task ended");
             });
+
+            *self.event_forwarding_task.write().await = Some(handle);
 
             tracing::debug!("[SUCCESS] TransportClient event forwarding task started");
             Ok(())
         } else {
+            self.event_forwarding_running.store(false, Ordering::SeqCst);
             Err(TransportError::connection_error(
                 "Connection does not support event streams",
                 false,
             ))
+        }
+    }
+
+    async fn stop_event_forwarding(&self) {
+        self.event_forwarding_running.store(false, Ordering::SeqCst);
+        if let Some(handle) = self.event_forwarding_task.write().await.take() {
+            handle.abort();
         }
     }
 

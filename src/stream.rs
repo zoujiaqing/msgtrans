@@ -80,12 +80,10 @@ impl EventStream {
     /// Check if event should be emitted (based on filter)
     fn should_emit_event(&self, event: &TransportEvent) -> bool {
         match self.session_filter {
-            Some(filter_session_id) => {
-                match event.session_id() {
-                    Some(event_session_id) => event_session_id == filter_session_id,
-                    None => true, // Global events are always emitted
-                }
-            }
+            Some(filter_session_id) => match event.session_id() {
+                Some(event_session_id) => event_session_id == filter_session_id,
+                None => false,
+            },
             None => true, // No filter, emit all events
         }
     }

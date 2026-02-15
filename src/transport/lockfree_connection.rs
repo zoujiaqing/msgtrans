@@ -12,7 +12,7 @@ use crate::{
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, oneshot};
 
 /// Lock-free connection commands
 #[derive(Debug)]
@@ -95,7 +95,7 @@ pub struct LockFreeConnection {
     /// Connection state (atomic operation)
     is_connected: AtomicBool,
     /// Command sender (lock-free)
-    command_tx: mpsc::Sender<LockFreeConnectionCommand>,
+    command_tx: flume::Sender<LockFreeConnectionCommand>,
     /// Event broadcaster
     event_tx: broadcast::Sender<TransportEvent>,
     /// Statistics information (atomic operations)
@@ -116,7 +116,7 @@ impl LockFreeConnection {
         session_id: SessionId,
         buffer_size: usize,
     ) -> (Self, tokio::task::JoinHandle<()>) {
-        let (command_tx, command_rx) = mpsc::channel(buffer_size.max(1));
+        let (command_tx, command_rx) = flume::bounded(buffer_size.max(1));
         let (event_tx, _) = broadcast::channel(buffer_size);
         let stats = Arc::new(LockFreeConnectionStats::new());
 
@@ -162,7 +162,7 @@ impl LockFreeConnection {
     /// Background connection worker - Handles all actual connection operations
     async fn connection_worker(
         mut connection: Box<dyn Connection>,
-        mut command_rx: mpsc::Receiver<LockFreeConnectionCommand>,
+        command_rx: flume::Receiver<LockFreeConnectionCommand>,
         event_tx: broadcast::Sender<TransportEvent>,
         stats: Arc<LockFreeConnectionStats>,
     ) {
@@ -172,7 +172,7 @@ impl LockFreeConnection {
         );
 
         // Process command queue
-        while let Some(command) = command_rx.recv().await {
+        while let Ok(command) = command_rx.recv_async().await {
             stats.update_queue_depth(command_rx.len() as u64);
 
             match command {
@@ -293,7 +293,7 @@ impl LockFreeConnection {
 
         // Non-blocking send command
         self.command_tx
-            .send(command)
+            .send_async(command)
             .await
             .map_err(|_| TransportError::connection_error("Connection closed", false))?;
 
@@ -310,7 +310,7 @@ impl LockFreeConnection {
         let command = LockFreeConnectionCommand::Close { response_tx };
 
         self.command_tx
-            .send(command)
+            .send_async(command)
             .await
             .map_err(|_| TransportError::connection_error("Connection closed", false))?;
 
@@ -332,7 +332,7 @@ impl LockFreeConnection {
         let command = LockFreeConnectionCommand::Flush { response_tx };
 
         self.command_tx
-            .send(command)
+            .send_async(command)
             .await
             .map_err(|_| TransportError::connection_error("Connection closed", false))?;
 
