@@ -219,6 +219,16 @@ impl OptimizedReadBuffer {
 
             // Validate header at current position
             if !self.is_valid_header_at(0) {
+                // Fast-fail for non-protocol traffic: if we have never parsed a valid packet
+                // on this connection, invalid first header means this is not msgtrans.
+                if self.stats.packets_parsed == 0 {
+                    tracing::warn!(
+                        "[PARSE] Invalid protocol header on first packet, closing connection"
+                    );
+                    return Err(TcpError::Config(
+                        "Invalid protocol header on first packet".to_string(),
+                    ));
+                }
                 tracing::debug!("[PARSE] Invalid header detected, attempting resync");
                 if !self.try_resync_frame() {
                     return Err(TcpError::BufferOverflow);
