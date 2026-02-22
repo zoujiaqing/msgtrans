@@ -200,8 +200,11 @@ impl OptimizedReadBuffer {
             return true;
         }
 
-        // Buffer too small, need more data
-        true
+        // Buffer too small and no valid header found - signal caller to stop parsing
+        // and wait for more data. Returning true here would cause an infinite loop
+        // in try_parse_next_packet() because the buffer is not consumed but still
+        // >= FIXED_HEADER_SIZE.
+        false
     }
 
     /// Try to parse next complete packet from buffer
