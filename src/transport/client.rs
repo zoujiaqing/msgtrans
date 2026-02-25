@@ -207,8 +207,8 @@ impl TransportClientBuilder {
 
     /// Build client transport layer - return TransportClient
     pub async fn build(self) -> Result<TransportClient, TransportError> {
-        // Create underlying Transport
-        let transport = Transport::new(self.transport_config).await?;
+        let ctx = crate::transport::context::TransportContext::new().await?;
+        let transport = Transport::with_context(self.transport_config, &ctx);
 
         Ok(TransportClient::new(
             transport,

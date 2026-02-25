@@ -7,8 +7,8 @@
 /// - Asynchronous queues
 use async_trait::async_trait;
 use quinn::{
-    ClientConfig, ClosedStream, ConnectError, Connection, ConnectionError, Endpoint, ReadError,
-    ReadToEndError, ServerConfig, WriteError,
+    ClientConfig, ClosedStream, ConnectError, Connection as QuinnConnection, ConnectionError,
+    Endpoint, ReadError, ReadToEndError, ServerConfig, WriteError,
 };
 use rustls::{
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
@@ -23,7 +23,9 @@ use crate::{
     error::TransportError,
     event::TransportEvent,
     packet::Packet,
-    protocol::{AdapterStats, ProtocolAdapter, QuicClientConfig, QuicServerConfig},
+    connection::Connection,
+    protocol::{AdapterStats, QuicClientConfig, QuicServerConfig},
+    transport::memory_pool::{shared_memory_pool, BufferSize},
     SessionId,
 };
 
@@ -330,7 +332,7 @@ pub struct QuicAdapter<C> {
 
 impl<C> QuicAdapter<C> {
     pub async fn new_with_connection(
-        connection: Connection,
+        connection: QuinnConnection,
         config: C,
         event_sender: broadcast::Sender<TransportEvent>,
         is_server: bool,
@@ -399,7 +401,7 @@ impl<C> QuicAdapter<C> {
     /// This version uses separate tasks for reading and writing to avoid blocking issues
     /// under high load where one direction could starve the other in a select! loop.
     async fn start_event_loop(
-        connection: Connection,
+        connection: QuinnConnection,
         session_id: Arc<std::sync::atomic::AtomicU64>,
         mut send_queue: mpsc::Receiver<Packet>,
         mut shutdown_signal: mpsc::UnboundedReceiver<()>,
@@ -574,9 +576,9 @@ impl<C> QuicAdapter<C> {
                 // Batch write optimization constants
                 const WRITE_BATCH_SIZE: usize = 32;
 
-                // Pre-allocate batch buffer and write buffer
+                let pool = shared_memory_pool();
                 let mut batch = Vec::with_capacity(WRITE_BATCH_SIZE);
-                let mut write_buf = bytes::BytesMut::with_capacity(64 * 1024); // 64KB write buffer
+                let mut write_buf = pool.get_buffer(BufferSize::Large);
 
                 loop {
                     if write_shutdown_flag.load(std::sync::atomic::Ordering::Relaxed) {
@@ -648,6 +650,9 @@ impl<C> QuicAdapter<C> {
                         }
                     }
                 }
+
+                write_buf.clear();
+                pool.return_buffer(write_buf, BufferSize::Large);
             });
 
             // Wait for shutdown signal or task completion
@@ -715,27 +720,22 @@ impl QuicAdapter<QuicClientConfig> {
 }
 
 #[async_trait]
-impl ProtocolAdapter for QuicAdapter<QuicClientConfig> {
-    type Config = QuicClientConfig;
-    type Error = QuicError;
-
-    async fn send(&mut self, packet: Packet) -> Result<(), Self::Error> {
+impl<C: Send + Sync + 'static> Connection for QuicAdapter<C> {
+    async fn send(&mut self, packet: Packet) -> Result<(), TransportError> {
         self.send_queue
             .send(packet)
             .await
-            .map_err(|_| QuicError::ConnectionClosed)?;
+            .map_err(|_| TransportError::connection_error("QUIC connection closed", false))?;
         Ok(())
     }
 
-    async fn close(&mut self) -> Result<(), Self::Error> {
-        tracing::debug!("[CLOSE] Close QUIC client connection");
+    async fn close(&mut self) -> Result<(), TransportError> {
+        tracing::debug!("[CLOSE] Close QUIC connection");
 
-        // Send shutdown signal
         if let Err(e) = self.shutdown_sender.send(()) {
             tracing::warn!("Failed to send shutdown signal: {:?}", e);
         }
 
-        // Wait for event loop to end
         if let Some(handle) = self.event_loop_handle.take() {
             if let Err(e) = handle.await {
                 tracing::warn!("Failed to wait for event loop to end: {:?}", e);
@@ -743,6 +743,15 @@ impl ProtocolAdapter for QuicAdapter<QuicClientConfig> {
         }
 
         Ok(())
+    }
+
+    fn session_id(&self) -> SessionId {
+        SessionId(self.session_id.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    fn set_session_id(&mut self, session_id: SessionId) {
+        self.session_id
+            .store(session_id.0, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn connection_info(&self) -> ConnectionInfo {
@@ -756,84 +765,14 @@ impl ProtocolAdapter for QuicAdapter<QuicClientConfig> {
         self.event_loop_handle.is_some()
     }
 
-    fn stats(&self) -> AdapterStats {
-        self.stats.clone()
-    }
-
-    fn session_id(&self) -> SessionId {
-        SessionId(self.session_id.load(std::sync::atomic::Ordering::SeqCst))
-    }
-
-    fn set_session_id(&mut self, session_id: SessionId) {
-        self.session_id
-            .store(session_id.0, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    async fn flush(&mut self) -> Result<(), Self::Error> {
-        // QUIC streams auto-flush
-        Ok(())
-    }
-}
-
-// Server adapter implementation
-#[async_trait]
-impl ProtocolAdapter for QuicAdapter<QuicServerConfig> {
-    type Config = QuicServerConfig;
-    type Error = QuicError;
-
-    async fn send(&mut self, packet: Packet) -> Result<(), Self::Error> {
-        self.send_queue
-            .send(packet)
-            .await
-            .map_err(|_| QuicError::ConnectionClosed)?;
+    async fn flush(&mut self) -> Result<(), TransportError> {
         Ok(())
     }
 
-    async fn close(&mut self) -> Result<(), Self::Error> {
-        tracing::debug!("[CLOSE] Close QUIC server connection");
-
-        // Send shutdown signal
-        if let Err(e) = self.shutdown_sender.send(()) {
-            tracing::warn!("Failed to send shutdown signal: {:?}", e);
-        }
-
-        // Wait for event loop to end
-        if let Some(handle) = self.event_loop_handle.take() {
-            if let Err(e) = handle.await {
-                tracing::warn!("Failed to wait for event loop to end: {:?}", e);
-            }
-        }
-
-        Ok(())
-    }
-
-    fn connection_info(&self) -> ConnectionInfo {
-        let mut info = ConnectionInfo::default();
-        info.protocol = "quic".to_string();
-        info.session_id = SessionId(self.session_id.load(std::sync::atomic::Ordering::SeqCst));
-        info
-    }
-
-    fn is_connected(&self) -> bool {
-        self.event_loop_handle.is_some()
-    }
-
-    fn stats(&self) -> AdapterStats {
-        self.stats.clone()
-    }
-
-    fn session_id(&self) -> SessionId {
-        SessionId(self.session_id.load(std::sync::atomic::Ordering::SeqCst))
-    }
-
-    fn set_session_id(&mut self, session_id: SessionId) {
-        self.session_id
-            .store(session_id.0, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    async fn flush(&mut self) -> Result<(), Self::Error> {
-        // QUIC streams auto-flush
-        Ok(())
+    fn event_stream(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<crate::event::TransportEvent>> {
+        Some(self.event_sender.subscribe())
     }
 }
 

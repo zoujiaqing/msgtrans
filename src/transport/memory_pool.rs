@@ -1,18 +1,27 @@
 use bytes::BytesMut;
-/// [MEMORY] Fully lock-free memory pool implementation
-///
-/// Optimization features:
-/// - Complete removal of RwLock, using lock-free data structures
-/// - Synchronous API to avoid async overhead
-/// - Intelligent cache management and adaptive adjustment
-/// - Zero-copy buffer reuse
-/// - Real-time performance monitoring and event broadcasting
 use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
-    Arc,
+    Arc, OnceLock,
 };
 
 use crate::transport::lockfree::LockFreeQueue;
+
+static SHARED_MEMORY_POOL: OnceLock<Arc<OptimizedMemoryPool>> = OnceLock::new();
+
+/// Register a memory pool as the globally shared instance.
+///
+/// Must be called before any adapter is created. Subsequent calls are no-ops
+/// (the first pool wins, matching OnceLock semantics).
+pub fn init_shared_memory_pool(pool: Arc<OptimizedMemoryPool>) {
+    let _ = SHARED_MEMORY_POOL.set(pool);
+}
+
+/// Get the globally shared memory pool (lazy-initializes a default if none was registered).
+pub fn shared_memory_pool() -> Arc<OptimizedMemoryPool> {
+    SHARED_MEMORY_POOL
+        .get_or_init(|| Arc::new(OptimizedMemoryPool::new()))
+        .clone()
+}
 
 /// [OPTIMIZED] Fully lock-free memory pool
 #[derive(Clone)]

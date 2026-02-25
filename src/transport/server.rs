@@ -222,53 +222,6 @@ impl Default for TransportServerBuilder {
     }
 }
 
-/* TODO: Old ServerTransport implementation - awaiting refactoring or removal
-/// Server control command (synchronous high-performance)
-#[derive(Debug)]
-enum ServerControlCommand {
-    AddSession(SessionId, Transport),
-    RemoveSession(SessionId),
-    Shutdown,
-}
-
-/// Hybrid architecture server transport
-///
-/// Uses optimized data structures and traditional structured code:
-/// - Lock-free session management (HashMap replacement)
-/// - Crossbeam synchronous control channel (Actor system simplification)
-/// - Unified Transport interface
-pub struct ServerTransport {
-    /// Lock-free session management (replacement for Arc<RwLock<HashMap>>)
-    sessions: Arc<LockFreeHashMap<SessionId, Transport>>,
-
-    /// Crossbeam synchronous control channel (replacement for Tokio)
-    control_tx: CrossbeamSender<ServerControlCommand>,
-    control_rx: Option<CrossbeamReceiver<ServerControlCommand>>,
-
-    // Temporarily removed: unified session manager (with event stream support)
-    // session_manager: Arc<SimplifiedSessionManager>,
-
-    /// Server instance management (keep Tokio Mutex for low-frequency operations)
-    servers: Arc<Mutex<HashMap<String, Box<dyn Server>>>>,
-
-    /// Server configuration
-    acceptor_config: AcceptorConfig,
-    rate_limiter: Option<RateLimiterConfig>,
-    middleware_stack: Vec<Box<dyn ServerMiddleware>>,
-    graceful_shutdown: Option<Duration>,
-
-    /// Protocol configuration - for creating server listeners
-    protocol_configs: std::collections::HashMap<String, Box<dyn crate::protocol::adapter::DynProtocolConfig>>,
-
-    /// Global Actor manager - shared by all Transport instances
-    global_actor_manager: Arc<crate::transport::actor::ActorManager>,
-
-    /// Session ID generator
-    session_id_generator: Arc<AtomicU64>,
-}
-
-// ... Rest of ServerTransport implementation is commented out ...
-*/
 
 /// Example middleware implementations
 

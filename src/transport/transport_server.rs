@@ -37,42 +37,32 @@ const LISTENER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_mi
 /// - Per-connection actor model (new!)
 /// - Optional legacy event system for backward compatibility
 pub struct TransportServer {
-    /// Configuration
     config: TransportConfig,
-    /// Session to transport layer mapping
+    /// Shared context for creating Transport instances (no global singletons)
+    context: Arc<crate::transport::context::TransportContext>,
     transports: Arc<LockFreeHashMap<SessionId, Arc<crate::transport::transport::Transport>>>,
-    /// Session handles for actor model
     session_handles: Arc<LockFreeHashMap<SessionId, SessionHandle>>,
-    /// Session ID generator
     session_id_generator: Arc<std::sync::atomic::AtomicU64>,
-    /// Server statistics
     stats: Arc<LockFreeHashMap<SessionId, TransportStats>>,
-    /// Event broadcaster (legacy mode)
     event_sender: broadcast::Sender<ServerEvent>,
-    /// Whether it's running
     is_running: Arc<std::sync::atomic::AtomicBool>,
-    /// Protocol configuration
     protocol_configs:
         std::collections::HashMap<String, Box<dyn crate::protocol::adapter::DynServerConfig>>,
-    /// Connection state manager
     state_manager: ConnectionStateManager,
-    /// Request tracker
     request_tracker: Arc<crate::transport::transport::RequestTracker>,
-    /// Message ID counter
     message_id_counter: std::sync::atomic::AtomicU32,
-    /// Session handler for actor mode
     session_handler: Option<Arc<dyn SessionHandler>>,
-    /// Buffer size for actor channels
     actor_buffer_size: usize,
 }
 
 impl TransportServer {
-    /// Create new TransportServer (legacy mode)
     pub async fn new(config: TransportConfig) -> Result<Self, TransportError> {
+        let ctx = Arc::new(crate::transport::context::TransportContext::new().await?);
         let (event_sender, _) = broadcast::channel(8192);
 
         Ok(Self {
             config,
+            context: ctx,
             transports: Arc::new(LockFreeHashMap::new()),
             session_handles: Arc::new(LockFreeHashMap::new()),
             session_id_generator: Arc::new(std::sync::atomic::AtomicU64::new(1)),
@@ -90,7 +80,6 @@ impl TransportServer {
         })
     }
 
-    /// Create server with protocol configuration (legacy mode)
     pub async fn new_with_protocols(
         config: TransportConfig,
         protocol_configs: std::collections::HashMap<
@@ -98,10 +87,12 @@ impl TransportServer {
             Box<dyn crate::protocol::adapter::DynServerConfig>,
         >,
     ) -> Result<Self, TransportError> {
+        let ctx = Arc::new(crate::transport::context::TransportContext::new().await?);
         let (event_sender, _) = broadcast::channel(8192);
 
         Ok(Self {
             config,
+            context: ctx,
             transports: Arc::new(LockFreeHashMap::new()),
             session_handles: Arc::new(LockFreeHashMap::new()),
             session_id_generator: Arc::new(std::sync::atomic::AtomicU64::new(1)),
@@ -119,7 +110,6 @@ impl TransportServer {
         })
     }
 
-    /// Create server with protocol configuration and handler (actor mode - recommended)
     pub async fn new_with_protocols_and_handler(
         config: TransportConfig,
         protocol_configs: std::collections::HashMap<
@@ -129,10 +119,12 @@ impl TransportServer {
         handler: Arc<dyn SessionHandler>,
         buffer_size: Option<usize>,
     ) -> Result<Self, TransportError> {
-        let (event_sender, _) = broadcast::channel(64); // Small buffer, not used in actor mode
+        let ctx = Arc::new(crate::transport::context::TransportContext::new().await?);
+        let (event_sender, _) = broadcast::channel(64);
 
         Ok(Self {
             config,
+            context: ctx,
             transports: Arc::new(LockFreeHashMap::new()),
             session_handles: Arc::new(LockFreeHashMap::new()),
             session_id_generator: Arc::new(std::sync::atomic::AtomicU64::new(1)),
@@ -377,27 +369,17 @@ impl TransportServer {
         let session_id = connection.session_id();
         let mut connection = connection;
 
-        // [CREATE] Create Transport instance
-        let transport = match crate::transport::transport::Transport::new(self.config.clone()).await {
-            Ok(transport) => Arc::new(transport),
-            Err(e) => {
-                tracing::error!(
-                    "[ERROR] Failed to create Transport for session {}: {:?}",
-                    session_id,
-                    e
-                );
-                let _ = connection.close().await;
-                return session_id;
-            }
-        };
+        let transport = Arc::new(
+            crate::transport::transport::Transport::with_context(self.config.clone(), &self.context),
+        );
 
         // [FIX] Subscribe to event stream BEFORE setting connection
         // This ensures that when adapter's event loop starts, there's already a subscriber ready
         // This prevents message loss during the time window between event loop start and consumer loop start
         let event_receiver_opt = connection.event_stream();
 
-        // Set connection to Transport
-        transport.set_connection(connection, session_id).await;
+        // Server manages its own event routing, skip Transport's internal consumer
+        transport.set_connection_no_consumer(connection, session_id).await;
 
         // Insert into transport layer mapping
         if let Err(e) = self.transports.insert(session_id, transport.clone()) {
@@ -1195,6 +1177,7 @@ impl Clone for TransportServer {
 
         Self {
             config: self.config.clone(),
+            context: self.context.clone(),
             transports: self.transports.clone(),
             session_id_generator: self.session_id_generator.clone(),
             stats: self.stats.clone(),
@@ -1203,7 +1186,7 @@ impl Clone for TransportServer {
             protocol_configs: cloned_configs,
             state_manager: self.state_manager.clone(),
             request_tracker: self.request_tracker.clone(),
-            message_id_counter: std::sync::atomic::AtomicU32::new(20000), // Re-initialize on clone
+            message_id_counter: std::sync::atomic::AtomicU32::new(20000),
             session_handles: self.session_handles.clone(),
             session_handler: self.session_handler.clone(),
             actor_buffer_size: self.actor_buffer_size,

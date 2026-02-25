@@ -14,7 +14,8 @@ use crate::{
     error::TransportError,
     event::TransportEvent,
     packet::Packet,
-    protocol::{AdapterStats, ProtocolAdapter, ProtocolConfig},
+    connection::Connection,
+    protocol::AdapterStats,
     ConnectionInfo, SessionId,
 };
 
@@ -391,23 +392,16 @@ impl<C> WebSocketAdapter<C> {
 }
 
 #[async_trait]
-impl<C> ProtocolAdapter for WebSocketAdapter<C>
-where
-    C: Send + Sync + 'static + ProtocolConfig,
-{
-    type Config = C;
-    type Error = WebSocketError;
-
-    async fn send(&mut self, packet: Packet) -> Result<(), Self::Error> {
-        // Use send queue instead of direct sending
+impl<C: Send + Sync + 'static> Connection for WebSocketAdapter<C> {
+    async fn send(&mut self, packet: Packet) -> Result<(), TransportError> {
         self.send_queue
             .send(packet)
             .await
-            .map_err(|_| WebSocketError::ConnectionClosed)?;
+            .map_err(|_| TransportError::connection_error("WebSocket connection closed", false))?;
         Ok(())
     }
 
-    async fn close(&mut self) -> Result<(), Self::Error> {
+    async fn close(&mut self) -> Result<(), TransportError> {
         let current_session_id =
             SessionId(self.session_id.load(std::sync::atomic::Ordering::SeqCst));
         tracing::debug!(
@@ -415,10 +409,8 @@ where
             current_session_id
         );
 
-        // Send shutdown signal
         let _ = self.shutdown_sender.send(());
 
-        // Wait for event loop to end
         if let Some(handle) = self.event_loop_handle.take() {
             let _ = handle.await;
         }
@@ -426,18 +418,6 @@ where
         self.is_connected
             .store(false, std::sync::atomic::Ordering::SeqCst);
         Ok(())
-    }
-
-    fn connection_info(&self) -> ConnectionInfo {
-        self.connection_info.clone()
-    }
-
-    fn is_connected(&self) -> bool {
-        self.is_connected.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    fn stats(&self) -> AdapterStats {
-        self.stats.clone()
     }
 
     fn session_id(&self) -> SessionId {
@@ -449,8 +429,22 @@ where
             .store(session_id.0, std::sync::atomic::Ordering::SeqCst);
     }
 
-    async fn flush(&mut self) -> Result<(), Self::Error> {
+    fn connection_info(&self) -> ConnectionInfo {
+        self.connection_info.clone()
+    }
+
+    fn is_connected(&self) -> bool {
+        self.is_connected.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    async fn flush(&mut self) -> Result<(), TransportError> {
         Ok(())
+    }
+
+    fn event_stream(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<crate::event::TransportEvent>> {
+        Some(self.event_sender.subscribe())
     }
 }
 

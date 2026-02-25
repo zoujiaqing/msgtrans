@@ -214,8 +214,6 @@ pub enum ConfigError {
     Io(#[from] std::io::Error),
 }
 
-/// TCP adapter configuration
-
 impl ServerConfig for TcpServerConfig {
     type Server = crate::adapters::factories::TcpServerWrapper;
 
@@ -252,7 +250,7 @@ impl ServerConfig for TcpServerConfig {
 }
 
 impl ClientConfig for TcpClientConfig {
-    type Connection = crate::connection::TcpConnection;
+    type Connection = crate::adapters::tcp::TcpAdapter<TcpClientConfig>;
 
     fn validate(&self) -> Result<(), TransportError> {
         ProtocolConfig::validate(self).map_err(|e| {
@@ -266,7 +264,7 @@ impl ClientConfig for TcpClientConfig {
     async fn build_connection(&self) -> Result<Self::Connection, TransportError> {
         use crate::adapters::tcp::TcpClientBuilder;
 
-        let adapter = TcpClientBuilder::new()
+        TcpClientBuilder::new()
             .target_address(self.target_address)
             .config(self.clone())
             .connect()
@@ -276,9 +274,7 @@ impl ClientConfig for TcpClientConfig {
                     format!("Failed to build TCP connection: {:?}", e),
                     true,
                 )
-            })?;
-
-        Ok(crate::connection::TcpConnection::new(adapter))
+            })
     }
 
     fn protocol_name(&self) -> &'static str {
@@ -324,7 +320,8 @@ impl ServerConfig for WebSocketServerConfig {
 }
 
 impl ClientConfig for WebSocketClientConfig {
-    type Connection = crate::adapters::factories::WebSocketConnection;
+    type Connection =
+        crate::adapters::websocket::WebSocketAdapter<WebSocketClientConfig>;
 
     fn validate(&self) -> Result<(), TransportError> {
         ProtocolConfig::validate(self).map_err(|e| {
@@ -338,7 +335,7 @@ impl ClientConfig for WebSocketClientConfig {
     async fn build_connection(&self) -> Result<Self::Connection, TransportError> {
         use crate::adapters::websocket::WebSocketClientBuilder;
 
-        let adapter = WebSocketClientBuilder::new()
+        WebSocketClientBuilder::new()
             .target_url(&self.target_url)
             .config(self.clone())
             .connect()
@@ -348,11 +345,7 @@ impl ClientConfig for WebSocketClientConfig {
                     format!("Failed to build WebSocket connection: {:?}", e),
                     true,
                 )
-            })?;
-
-        Ok(crate::adapters::factories::WebSocketConnection::new(
-            adapter,
-        ))
+            })
     }
 
     fn protocol_name(&self) -> &'static str {
@@ -396,7 +389,7 @@ impl ServerConfig for QuicServerConfig {
 }
 
 impl ClientConfig for QuicClientConfig {
-    type Connection = crate::adapters::factories::QuicConnection;
+    type Connection = crate::adapters::quic::QuicAdapter<QuicClientConfig>;
 
     fn validate(&self) -> Result<(), TransportError> {
         ProtocolConfig::validate(self).map_err(|e| {
@@ -410,7 +403,7 @@ impl ClientConfig for QuicClientConfig {
     async fn build_connection(&self) -> Result<Self::Connection, TransportError> {
         use crate::adapters::quic::QuicClientBuilder;
 
-        let adapter = QuicClientBuilder::new()
+        QuicClientBuilder::new()
             .target_address(self.target_address)
             .config(self.clone())
             .connect()
@@ -420,9 +413,7 @@ impl ClientConfig for QuicClientConfig {
                     format!("Failed to build QUIC connection: {:?}", e),
                     true,
                 )
-            })?;
-
-        Ok(crate::adapters::factories::QuicConnection::new(adapter))
+            })
     }
 
     fn protocol_name(&self) -> &'static str {

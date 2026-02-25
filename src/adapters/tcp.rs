@@ -3,7 +3,9 @@ use crate::{
     error::TransportError,
     event::TransportEvent,
     packet::{Packet, PacketError},
-    protocol::{AdapterStats, ProtocolAdapter, TcpClientConfig, TcpServerConfig},
+    connection::Connection,
+    protocol::{AdapterStats, TcpClientConfig, TcpServerConfig},
+    transport::memory_pool::{shared_memory_pool, BufferSize, OptimizedMemoryPool},
     SessionId,
 };
 use async_trait::async_trait;
@@ -71,47 +73,51 @@ const FIXED_HEADER_SIZE: usize = 16;
 /// Bound send queue to prevent unbounded memory growth under slow peers.
 const SEND_QUEUE_CAPACITY: usize = 8192;
 
-/// Optimized TCP read buffer with frame resync capability
-///
-/// Features:
-/// 1. Zero-copy packet parsing
-/// 2. Streaming read buffering
-/// 3. Memory pool reuse
-/// 4. Enhanced header validation
-/// 5. Frame resync on corruption detection
-#[derive(Debug)]
+/// Optimized TCP read buffer with frame resync and memory-pool recycling.
 struct OptimizedReadBuffer {
-    /// Main read buffer
     buffer: BytesMut,
-    /// Target buffer size
     target_capacity: usize,
-    /// Statistics
     stats: ReadBufferStats,
+    pool: Arc<OptimizedMemoryPool>,
+    buffer_tier: BufferSize,
 }
 
 #[derive(Debug, Default)]
 struct ReadBufferStats {
-    /// Number of reads
     reads: u64,
-    /// Number of parsed packets
     packets_parsed: u64,
-    /// Number of buffer reallocations
     reallocations: u64,
-    /// Total bytes read
     bytes_read: u64,
-    /// Number of resync attempts
     resync_attempts: u64,
-    /// Number of bytes discarded during resync
     bytes_discarded: u64,
 }
 
+impl Drop for OptimizedReadBuffer {
+    fn drop(&mut self) {
+        if self.buffer.capacity() > 0 {
+            let mut buf = std::mem::replace(&mut self.buffer, BytesMut::new());
+            buf.clear();
+            self.pool.return_buffer(buf, self.buffer_tier);
+        }
+    }
+}
+
 impl OptimizedReadBuffer {
-    /// Create new read buffer
-    fn new(initial_capacity: usize) -> Self {
+    fn new_with_pool(initial_capacity: usize, pool: Arc<OptimizedMemoryPool>) -> Self {
+        let buffer_tier = if initial_capacity <= 1024 {
+            BufferSize::Small
+        } else if initial_capacity <= 8192 {
+            BufferSize::Medium
+        } else {
+            BufferSize::Large
+        };
+        let buffer = pool.get_buffer(buffer_tier);
         Self {
-            buffer: BytesMut::with_capacity(initial_capacity),
+            buffer,
             target_capacity: initial_capacity,
             stats: ReadBufferStats::default(),
+            pool,
+            buffer_tier,
         }
     }
 
@@ -334,13 +340,11 @@ pub struct TcpAdapter<C> {
 }
 
 impl<C> TcpAdapter<C> {
-    /// Create new TCP adapter
     pub async fn new(
         stream: TcpStream,
         config: C,
         event_sender: broadcast::Sender<TransportEvent>,
     ) -> Result<Self, TcpError> {
-        // Set basic TCP options
         stream.set_nodelay(true)?;
 
         let local_addr = stream.local_addr()?;
@@ -353,19 +357,20 @@ impl<C> TcpAdapter<C> {
         connection_info.state = ConnectionState::Connected;
         connection_info.established_at = std::time::SystemTime::now();
 
-        let session_id = Arc::new(std::sync::atomic::AtomicU64::new(0)); // Temporary ID, will be set later
+        let session_id = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-        // Create communication channels
         let (send_queue_tx, send_queue_rx) = mpsc::channel(SEND_QUEUE_CAPACITY);
         let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel();
 
-        // Start event loop
+        let memory_pool = shared_memory_pool();
+
         let event_loop_handle = Self::start_event_loop(
             stream,
             session_id.clone(),
             send_queue_rx,
             shutdown_rx,
             event_sender.clone(),
+            memory_pool,
         )
         .await;
 
@@ -388,13 +393,13 @@ impl<C> TcpAdapter<C> {
         self.event_sender.subscribe()
     }
 
-    /// Start tokio::select! based event loop
     async fn start_event_loop(
         stream: TcpStream,
         session_id: Arc<std::sync::atomic::AtomicU64>,
         mut send_queue: mpsc::Receiver<Packet>,
         mut shutdown_signal: mpsc::UnboundedReceiver<()>,
         event_sender: broadcast::Sender<TransportEvent>,
+        memory_pool: Arc<OptimizedMemoryPool>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let current_session_id =
@@ -404,10 +409,8 @@ impl<C> TcpAdapter<C> {
                 current_session_id
             );
 
-            // Split read/write streams
             let (mut read_half, mut write_half) = stream.into_split();
-            // Keep read buffer across iterations to correctly handle sticky/partial packets.
-            let mut read_buffer = OptimizedReadBuffer::new(8192);
+            let mut read_buffer = OptimizedReadBuffer::new_with_pool(8192, memory_pool);
 
             'event_loop: loop {
                 // Get current session ID
@@ -561,60 +564,23 @@ impl TcpAdapter<TcpClientConfig> {
 }
 
 #[async_trait]
-impl ProtocolAdapter for TcpAdapter<TcpClientConfig> {
-    type Config = TcpClientConfig;
-    type Error = TcpError;
-
-    async fn send(&mut self, packet: Packet) -> Result<(), Self::Error> {
-        let current_session_id =
-            SessionId(self.session_id.load(std::sync::atomic::Ordering::SeqCst));
-        tracing::debug!(
-            "[SEND] TCP sending packet: {} bytes (session: {})",
-            packet.payload.len(),
-            current_session_id
-        );
-
-        // Send packet through queue, event loop will handle actual sending
+impl<C: Send + Sync + 'static> Connection for TcpAdapter<C> {
+    async fn send(&mut self, packet: Packet) -> Result<(), TransportError> {
         self.send_queue
             .send(packet)
             .await
-            .map_err(|_| TcpError::ConnectionClosed)?;
-
+            .map_err(|_| TransportError::connection_error("TCP connection closed", false))?;
         Ok(())
     }
 
-    async fn close(&mut self) -> Result<(), Self::Error> {
-        let current_session_id =
-            SessionId(self.session_id.load(std::sync::atomic::Ordering::SeqCst));
-        tracing::debug!(
-            "[CLOSE] Closing TCP connection (session: {})",
-            current_session_id
-        );
-
-        // Send shutdown signal
+    async fn close(&mut self) -> Result<(), TransportError> {
         let _ = self.shutdown_sender.send(());
-
-        // Wait for event loop to end
         if let Some(handle) = self.event_loop_handle.take() {
             let _ = handle.await;
         }
-
         self.connection_info.state = ConnectionState::Closed;
         self.connection_info.closed_at = Some(std::time::SystemTime::now());
-
         Ok(())
-    }
-
-    fn connection_info(&self) -> ConnectionInfo {
-        self.connection_info.clone()
-    }
-
-    fn is_connected(&self) -> bool {
-        self.connection_info.state == ConnectionState::Connected
-    }
-
-    fn stats(&self) -> AdapterStats {
-        self.stats.clone()
     }
 
     fn session_id(&self) -> SessionId {
@@ -627,58 +593,6 @@ impl ProtocolAdapter for TcpAdapter<TcpClientConfig> {
         self.connection_info.session_id = session_id;
     }
 
-    async fn flush(&mut self) -> Result<(), Self::Error> {
-        // In event-driven mode, flush is handled automatically by the event loop
-        Ok(())
-    }
-}
-
-// Server adapter implementation
-#[async_trait]
-impl ProtocolAdapter for TcpAdapter<TcpServerConfig> {
-    type Config = TcpServerConfig;
-    type Error = TcpError;
-
-    async fn send(&mut self, packet: Packet) -> Result<(), Self::Error> {
-        let current_session_id =
-            SessionId(self.session_id.load(std::sync::atomic::Ordering::SeqCst));
-        tracing::debug!(
-            "[SEND] TCP sending packet: {} bytes (session: {})",
-            packet.payload.len(),
-            current_session_id
-        );
-
-        // Send packet through queue, event loop will handle actual sending
-        self.send_queue
-            .send(packet)
-            .await
-            .map_err(|_| TcpError::ConnectionClosed)?;
-
-        Ok(())
-    }
-
-    async fn close(&mut self) -> Result<(), Self::Error> {
-        let current_session_id =
-            SessionId(self.session_id.load(std::sync::atomic::Ordering::SeqCst));
-        tracing::debug!(
-            "[CLOSE] Closing TCP connection (session: {})",
-            current_session_id
-        );
-
-        // Send shutdown signal
-        let _ = self.shutdown_sender.send(());
-
-        // Wait for event loop to end
-        if let Some(handle) = self.event_loop_handle.take() {
-            let _ = handle.await;
-        }
-
-        self.connection_info.state = ConnectionState::Closed;
-        self.connection_info.closed_at = Some(std::time::SystemTime::now());
-
-        Ok(())
-    }
-
     fn connection_info(&self) -> ConnectionInfo {
         self.connection_info.clone()
     }
@@ -687,23 +601,14 @@ impl ProtocolAdapter for TcpAdapter<TcpServerConfig> {
         self.connection_info.state == ConnectionState::Connected
     }
 
-    fn stats(&self) -> AdapterStats {
-        self.stats.clone()
-    }
-
-    fn session_id(&self) -> SessionId {
-        SessionId(self.session_id.load(std::sync::atomic::Ordering::SeqCst))
-    }
-
-    fn set_session_id(&mut self, session_id: SessionId) {
-        self.session_id
-            .store(session_id.0, std::sync::atomic::Ordering::SeqCst);
-        self.connection_info.session_id = session_id;
-    }
-
-    async fn flush(&mut self) -> Result<(), Self::Error> {
-        // In event-driven mode, flush is automatically handled by event loop
+    async fn flush(&mut self) -> Result<(), TransportError> {
         Ok(())
+    }
+
+    fn event_stream(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<crate::event::TransportEvent>> {
+        Some(self.event_sender.subscribe())
     }
 }
 

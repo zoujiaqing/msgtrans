@@ -37,9 +37,8 @@ pub mod server;
 pub mod transport;
 pub mod transport_server;
 
-// [CORE] High-performance components (enabled by default)
-pub mod actor;
 pub mod connection_factory;
+pub mod context;
 pub mod lockfree;
 pub mod lockfree_connection;
 pub mod memory_pool;
@@ -51,6 +50,7 @@ pub use client::{
     CircuitBreakerConfig, ConnectionOptions, ConnectionPoolConfig, ConnectionPriority,
     LoadBalancerConfig, RetryConfig, TransportClient, TransportClientBuilder,
 };
+pub use context::TransportContext;
 pub use server::TransportServerBuilder;
 pub use transport::Transport;
 pub use transport_server::TransportServer;
@@ -58,24 +58,14 @@ pub use transport_server::TransportServer;
 // [CONFIG] Configuration exports
 pub use config::TransportConfig;
 
-// [PROTOCOL] Protocol adapter traits
-pub use crate::protocol::adapter::ProtocolAdapter as ProtocolAdapterTrait;
-
-// [OPTIMIZED] Optimized component exports with unified naming
 pub use memory_pool::{
     BufferSize, MemoryPoolEvent, OptimizedMemoryPool as MemoryPool,
     OptimizedMemoryStats as MemoryStats, OptimizedMemoryStatsSnapshot as MemoryStatsSnapshot,
 };
 
 pub use protocol_adapter::{
-    create_test_packet, FlumePoweredProtocolAdapter as ProtocolAdapter,
-    LockFreeProtocolStats as ProtocolStats, PerformanceMetrics, ProtocolEvent,
-    ProtocolStatsSnapshot,
-};
-
-pub use actor::{
-    ActorCommand, ActorEvent, ActorManager, LockFreeActorStats as ActorStats,
-    OptimizedActor as Actor,
+    create_test_packet, FlumePoweredProtocolAdapter, LockFreeProtocolStats as ProtocolStats,
+    PerformanceMetrics, ProtocolEvent, ProtocolStatsSnapshot,
 };
 
 // [POOL] Connection pool exports

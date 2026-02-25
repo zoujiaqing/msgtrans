@@ -9,8 +9,8 @@
 
 /// msgtrans - Unified multi-protocol transport library
 ///
-/// This is a modern, high-performance Rust transport library providing unified interfaces for TCP, WebSocket and QUIC protocols.
-/// Designed based on Actor pattern, completely eliminates callback hell and provides type-safe event-driven API.
+/// High-performance Rust transport library providing unified interfaces for TCP, WebSocket and QUIC protocols.
+/// Event-driven architecture with a single `Connection` trait, zero-copy packets, and lock-free internals.
 // Transport layer
 pub mod transport;
 
@@ -82,37 +82,28 @@ pub use stream::{ClientEventStream, EventStream, PacketStream};
 
 pub use transport::{
     AcceptorConfig,
-    // High-performance components
-    Actor,
-    ActorManager,
     BackpressureStrategy,
     CircuitBreakerConfig,
-    // Connection pool and memory management
     ConnectionPool,
-    // Advanced configuration
     ConnectionPoolConfig,
     ExpertConfig,
     LoadBalancerConfig,
     LockFreeCounter,
-    // LockFree base components
     LockFreeHashMap,
     LockFreeQueue,
     MemoryPool,
     MemoryStats,
     MemoryStatsSnapshot,
     PerformanceConfig,
-    ProtocolAdapter,
     ProtocolStats,
     RateLimiterConfig,
     RetryConfig,
     SmartPoolConfig,
-    // Core transport types
     Transport,
-    // Client and server
     TransportClient,
-    // Builders
     TransportClientBuilder,
     TransportConfig,
+    TransportContext,
     TransportServer,
     TransportServerBuilder,
 };

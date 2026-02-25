@@ -1,131 +1,15 @@
 use crate::adapters::tcp;
 use crate::{
-    command::ConnectionInfo,
-    connection::{Connection, Server}, // Use unified connection interface
+    connection::{Connection, Server},
     protocol::{
         ProtocolFactory, QuicClientConfig, QuicServerConfig, TcpClientConfig, TcpServerConfig,
         WebSocketClientConfig, WebSocketServerConfig,
     },
-    Packet,
-    SessionId,
     TransportError,
 };
-/// Protocol factory implementation
-///
-/// Provides factory interface implementation for generic protocol adapters
 use async_trait::async_trait;
 use std::any::Any;
 use std::collections::HashMap;
-
-/// TCP adapter Connection wrapper (client)
-pub struct TcpClientConnection {
-    inner: tcp::TcpAdapter<TcpClientConfig>,
-}
-
-impl TcpClientConnection {
-    pub fn new(adapter: tcp::TcpAdapter<TcpClientConfig>) -> Self {
-        Self { inner: adapter }
-    }
-}
-
-#[async_trait]
-impl Connection for TcpClientConnection {
-    async fn send(&mut self, packet: Packet) -> Result<(), TransportError> {
-        use crate::protocol::ProtocolAdapter;
-        self.inner.send(packet).await.map_err(Into::into)
-    }
-
-    async fn close(&mut self) -> Result<(), TransportError> {
-        use crate::protocol::ProtocolAdapter;
-        self.inner.close().await.map_err(Into::into)
-    }
-
-    fn is_connected(&self) -> bool {
-        use crate::protocol::ProtocolAdapter;
-        self.inner.is_connected()
-    }
-
-    fn session_id(&self) -> SessionId {
-        use crate::protocol::ProtocolAdapter;
-        self.inner.session_id()
-    }
-
-    fn set_session_id(&mut self, session_id: SessionId) {
-        use crate::protocol::ProtocolAdapter;
-        self.inner.set_session_id(session_id);
-    }
-
-    fn connection_info(&self) -> ConnectionInfo {
-        use crate::protocol::ProtocolAdapter;
-        self.inner.connection_info()
-    }
-
-    async fn flush(&mut self) -> Result<(), TransportError> {
-        use crate::protocol::ProtocolAdapter;
-        self.inner.flush().await.map_err(Into::into)
-    }
-
-    fn event_stream(
-        &self,
-    ) -> Option<tokio::sync::broadcast::Receiver<crate::event::TransportEvent>> {
-        Some(self.inner.subscribe_events())
-    }
-}
-
-/// TCP server-side connection wrapper
-pub struct TcpServerConnection {
-    inner: tcp::TcpAdapter<TcpServerConfig>,
-}
-
-impl TcpServerConnection {
-    pub fn new(adapter: tcp::TcpAdapter<TcpServerConfig>) -> Self {
-        Self { inner: adapter }
-    }
-}
-
-#[async_trait]
-impl Connection for TcpServerConnection {
-    async fn send(&mut self, packet: Packet) -> Result<(), TransportError> {
-        use crate::protocol::ProtocolAdapter;
-        self.inner.send(packet).await.map_err(Into::into)
-    }
-
-    async fn close(&mut self) -> Result<(), TransportError> {
-        use crate::protocol::ProtocolAdapter;
-        self.inner.close().await.map_err(Into::into)
-    }
-
-    fn is_connected(&self) -> bool {
-        use crate::protocol::ProtocolAdapter;
-        self.inner.is_connected()
-    }
-
-    fn session_id(&self) -> SessionId {
-        use crate::protocol::ProtocolAdapter;
-        self.inner.session_id()
-    }
-
-    fn set_session_id(&mut self, session_id: SessionId) {
-        use crate::protocol::ProtocolAdapter;
-        self.inner.set_session_id(session_id);
-    }
-
-    fn connection_info(&self) -> ConnectionInfo {
-        use crate::protocol::ProtocolAdapter;
-        self.inner.connection_info()
-    }
-
-    async fn flush(&mut self) -> Result<(), TransportError> {
-        use crate::protocol::ProtocolAdapter;
-        self.inner.flush().await.map_err(Into::into)
-    }
-
-    fn event_stream(
-        &self,
-    ) -> Option<tokio::sync::broadcast::Receiver<crate::event::TransportEvent>> {
-        Some(self.inner.subscribe_events())
-    }
-}
 
 /// TCP server Server wrapper
 pub struct TcpServerWrapper {
@@ -145,7 +29,7 @@ impl Server for TcpServerWrapper {
             TransportError::connection_error(format!("TCP accept error: {:?}", e), true)
         })?;
 
-        Ok(Box::new(TcpServerConnection::new(adapter)))
+        Ok(Box::new(adapter))
     }
 
     fn local_addr(&self) -> Result<std::net::SocketAddr, TransportError> {
@@ -202,7 +86,7 @@ impl ProtocolFactory for TcpFactory {
                 TransportError::connection_error(format!("TCP connection failed: {:?}", e), true)
             })?;
 
-        Ok(Box::new(TcpClientConnection::new(adapter)))
+        Ok(Box::new(adapter))
     }
 
     async fn create_server(
@@ -247,7 +131,6 @@ impl ProtocolFactory for TcpFactory {
         &self,
         uri: &str,
     ) -> Result<(std::net::SocketAddr, HashMap<String, String>), TransportError> {
-        // Handle tcp://host:port format
         if let Some(stripped) = uri.strip_prefix("tcp://") {
             if let Ok(addr) = stripped.parse::<std::net::SocketAddr>() {
                 Ok((addr, HashMap::new()))
@@ -258,7 +141,6 @@ impl ProtocolFactory for TcpFactory {
                 ))
             }
         } else if let Ok(addr) = uri.parse::<std::net::SocketAddr>() {
-            // Support host:port format without scheme
             Ok((addr, HashMap::new()))
         } else {
             Err(TransportError::config_error(
@@ -269,66 +151,12 @@ impl ProtocolFactory for TcpFactory {
     }
 }
 
-/// WebSocket and QUIC factories (simplified version, not yet implemented)
+/// WebSocket factory
 pub struct WebSocketFactory;
-pub struct QuicFactory;
 
-// Simplified connection wrapper
-pub struct WebSocketConnection {
-    inner: crate::adapters::websocket::WebSocketAdapter<crate::protocol::WebSocketClientConfig>,
-}
-
-impl WebSocketConnection {
-    pub fn new(
-        adapter: crate::adapters::websocket::WebSocketAdapter<
-            crate::protocol::WebSocketClientConfig,
-        >,
-    ) -> Self {
-        Self { inner: adapter }
-    }
-}
-
-#[async_trait]
-impl Connection for WebSocketConnection {
-    async fn send(&mut self, packet: Packet) -> Result<(), TransportError> {
-        use crate::protocol::ProtocolAdapter;
-        self.inner.send(packet).await.map_err(Into::into)
-    }
-
-    async fn close(&mut self) -> Result<(), TransportError> {
-        use crate::protocol::ProtocolAdapter;
-        self.inner.close().await.map_err(Into::into)
-    }
-
-    fn is_connected(&self) -> bool {
-        use crate::protocol::ProtocolAdapter;
-        self.inner.is_connected()
-    }
-
-    fn session_id(&self) -> SessionId {
-        use crate::protocol::ProtocolAdapter;
-        self.inner.session_id()
-    }
-
-    fn set_session_id(&mut self, session_id: SessionId) {
-        use crate::protocol::ProtocolAdapter;
-        self.inner.set_session_id(session_id)
-    }
-
-    fn connection_info(&self) -> ConnectionInfo {
-        use crate::protocol::ProtocolAdapter;
-        self.inner.connection_info()
-    }
-
-    async fn flush(&mut self) -> Result<(), TransportError> {
-        use crate::protocol::ProtocolAdapter;
-        self.inner.flush().await.map_err(Into::into)
-    }
-
-    fn event_stream(
-        &self,
-    ) -> Option<tokio::sync::broadcast::Receiver<crate::event::TransportEvent>> {
-        Some(self.inner.subscribe_events())
+impl WebSocketFactory {
+    pub fn new() -> Self {
+        Self
     }
 }
 
@@ -344,64 +172,6 @@ impl WebSocketServerWrapper {
     }
 }
 
-pub struct WebSocketServerConnection {
-    inner: crate::adapters::websocket::WebSocketAdapter<crate::protocol::WebSocketServerConfig>,
-}
-
-impl WebSocketServerConnection {
-    pub fn new(
-        adapter: crate::adapters::websocket::WebSocketAdapter<
-            crate::protocol::WebSocketServerConfig,
-        >,
-    ) -> Self {
-        Self { inner: adapter }
-    }
-}
-
-#[async_trait]
-impl Connection for WebSocketServerConnection {
-    async fn send(&mut self, packet: Packet) -> Result<(), TransportError> {
-        use crate::protocol::ProtocolAdapter;
-        self.inner.send(packet).await.map_err(Into::into)
-    }
-
-    async fn close(&mut self) -> Result<(), TransportError> {
-        use crate::protocol::ProtocolAdapter;
-        self.inner.close().await.map_err(Into::into)
-    }
-
-    fn is_connected(&self) -> bool {
-        use crate::protocol::ProtocolAdapter;
-        self.inner.is_connected()
-    }
-
-    fn session_id(&self) -> SessionId {
-        use crate::protocol::ProtocolAdapter;
-        self.inner.session_id()
-    }
-
-    fn set_session_id(&mut self, session_id: SessionId) {
-        use crate::protocol::ProtocolAdapter;
-        self.inner.set_session_id(session_id)
-    }
-
-    fn connection_info(&self) -> ConnectionInfo {
-        use crate::protocol::ProtocolAdapter;
-        self.inner.connection_info()
-    }
-
-    async fn flush(&mut self) -> Result<(), TransportError> {
-        use crate::protocol::ProtocolAdapter;
-        self.inner.flush().await.map_err(Into::into)
-    }
-
-    fn event_stream(
-        &self,
-    ) -> Option<tokio::sync::broadcast::Receiver<crate::event::TransportEvent>> {
-        Some(self.inner.subscribe_events())
-    }
-}
-
 #[async_trait]
 impl Server for WebSocketServerWrapper {
     async fn accept(&mut self) -> Result<Box<dyn Connection>, TransportError> {
@@ -410,7 +180,7 @@ impl Server for WebSocketServerWrapper {
             .accept()
             .await
             .map_err(|e| TransportError::config_error("websocket", &e.to_string()))?;
-        Ok(Box::new(WebSocketServerConnection::new(adapter)))
+        Ok(Box::new(adapter))
     }
 
     fn local_addr(&self) -> Result<std::net::SocketAddr, TransportError> {
@@ -424,165 +194,6 @@ impl Server for WebSocketServerWrapper {
             .shutdown()
             .await
             .map_err(|e| TransportError::config_error("websocket", &e.to_string()))
-    }
-}
-
-pub struct QuicConnection {
-    inner: crate::adapters::quic::QuicAdapter<crate::protocol::QuicClientConfig>,
-}
-
-impl QuicConnection {
-    pub fn new(
-        adapter: crate::adapters::quic::QuicAdapter<crate::protocol::QuicClientConfig>,
-    ) -> Self {
-        Self { inner: adapter }
-    }
-}
-
-pub struct QuicServerConnection {
-    inner: crate::adapters::quic::QuicAdapter<crate::protocol::QuicServerConfig>,
-}
-
-impl QuicServerConnection {
-    pub fn new(
-        adapter: crate::adapters::quic::QuicAdapter<crate::protocol::QuicServerConfig>,
-    ) -> Self {
-        Self { inner: adapter }
-    }
-}
-
-#[async_trait]
-impl Connection for QuicServerConnection {
-    async fn send(&mut self, packet: Packet) -> Result<(), TransportError> {
-        use crate::protocol::ProtocolAdapter;
-        self.inner.send(packet).await.map_err(Into::into)
-    }
-
-    async fn close(&mut self) -> Result<(), TransportError> {
-        use crate::protocol::ProtocolAdapter;
-        self.inner.close().await.map_err(Into::into)
-    }
-
-    fn is_connected(&self) -> bool {
-        use crate::protocol::ProtocolAdapter;
-        self.inner.is_connected()
-    }
-
-    fn session_id(&self) -> SessionId {
-        use crate::protocol::ProtocolAdapter;
-        self.inner.session_id()
-    }
-
-    fn set_session_id(&mut self, session_id: SessionId) {
-        use crate::protocol::ProtocolAdapter;
-        self.inner.set_session_id(session_id)
-    }
-
-    fn connection_info(&self) -> ConnectionInfo {
-        use crate::protocol::ProtocolAdapter;
-        self.inner.connection_info()
-    }
-
-    async fn flush(&mut self) -> Result<(), TransportError> {
-        use crate::protocol::ProtocolAdapter;
-        self.inner.flush().await.map_err(Into::into)
-    }
-
-    fn event_stream(
-        &self,
-    ) -> Option<tokio::sync::broadcast::Receiver<crate::event::TransportEvent>> {
-        Some(self.inner.subscribe_events())
-    }
-}
-
-#[async_trait]
-impl Connection for QuicConnection {
-    async fn send(&mut self, packet: Packet) -> Result<(), TransportError> {
-        use crate::protocol::ProtocolAdapter;
-        self.inner.send(packet).await.map_err(Into::into)
-    }
-
-    async fn close(&mut self) -> Result<(), TransportError> {
-        use crate::protocol::ProtocolAdapter;
-        self.inner.close().await.map_err(Into::into)
-    }
-
-    fn is_connected(&self) -> bool {
-        use crate::protocol::ProtocolAdapter;
-        self.inner.is_connected()
-    }
-
-    fn session_id(&self) -> SessionId {
-        use crate::protocol::ProtocolAdapter;
-        self.inner.session_id()
-    }
-
-    fn set_session_id(&mut self, session_id: SessionId) {
-        use crate::protocol::ProtocolAdapter;
-        self.inner.set_session_id(session_id)
-    }
-
-    fn connection_info(&self) -> ConnectionInfo {
-        use crate::protocol::ProtocolAdapter;
-        self.inner.connection_info()
-    }
-
-    async fn flush(&mut self) -> Result<(), TransportError> {
-        use crate::protocol::ProtocolAdapter;
-        self.inner.flush().await.map_err(Into::into)
-    }
-
-    fn event_stream(
-        &self,
-    ) -> Option<tokio::sync::broadcast::Receiver<crate::event::TransportEvent>> {
-        Some(self.inner.subscribe_events())
-    }
-}
-
-pub struct QuicServerWrapper {
-    inner: crate::adapters::quic::QuicServer,
-}
-
-impl QuicServerWrapper {
-    pub fn new(server: crate::adapters::quic::QuicServer) -> Self {
-        Self { inner: server }
-    }
-}
-
-#[async_trait]
-impl Server for QuicServerWrapper {
-    async fn accept(&mut self) -> Result<Box<dyn Connection>, TransportError> {
-        let adapter = self
-            .inner
-            .accept()
-            .await
-            .map_err(|e| TransportError::config_error("quic", &e.to_string()))?;
-        Ok(Box::new(QuicServerConnection::new(adapter)))
-    }
-
-    fn local_addr(&self) -> Result<std::net::SocketAddr, TransportError> {
-        self.inner
-            .local_addr()
-            .map_err(|e| TransportError::config_error("quic", &e.to_string()))
-    }
-
-    async fn shutdown(&mut self) -> Result<(), TransportError> {
-        self.inner
-            .shutdown()
-            .await
-            .map_err(|e| TransportError::config_error("quic", &e.to_string()))
-    }
-}
-
-impl WebSocketFactory {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl QuicFactory {
-    pub fn new() -> Self {
-        Self
     }
 }
 
@@ -622,7 +233,7 @@ impl ProtocolFactory for WebSocketFactory {
                 )
             })?;
 
-        Ok(Box::new(WebSocketConnection::new(adapter)))
+        Ok(Box::new(adapter))
     }
 
     async fn create_server(
@@ -665,7 +276,6 @@ impl ProtocolFactory for WebSocketFactory {
         &self,
         uri: &str,
     ) -> Result<(std::net::SocketAddr, HashMap<String, String>), TransportError> {
-        // Parse ws://host:port/path or wss://host:port/path format
         if let Ok(url) = uri.parse::<url::Url>() {
             if let Some(host) = url.host_str() {
                 let port = url
@@ -702,6 +312,50 @@ impl ProtocolFactory for WebSocketFactory {
     }
 }
 
+/// QUIC factory
+pub struct QuicFactory;
+
+impl QuicFactory {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+pub struct QuicServerWrapper {
+    inner: crate::adapters::quic::QuicServer,
+}
+
+impl QuicServerWrapper {
+    pub fn new(server: crate::adapters::quic::QuicServer) -> Self {
+        Self { inner: server }
+    }
+}
+
+#[async_trait]
+impl Server for QuicServerWrapper {
+    async fn accept(&mut self) -> Result<Box<dyn Connection>, TransportError> {
+        let adapter = self
+            .inner
+            .accept()
+            .await
+            .map_err(|e| TransportError::config_error("quic", &e.to_string()))?;
+        Ok(Box::new(adapter))
+    }
+
+    fn local_addr(&self) -> Result<std::net::SocketAddr, TransportError> {
+        self.inner
+            .local_addr()
+            .map_err(|e| TransportError::config_error("quic", &e.to_string()))
+    }
+
+    async fn shutdown(&mut self) -> Result<(), TransportError> {
+        self.inner
+            .shutdown()
+            .await
+            .map_err(|e| TransportError::config_error("quic", &e.to_string()))
+    }
+}
+
 #[async_trait]
 impl ProtocolFactory for QuicFactory {
     fn protocol_name(&self) -> &'static str {
@@ -724,14 +378,13 @@ impl ProtocolFactory for QuicFactory {
             Box::new(QuicClientConfig::default())
         };
 
-        // Parse address from URI or use address from configuration
         let (addr, _) = self.parse_uri(uri)?;
 
         let adapter = crate::adapters::quic::QuicAdapter::connect(addr, *config)
             .await
             .map_err(|e| TransportError::connection_error(&e.to_string(), true))?;
 
-        Ok(Box::new(QuicConnection::new(adapter)))
+        Ok(Box::new(adapter))
     }
 
     async fn create_server(

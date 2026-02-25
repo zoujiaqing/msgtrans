@@ -8,7 +8,7 @@ pub mod protocol_adapter;
 pub mod server_config;
 
 // Re-export core types
-pub use adapter::{AdapterStats, ProtocolAdapter};
+pub use adapter::AdapterStats;
 pub use protocol::{
     BoxFuture, PluginManager, ProtocolFactory, ProtocolRegistry, ProtocolSet, StandardProtocols,
 };
