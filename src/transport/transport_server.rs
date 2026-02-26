@@ -147,7 +147,11 @@ impl TransportServer {
         self.session_handler.is_some()
     }
 
-    /// [LOCKFREE] Send packet to specified session - lock-free version
+    /// [LOCKFREE] Send packet to specified session
+    ///
+    /// In actor mode, the packet is routed through the session actor's mailbox,
+    /// which serializes sends per-connection and avoids Mutex contention on the
+    /// Transport layer. In legacy mode, sends go directly through Transport.
     pub async fn send_to_session(
         &self,
         session_id: SessionId,
@@ -160,24 +164,59 @@ impl TransportServer {
             packet.payload.len()
         );
 
+        // Actor mode: route through the actor mailbox (lock-free hot path)
+        if let Some(handle) = self.session_handles.get(&session_id) {
+            match handle.send_packet_with_reply(packet).await {
+                Ok(()) => {
+                    tracing::debug!(
+                        "[SUCCESS] Session {} send successful (via actor)",
+                        session_id
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    let error_msg = format!("{:?}", e);
+                    if error_msg.contains("Broken pipe")
+                        || error_msg.contains("Connection reset")
+                        || error_msg.contains("Connection closed")
+                        || error_msg.contains("ECONNRESET")
+                        || error_msg.contains("EPIPE")
+                        || error_msg.contains("Actor channel closed")
+                        || error_msg.contains("Actor dropped")
+                    {
+                        tracing::warn!(
+                            "[WARN] Session {} connection closed: {}",
+                            session_id,
+                            error_msg
+                        );
+                        let _ = self.remove_session(session_id).await;
+                        return Err(TransportError::connection_error(
+                            "Connection closed during send",
+                            false,
+                        ));
+                    } else {
+                        tracing::error!(
+                            "[ERROR] Session {} send failed: {:?}",
+                            session_id,
+                            e
+                        );
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
+        // Legacy mode fallback: send directly through Transport
         if let Some(transport) = self.transports.get(&session_id) {
-            // [STATUS] Status check - through Transport abstraction
             if !transport.is_connected().await {
                 tracing::warn!(
                     "[WARN] Session {} connection closed, skipping send",
                     session_id
                 );
-                // Clean up disconnected connection
                 let _ = self.remove_session(session_id).await;
                 return Err(TransportError::connection_error("Connection closed", false));
             }
 
-            tracing::debug!(
-                "[CHECK] Session {} connection status normal, starting packet send",
-                session_id
-            );
-
-            // [SEND] Send through Transport unified interface
             match transport.send(packet).await {
                 Ok(()) => {
                     tracing::debug!(
@@ -189,7 +228,6 @@ impl TransportServer {
                 Err(e) => {
                     tracing::error!("[ERROR] Session {} send failed: {:?}", session_id, e);
 
-                    // [FIX] Critical fix: check if it's a connection-related error
                     let error_msg = format!("{:?}", e);
                     if error_msg.contains("Broken pipe")
                         || error_msg.contains("Connection reset")
@@ -202,19 +240,18 @@ impl TransportServer {
                             session_id,
                             error_msg
                         );
-                        // Clean up disconnected connection
                         let _ = self.remove_session(session_id).await;
-                        return Err(TransportError::connection_error(
+                        Err(TransportError::connection_error(
                             "Connection closed during send",
                             false,
-                        ));
+                        ))
                     } else {
                         tracing::error!(
                             "[ERROR] Session {} send failed (non-connection error): {:?}",
                             session_id,
                             e
                         );
-                        return Err(e);
+                        Err(e)
                     }
                 }
             }
@@ -671,23 +708,46 @@ impl TransportServer {
     }
 
     /// Broadcast message to all sessions
+    ///
+    /// In actor mode, uses fire-and-forget sends through each actor's mailbox
+    /// for maximum throughput. In legacy mode, sends directly through Transport.
     pub async fn broadcast(&self, packet: Packet) -> Result<(), TransportError> {
         let mut success_count = 0;
         let mut error_count = 0;
 
-        // First collect all session IDs, then process one by one
-        let session_ids: Vec<SessionId> = self.transports.keys().unwrap_or_default();
-        for session_id in session_ids {
-            if let Some(transport) = self.transports.get(&session_id) {
-                match transport.send(packet.clone()).await {
-                    Ok(()) => success_count += 1,
-                    Err(e) => {
-                        error_count += 1;
-                        tracing::warn!(
-                            "[WARN] Broadcast to session {} failed: {:?}",
-                            session_id,
-                            e
-                        );
+        // Actor mode: broadcast via actor handles (fire-and-forget for speed)
+        if self.is_actor_mode() {
+            let session_ids: Vec<SessionId> = self.session_handles.keys().unwrap_or_default();
+            for session_id in session_ids {
+                if let Some(handle) = self.session_handles.get(&session_id) {
+                    match handle.send_packet(packet.clone()).await {
+                        Ok(()) => success_count += 1,
+                        Err(e) => {
+                            error_count += 1;
+                            tracing::warn!(
+                                "[WARN] Broadcast to session {} failed: {:?}",
+                                session_id,
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+        } else {
+            // Legacy mode: send directly through Transport
+            let session_ids: Vec<SessionId> = self.transports.keys().unwrap_or_default();
+            for session_id in session_ids {
+                if let Some(transport) = self.transports.get(&session_id) {
+                    match transport.send(packet.clone()).await {
+                        Ok(()) => success_count += 1,
+                        Err(e) => {
+                            error_count += 1;
+                            tracing::warn!(
+                                "[WARN] Broadcast to session {} failed: {:?}",
+                                session_id,
+                                e
+                            );
+                        }
                     }
                 }
             }

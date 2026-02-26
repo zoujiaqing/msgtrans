@@ -7,12 +7,33 @@
 //! Architecture:
 //! ```text
 //! Connection → flume(bounded) → SessionActor → SessionHandler
+//!                     ↑ also receives Send/Close commands from TransportServer
 //! ```
 
 use crate::{event::TransportEvent, packet::Packet, transport::transport::Transport, SessionId};
 use async_trait::async_trait;
 use flume::{bounded, Receiver, Sender};
 use std::sync::Arc;
+
+/// Messages that flow through the actor's mailbox.
+///
+/// Combines inbound events (from the connection reader) and outbound commands
+/// (from TransportServer's send path) into a single channel, eliminating the
+/// need for the server to lock the connection Mutex on sends.
+#[derive(Debug)]
+pub enum ActorMessage {
+    /// Inbound: a transport event from the connection reader task
+    InboundEvent(TransportEvent),
+    /// Outbound: send a packet through this actor's connection (fire-and-forget)
+    Send(Packet),
+    /// Outbound: send a packet and notify the caller of the result
+    SendWithReply {
+        packet: Packet,
+        reply: tokio::sync::oneshot::Sender<Result<(), crate::TransportError>>,
+    },
+    /// Command: gracefully close the connection
+    Close,
+}
 
 /// Session handler trait - business layer implements this to receive messages
 ///
@@ -178,14 +199,14 @@ impl Responder {
 /// When this is dropped, the actor will shut down.
 #[derive(Clone)]
 pub struct SessionHandle {
-    /// Channel to send events to the actor
-    pub(crate) tx: Sender<TransportEvent>,
-    /// Reference to the transport for sending
+    /// Channel to send messages (events + commands) to the actor
+    pub(crate) tx: Sender<ActorMessage>,
+    /// Reference to the transport (kept for backward compatibility / connection status checks)
     pub(crate) transport: Arc<Transport>,
 }
 
 impl SessionHandle {
-    /// Send an event to the session actor
+    /// Forward an inbound transport event to the actor
     ///
     /// This will apply backpressure if the channel is full.
     pub async fn send_event(
@@ -193,9 +214,43 @@ impl SessionHandle {
         event: TransportEvent,
     ) -> Result<(), tokio::sync::mpsc::error::SendError<TransportEvent>> {
         self.tx
-            .send_async(event)
+            .send_async(ActorMessage::InboundEvent(event))
             .await
-            .map_err(|e| tokio::sync::mpsc::error::SendError(e.0))
+            .map_err(|e| {
+                // Extract the TransportEvent from the ActorMessage for the error
+                match e.0 {
+                    ActorMessage::InboundEvent(evt) => {
+                        tokio::sync::mpsc::error::SendError(evt)
+                    }
+                    _ => unreachable!(),
+                }
+            })
+    }
+
+    /// Send a packet through the actor (fire-and-forget, no reply).
+    pub async fn send_packet(&self, packet: Packet) -> Result<(), crate::TransportError> {
+        self.tx
+            .send_async(ActorMessage::Send(packet))
+            .await
+            .map_err(|_| crate::TransportError::connection_error("Actor channel closed", false))
+    }
+
+    /// Send a packet through the actor and wait for the send result.
+    pub async fn send_packet_with_reply(
+        &self,
+        packet: Packet,
+    ) -> Result<(), crate::TransportError> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send_async(ActorMessage::SendWithReply {
+                packet,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| crate::TransportError::connection_error("Actor channel closed", false))?;
+        reply_rx.await.map_err(|_| {
+            crate::TransportError::connection_error("Actor dropped before reply", false)
+        })?
     }
 
     /// Get the transport for this session
@@ -210,16 +265,17 @@ const BATCH_SIZE: usize = 64;
 /// Session Actor - processes events for a single connection
 ///
 /// Each connection has exactly one SessionActor running in its own task.
-/// Events flow: Connection → mpsc → SessionActor → SessionHandler
+/// The actor's mailbox receives both inbound events and outbound send commands,
+/// ensuring all I/O for a connection is serialized through a single task.
 ///
-/// Uses batch processing (recv_many) for high throughput:
-/// - Reduces await/wake cycles by 64x
+/// Uses batch processing for high throughput:
+/// - Reduces await/wake cycles by up to 64x
 /// - Reduces channel lock contention
 /// - Better CPU cache utilization
 pub struct SessionActor {
     session_id: SessionId,
     transport: Arc<Transport>,
-    rx: Receiver<TransportEvent>,
+    rx: Receiver<ActorMessage>,
     handler: Arc<dyn SessionHandler>,
 }
 
@@ -228,7 +284,7 @@ impl SessionActor {
     pub fn new(
         session_id: SessionId,
         transport: Arc<Transport>,
-        rx: Receiver<TransportEvent>,
+        rx: Receiver<ActorMessage>,
         handler: Arc<dyn SessionHandler>,
     ) -> Self {
         Self {
@@ -241,9 +297,10 @@ impl SessionActor {
 
     /// Run the actor's event loop with batch processing
     ///
-    /// Uses recv_many() to process up to BATCH_SIZE events per await cycle.
-    /// This dramatically reduces scheduling overhead and improves throughput.
-    pub async fn run(mut self) {
+    /// Processes both inbound events (from the connection reader) and outbound
+    /// commands (send requests from TransportServer). This eliminates the need
+    /// for external callers to lock the connection Mutex.
+    pub async fn run(self) {
         tracing::debug!(
             "[ACTOR] SessionActor started for session {}",
             self.session_id
@@ -253,7 +310,7 @@ impl SessionActor {
         self.handler.on_connected(self.session_id).await;
 
         // Pre-allocate batch buffer to avoid repeated allocations
-        let mut batch = Vec::with_capacity(BATCH_SIZE);
+        let mut batch: Vec<ActorMessage> = Vec::with_capacity(BATCH_SIZE);
 
         // Create sender once, reuse for all messages (it's Clone + cheap)
         let sender = SessionSender::new(self.session_id, self.transport.clone());
@@ -261,7 +318,7 @@ impl SessionActor {
         loop {
             batch.clear();
 
-            // Batch receive: wait for first event, then drain up to BATCH_SIZE.
+            // Batch receive: wait for first message, then drain up to BATCH_SIZE.
             match self.rx.recv_async().await {
                 Ok(first) => batch.push(first),
                 Err(_) => break,
@@ -276,35 +333,71 @@ impl SessionActor {
 
             // Process batch
             let mut should_break = false;
-            for event in batch.drain(..) {
-                match event {
-                    TransportEvent::MessageReceived(packet) => {
-                        // Direct handler call - no spawn, no extra allocation
-                        self.handler
-                            .on_message(self.session_id, packet, sender.clone())
-                            .await;
+            for msg in batch.drain(..) {
+                match msg {
+                    ActorMessage::InboundEvent(event) => {
+                        match event {
+                            TransportEvent::MessageReceived(packet) => {
+                                // Direct handler call - no spawn, no extra allocation
+                                self.handler
+                                    .on_message(self.session_id, packet, sender.clone())
+                                    .await;
+                            }
+                            TransportEvent::MessageSent { packet_id } => {
+                                tracing::trace!(
+                                    "[ACTOR] Message {} sent for session {}",
+                                    packet_id,
+                                    self.session_id
+                                );
+                            }
+                            TransportEvent::ConnectionClosed { reason } => {
+                                tracing::debug!(
+                                    "[ACTOR] Session {} closed: {:?}",
+                                    self.session_id,
+                                    reason
+                                );
+                                self.handler
+                                    .on_disconnected(self.session_id, reason)
+                                    .await;
+                                should_break = true;
+                            }
+                            TransportEvent::TransportError { error } => {
+                                tracing::warn!(
+                                    "[ACTOR] Session {} error: {:?}",
+                                    self.session_id,
+                                    error
+                                );
+                                self.handler.on_error(self.session_id, error).await;
+                            }
+                            _ => {
+                                tracing::trace!(
+                                    "[ACTOR] Session {} received unhandled event",
+                                    self.session_id
+                                );
+                            }
+                        }
                     }
-                    TransportEvent::MessageSent { packet_id } => {
-                        tracing::trace!(
-                            "[ACTOR] Message {} sent for session {}",
-                            packet_id,
+                    ActorMessage::Send(packet) => {
+                        // Outbound send routed through actor — uses Transport::send
+                        // which holds the Mutex internally, but now serialized per-connection.
+                        if let Err(e) = self.transport.send(packet).await {
+                            tracing::warn!(
+                                "[ACTOR] Session {} send failed: {:?}",
+                                self.session_id,
+                                e
+                            );
+                        }
+                    }
+                    ActorMessage::SendWithReply { packet, reply } => {
+                        let result = self.transport.send(packet).await;
+                        let _ = reply.send(result);
+                    }
+                    ActorMessage::Close => {
+                        tracing::debug!(
+                            "[ACTOR] Session {} received close command",
                             self.session_id
                         );
-                    }
-                    TransportEvent::ConnectionClosed { reason } => {
-                        tracing::debug!("[ACTOR] Session {} closed: {:?}", self.session_id, reason);
-                        self.handler.on_disconnected(self.session_id, reason).await;
                         should_break = true;
-                    }
-                    TransportEvent::TransportError { error } => {
-                        tracing::warn!("[ACTOR] Session {} error: {:?}", self.session_id, error);
-                        self.handler.on_error(self.session_id, error).await;
-                    }
-                    _ => {
-                        tracing::trace!(
-                            "[ACTOR] Session {} received unhandled event",
-                            self.session_id
-                        );
                     }
                 }
             }
@@ -327,6 +420,7 @@ pub const DEFAULT_ACTOR_BUFFER_SIZE: usize = 2048;
 /// Create a new session actor pair (handle + actor)
 ///
 /// Returns the handle (for TransportServer) and the actor (to be spawned).
+/// The channel carries `ActorMessage` — both inbound events and outbound commands.
 pub fn create_session_actor(
     session_id: SessionId,
     transport: Arc<Transport>,

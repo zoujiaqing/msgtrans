@@ -155,6 +155,6 @@ pub use connection_factory::{
 
 // [ACTOR] Session actor model exports
 pub use session_actor::{
-    create_session_actor, Responder, SessionActor, SessionHandle, SessionHandler, SessionSender,
-    DEFAULT_ACTOR_BUFFER_SIZE,
+    create_session_actor, ActorMessage, Responder, SessionActor, SessionHandle, SessionHandler,
+    SessionSender, DEFAULT_ACTOR_BUFFER_SIZE,
 };
