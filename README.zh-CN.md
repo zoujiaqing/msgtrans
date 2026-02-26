@@ -694,7 +694,7 @@ cargo run --example echo_client_quic
 
 本项目采用 [Apache License 2.0](LICENSE) 许可证。
 
-Copyright © 2024 [Jiaqing Zou](mailto:zoujiaqing@gmail.com)
+Copyright © 2024 [zoujiaqing](mailto:zoujiaqing@gmail.com)
 
 ## 🤝 贡献
 

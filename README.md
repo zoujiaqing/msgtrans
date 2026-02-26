@@ -698,7 +698,7 @@ cargo run --example echo_client_quic
 
 This project is licensed under the [Apache License 2.0](LICENSE).
 
-Copyright © 2024 [Jiaqing Zou](mailto:zoujiaqing@gmail.com)
+Copyright © 2024 [zoujiaqing](mailto:zoujiaqing@gmail.com)
 
 ## 🤝 Contributing
 
@@ -706,4 +706,4 @@ Issues and Pull Requests are welcome! Please check the [Contributing Guide](CONT
 
 ---
 
-> 🎯 **MsgTrans Mission**: Make multi-protocol communication simple, efficient, and reliable, focusing on business logic rather than underlying transport details. 
+> 🎯 **MsgTrans Mission**: Make multi-protocol communication simple, efficient, and reliable, focusing on business logic rather than underlying transport details.
