@@ -33,6 +33,7 @@ pub mod connection_state;
 pub mod expert_config;
 pub mod pool;
 pub mod request_manager;
+pub mod request_registry;
 pub mod server;
 pub mod transport;
 pub mod transport_server;
@@ -92,6 +93,10 @@ pub use lockfree_connection::{
 
 // [STATE] Connection state management exports
 pub use connection_state::{ConnectionState, ConnectionStateManager};
+pub use request_registry::{
+    MarkResult as RequestMarkResult, RequestCountersSnapshot, RequestEntry, RequestRegistry,
+    RequestState,
+};
 
 use crate::packet::CompressionType;
 use bytes::Bytes;

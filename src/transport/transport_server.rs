@@ -28,6 +28,7 @@ use crate::{
 use std::sync::Arc;
 use tokio::sync::broadcast;
 const LISTENER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+const DEFAULT_REQUEST_LIFECYCLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// TransportServer - multi-protocol server
 ///
@@ -50,6 +51,7 @@ pub struct TransportServer {
         std::collections::HashMap<String, Box<dyn crate::protocol::adapter::DynServerConfig>>,
     state_manager: ConnectionStateManager,
     request_tracker: Arc<crate::transport::transport::RequestTracker>,
+    request_registry: Arc<crate::transport::request_registry::RequestRegistry>,
     message_id_counter: std::sync::atomic::AtomicU32,
     session_handler: Option<Arc<dyn SessionHandler>>,
     actor_buffer_size: usize,
@@ -74,6 +76,7 @@ impl TransportServer {
             request_tracker: Arc::new(
                 crate::transport::transport::RequestTracker::new_with_start_id(10000),
             ),
+            request_registry: Arc::new(crate::transport::request_registry::RequestRegistry::new()),
             message_id_counter: std::sync::atomic::AtomicU32::new(20000),
             session_handler: None,
             actor_buffer_size: DEFAULT_ACTOR_BUFFER_SIZE,
@@ -104,6 +107,7 @@ impl TransportServer {
             request_tracker: Arc::new(
                 crate::transport::transport::RequestTracker::new_with_start_id(10000),
             ),
+            request_registry: Arc::new(crate::transport::request_registry::RequestRegistry::new()),
             message_id_counter: std::sync::atomic::AtomicU32::new(20000),
             session_handler: None,
             actor_buffer_size: DEFAULT_ACTOR_BUFFER_SIZE,
@@ -136,6 +140,7 @@ impl TransportServer {
             request_tracker: Arc::new(
                 crate::transport::transport::RequestTracker::new_with_start_id(10000),
             ),
+            request_registry: Arc::new(crate::transport::request_registry::RequestRegistry::new()),
             message_id_counter: std::sync::atomic::AtomicU32::new(20000),
             session_handler: Some(handler),
             actor_buffer_size: buffer_size.unwrap_or(DEFAULT_ACTOR_BUFFER_SIZE),
@@ -528,6 +533,15 @@ impl TransportServer {
 
     /// Remove session
     pub async fn remove_session(&self, session_id: SessionId) -> Result<(), TransportError> {
+        let closed_pending = self.request_registry.close_session_pending(session_id);
+        if closed_pending > 0 {
+            tracing::debug!(
+                "[REQUEST] Session {} removed, marked {} pending requests as SessionClosed",
+                session_id,
+                closed_pending
+            );
+        }
+
         if let Err(e) = self.transports.remove(&session_id) {
             tracing::warn!(
                 "[WARN] Failed to remove transport for session {}: {:?}",
@@ -809,6 +823,7 @@ impl TransportServer {
 
         // Create vector of listen tasks
         let mut listen_tasks = Vec::new();
+        listen_tasks.push(self.start_request_timeout_scanner());
 
         // Start server for each protocol configuration
         for (protocol_name, protocol_config) in &self.protocol_configs {
@@ -984,6 +999,37 @@ impl TransportServer {
         Ok(task)
     }
 
+    fn start_request_timeout_scanner(&self) -> tokio::task::JoinHandle<()> {
+        let server_clone = self.clone();
+        tokio::spawn(async move {
+            let tick = server_clone.request_registry.tick_duration();
+            tracing::info!(
+                "[START] request timeout scanner started (tick={}ms)",
+                tick.as_millis()
+            );
+
+            loop {
+                if !server_clone
+                    .is_running
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    break;
+                }
+
+                tokio::time::sleep(tick).await;
+                let timed_out = server_clone.request_registry.scan_timeout_bucket();
+                if timed_out > 0 {
+                    tracing::warn!(
+                        "[TIMEOUT] request timeout scanner marked {} requests as TimedOut",
+                        timed_out
+                    );
+                }
+            }
+
+            tracing::info!("[STOP] request timeout scanner stopped");
+        })
+    }
+
     /// [INTERNAL] Internal method: extract listen address from protocol configuration
     fn get_protocol_bind_address(
         &self,
@@ -1013,9 +1059,22 @@ impl TransportServer {
                             packet.header.message_id,
                             packet.header.biz_type
                         );
+                        let registered = self.request_registry.register(
+                            packet.header.message_id,
+                            Some(session_id),
+                            packet.header.biz_type,
+                            DEFAULT_REQUEST_LIFECYCLE_TIMEOUT,
+                        );
+                        if !registered {
+                            tracing::warn!(
+                                "[REQUEST] Duplicate request registration detected: session={}, request_id={}",
+                                session_id,
+                                packet.header.message_id
+                            );
+                        }
                         // Create unified TransportContext
                         let server_clone = self.clone();
-                        let mut context = crate::event::TransportContext::new_request(
+                        let mut context = crate::event::TransportContext::new_request_with_registry(
                             Some(session_id),
                             packet.header.message_id,
                             packet.header.biz_type,
@@ -1056,6 +1115,7 @@ impl TransportServer {
                                     }
                                 });
                             }),
+                            Some(self.request_registry.clone()),
                         );
 
                         // [FIX] Fix BUG: set as primary instance, ensure request is correctly tracked and responded
@@ -1246,6 +1306,7 @@ impl Clone for TransportServer {
             protocol_configs: cloned_configs,
             state_manager: self.state_manager.clone(),
             request_tracker: self.request_tracker.clone(),
+            request_registry: self.request_registry.clone(),
             message_id_counter: std::sync::atomic::AtomicU32::new(20000),
             session_handles: self.session_handles.clone(),
             session_handler: self.session_handler.clone(),

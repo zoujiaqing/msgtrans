@@ -1,6 +1,7 @@
 use crate::command::ConnectionInfo;
 use crate::error::TransportError;
 use crate::packet::Packet;
+use crate::transport::request_registry::{MarkResult, RequestRegistry};
 use crate::{CloseReason, PacketId, SessionId};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -650,7 +651,6 @@ impl ClientEvent {
 }
 
 /// [TARGET] Unified transport context - used for all received messages
-#[derive(Clone)]
 pub struct TransportContext {
     /// Message source session ID (None for client, Some for server)
     pub peer: Option<SessionId>,
@@ -669,7 +669,6 @@ pub struct TransportContext {
 }
 
 /// Message type enumeration
-#[derive(Clone)]
 enum TransportContextKind {
     /// One-way message (no response needed)
     OneWay,
@@ -678,6 +677,7 @@ enum TransportContextKind {
         responder: Arc<dyn Fn(Vec<u8>) + Send + Sync + 'static>,
         responded: Arc<AtomicBool>,
         is_primary: bool, // Mark whether it's the primary instance
+        request_registry: Option<Arc<RequestRegistry>>,
     },
 }
 
@@ -710,6 +710,18 @@ impl TransportContext {
         data: Vec<u8>,
         responder: Arc<dyn Fn(Vec<u8>) + Send + Sync + 'static>,
     ) -> Self {
+        Self::new_request_with_registry(peer, message_id, biz_type, ext_header, data, responder, None)
+    }
+
+    pub(crate) fn new_request_with_registry(
+        peer: Option<SessionId>,
+        message_id: u32,
+        biz_type: u8,
+        ext_header: Option<Vec<u8>>,
+        data: Vec<u8>,
+        responder: Arc<dyn Fn(Vec<u8>) + Send + Sync + 'static>,
+        request_registry: Option<Arc<RequestRegistry>>,
+    ) -> Self {
         Self {
             peer,
             message_id,
@@ -721,6 +733,7 @@ impl TransportContext {
                 responder,
                 responded: Arc::new(AtomicBool::new(false)),
                 is_primary: false, // Default not primary instance
+                request_registry,
             },
         }
     }
@@ -748,16 +761,34 @@ impl TransportContext {
             TransportContextKind::Request {
                 responder,
                 responded,
+                request_registry,
                 ..
             } => {
+                if let Some(registry) = request_registry {
+                    match registry.mark_responded(self.message_id) {
+                        MarkResult::Updated => {}
+                        MarkResult::Already(state) => {
+                            tracing::debug!(
+                                "[RESPOND] Skip duplicate/late response: request_id={}, state={:?}",
+                                self.message_id,
+                                state
+                            );
+                            return;
+                        }
+                        MarkResult::NotFound => {
+                            // Registry is optional in transition period; fallback to local guard.
+                        }
+                    }
+                }
+
                 if responded
                     .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok()
                 {
                     responder(response);
                 } else {
-                    tracing::warn!(
-                        "[WARN] TransportContext already responded (ID: {})",
+                    tracing::debug!(
+                        "[RESPOND] TransportContext already responded locally (ID: {})",
                         self.message_id
                     );
                 }
@@ -774,6 +805,35 @@ impl TransportContext {
     /// Convenience method: respond with byte data
     pub fn respond_bytes(self, response: &[u8]) {
         self.respond(response.to_vec());
+    }
+}
+
+impl Clone for TransportContext {
+    fn clone(&self) -> Self {
+        let kind = match &self.kind {
+            TransportContextKind::OneWay => TransportContextKind::OneWay,
+            TransportContextKind::Request {
+                responder,
+                responded,
+                request_registry,
+                ..
+            } => TransportContextKind::Request {
+                responder: responder.clone(),
+                responded: responded.clone(),
+                // Clone instances should never be watchdog owners.
+                is_primary: false,
+                request_registry: request_registry.clone(),
+            },
+        };
+        Self {
+            peer: self.peer,
+            message_id: self.message_id,
+            biz_type: self.biz_type,
+            ext_header: self.ext_header.clone(),
+            data: self.data.clone(),
+            timestamp: self.timestamp,
+            kind,
+        }
     }
 }
 
@@ -797,26 +857,14 @@ impl Drop for TransportContext {
             ..
         } = &self.kind
         {
-            // Only primary instance checks response status
+            // Drop is now debug-only fallback. Main timeout detection is handled by RequestRegistry.
             if *is_primary && !responded.load(Ordering::SeqCst) {
-                // [PERF] Fix: delayed check, give application layer some time to handle event
-                // Clone data needed for checking
-                let message_id = self.message_id;
-                let responded_clone = responded.clone();
-
-                // Perform delayed check in separate task
-                tokio::spawn(async move {
-                    // Give application layer 10ms to handle event
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
-                    // Check again if responded
-                    if !responded_clone.load(Ordering::SeqCst) {
-                        tracing::warn!(
-                            "[WARN] TransportContext dropped without response (ID: {})",
-                            message_id
-                        );
-                    }
-                });
+                tracing::debug!(
+                    "[DROP] TransportContext dropped before response (request_id={}, session_id={:?}, biz_type={})",
+                    self.message_id,
+                    self.peer,
+                    self.biz_type
+                );
             }
         }
     }
