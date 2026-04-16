@@ -18,6 +18,15 @@ use tokio::{
     sync::{broadcast, mpsc},
 };
 
+/// Apply TCP keepalive to a TcpStream (cross-platform via socket2::SockRef)
+fn apply_tcp_keepalive(stream: &TcpStream, duration: std::time::Duration) {
+    let sock_ref = socket2::SockRef::from(&stream);
+    let keepalive = socket2::TcpKeepalive::new().with_time(duration);
+    if let Err(e) = sock_ref.set_tcp_keepalive(&keepalive) {
+        tracing::warn!("Failed to set TCP keepalive: {}", e);
+    }
+}
+
 /// TCP adapter error types
 #[derive(Debug, thiserror::Error)]
 pub enum TcpError {
@@ -559,6 +568,10 @@ impl TcpAdapter<TcpClientConfig> {
 
         tracing::debug!("[SUCCESS] TCP connection established successfully");
 
+        if let Some(keepalive) = config.keepalive {
+            apply_tcp_keepalive(&stream, keepalive);
+        }
+
         Self::new(stream, config, broadcast::channel(8192).0).await
     }
 }
@@ -680,6 +693,10 @@ impl TcpServer {
         let (stream, peer_addr) = listener.accept().await?;
 
         tracing::debug!("[CONNECT] TCP new connection from: {}", peer_addr);
+
+        if let Some(keepalive) = self.config.keepalive {
+            apply_tcp_keepalive(&stream, keepalive);
+        }
 
         TcpAdapter::new(stream, self.config.clone(), broadcast::channel(8192).0).await
     }

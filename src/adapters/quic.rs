@@ -256,6 +256,9 @@ fn configure_server_insecure_with_config(
     let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
     transport_config.receive_window((1500u32 * 100).into());
     transport_config.max_idle_timeout(Some(config.max_idle_timeout.try_into().unwrap()));
+    if let Some(keep_alive) = config.keep_alive_interval {
+        transport_config.keep_alive_interval(Some(keep_alive));
+    }
 
     (server_config, cert)
 }
@@ -309,6 +312,9 @@ fn configure_server_with_pem(
     let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
     transport_config.receive_window((1500u32 * 100).into());
     transport_config.max_idle_timeout(Some(config.max_idle_timeout.try_into().unwrap()));
+    if let Some(keep_alive) = config.keep_alive_interval {
+        transport_config.keep_alive_interval(Some(keep_alive));
+    }
 
     Ok((server_config, first_cert))
 }
