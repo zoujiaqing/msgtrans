@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "compression": 0,
+  "packet_type": 0,
+  "biz_type": 0,
+  "message_id": 1,
+  "ext_header_hex": "",
+  "payload_hex": "",
+  "reserved": 0
+}
