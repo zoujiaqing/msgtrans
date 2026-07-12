@@ -1,7 +1,7 @@
 /// Packet encapsulation and unpacking verification example
 ///
 /// Demonstrates basic serialization and deserialization functionality of the msgtrans unified packet system
-use msgtrans::packet::{Packet, PacketType};
+use msgtrans::packet::Packet;
 
 fn main() {
     println!("[START] Packet serialization and deserialization test");

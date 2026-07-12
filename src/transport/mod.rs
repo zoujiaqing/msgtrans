@@ -10,7 +10,7 @@ pub mod client;
 /// - **Progressive Enhancement**: Smart components ready for seamless integration
 ///
 /// ## High-Performance Component Architecture
-/// ```
+/// ```text
 /// ┌─────────────────────────────────────────────────────────────┐
 /// │                   High-Performance Transport                │
 /// ├─────────────────┬───────────────────┬───────────────────────┤
@@ -94,8 +94,8 @@ pub use lockfree_connection::{
 // [STATE] Connection state management exports
 pub use connection_state::{ConnectionState, ConnectionStateManager};
 pub use request_registry::{
-    MarkResult as RequestMarkResult, RequestCountersSnapshot, RequestEntry, RequestRegistry,
-    RequestState,
+    MarkResult as RequestMarkResult, RequestCountersSnapshot, RequestEntry, RequestKey,
+    RequestRegistry, RequestState,
 };
 
 use crate::packet::CompressionType;

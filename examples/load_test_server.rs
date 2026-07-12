@@ -14,7 +14,7 @@
 
 use async_trait::async_trait;
 use msgtrans::{
-    packet::Packet,
+    packet::{Packet, PacketType},
     protocol::QuicServerConfig,
     protocol::TcpServerConfig,
     protocol::WebSocketServerConfig,
@@ -33,8 +33,20 @@ struct EchoHandler;
 #[async_trait]
 impl SessionHandler for EchoHandler {
     async fn on_message(&self, _session_id: SessionId, packet: Packet, sender: SessionSender) {
-        // Echo the payload back using the sender
-        let _ = sender.send_data(packet.payload).await;
+        match packet.header.packet_type {
+            PacketType::Request => {
+                let _ = sender
+                    .respond(
+                        packet.header.message_id,
+                        packet.header.biz_type,
+                        packet.payload,
+                    )
+                    .await;
+            }
+            _ => {
+                let _ = sender.send_data(packet.payload).await;
+            }
+        }
     }
 
     async fn on_connected(&self, session_id: SessionId) {

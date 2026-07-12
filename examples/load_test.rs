@@ -13,7 +13,7 @@
 //!   --port            Server port (default: 8001 for tcp, 8002 for websocket, 8003 for quic)
 
 use msgtrans::{
-    event::ClientEvent,
+    event::{ClientEvent, TransportStatus},
     protocol::{QuicClientConfig, TcpClientConfig, WebSocketClientConfig},
     transport::client::TransportClientBuilder,
 };
@@ -56,8 +56,32 @@ impl Protocol {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TestMode {
+    Send,
+    Request,
+}
+
+impl TestMode {
+    fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "send" | "oneway" | "one-way" => Some(Self::Send),
+            "request" | "rpc" => Some(Self::Request),
+            _ => None,
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Send => "send",
+            Self::Request => "request",
+        }
+    }
+}
+
 struct Config {
     protocol: Protocol,
+    mode: TestMode,
     connections: usize,
     duration_secs: u64,
     message_size: usize,
@@ -70,6 +94,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             protocol: Protocol::Tcp,
+            mode: TestMode::Send,
             connections: 10,
             duration_secs: 10,
             message_size: 64,
@@ -105,6 +130,17 @@ fn parse_args() -> Config {
             "--connections" | "-c" => {
                 if i + 1 < args.len() {
                     config.connections = args[i + 1].parse().unwrap_or(10);
+                    i += 1;
+                }
+            }
+            "--mode" | "-m" => {
+                if i + 1 < args.len() {
+                    if let Some(mode) = TestMode::from_str(&args[i + 1]) {
+                        config.mode = mode;
+                    } else {
+                        eprintln!("Invalid mode: {}. Use send or request.", args[i + 1]);
+                        std::process::exit(1);
+                    }
                     i += 1;
                 }
             }
@@ -166,6 +202,7 @@ Usage:
 
 Options:
   -p, --protocol <PROTOCOL>      Protocol to test: tcp, websocket, quic [default: tcp]
+  -m, --mode <MODE>              Test mode: send, request [default: send]
   -c, --connections <NUM>        Number of concurrent connections [default: 10]
   -d, --duration <SECONDS>       Test duration in seconds [default: 10]
   -s, --message-size <BYTES>     Message size in bytes [default: 64]
@@ -177,6 +214,9 @@ Options:
 Examples:
   # Test TCP with 100 connections for 30 seconds
   cargo run --example load_test -- -p tcp -c 100 -d 30
+
+  # Test TCP request/response lifecycle
+  cargo run --example load_test -- -p tcp -m request -c 100 -d 30
 
   # Test WebSocket with 50 connections
   cargo run --example load_test -- -p websocket -c 50 -d 20
@@ -445,17 +485,41 @@ async fn run_client(
 
     while running.load(Ordering::Relaxed) {
         let start = Instant::now();
-        match transport.send(payload).await {
-            Ok(_) => {
-                stats.record_send(payload.len() as u64);
-                let latency = start.elapsed().as_micros() as u64;
-                stats.record_latency(latency);
+        match config.mode {
+            TestMode::Send => match transport.send(payload).await {
+                Ok(_) => {
+                    stats.record_send(payload.len() as u64);
+                    let latency = start.elapsed().as_micros() as u64;
+                    stats.record_latency(latency);
+                }
+                Err(_) => {
+                    stats.record_error();
+                    break;
+                }
+            },
+            TestMode::Request => match transport.request(payload).await {
+                Ok(result) => {
+                    stats.record_send(payload.len() as u64);
+                    let latency = start.elapsed().as_micros() as u64;
+                    stats.record_latency(latency);
+
+                    if result.status == TransportStatus::Completed {
+                        let received_len = result
+                            .data
+                            .as_ref()
+                            .map(|data| data.len())
+                            .unwrap_or_default();
+                        stats.record_receive(received_len as u64);
+                    } else {
+                        stats.record_error();
+                    }
+                }
+                Err(_) => {
+                    stats.record_error();
+                    break;
+                }
             }
-            Err(_) => {
-                stats.record_error();
-                break;
-            }
-        }
+        };
 
         // Wait for interval before sending next message
         // Use sleep even for 0ms to allow other tasks to run
@@ -490,6 +554,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
     println!("Configuration:");
     println!("  Protocol:            {}", config.protocol.name());
+    println!("  Mode:                {}", config.mode.name());
     println!("  Server:              {}:{}", config.host, config.port);
     println!("  Concurrent clients:  {}", config.connections);
     println!("  Duration:            {} seconds", config.duration_secs);
@@ -520,6 +585,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Clone config values needed in the task
         let protocol = config.protocol;
+        let mode = config.mode;
         let host = config.host.clone();
         let port = config.port;
         let message_size = config.message_size;
@@ -528,6 +594,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let handle = tokio::spawn(async move {
             let task_config = Config {
                 protocol,
+                mode,
                 connections: 1,
                 duration_secs: 0,
                 message_size,

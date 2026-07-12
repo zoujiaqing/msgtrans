@@ -3,8 +3,24 @@ use dashmap::{DashMap, DashSet};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
 const DEFAULT_TIMEOUT_BUCKET_COUNT: usize = 256;
 const DEFAULT_TIMEOUT_TICK: Duration = Duration::from_millis(100);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RequestKey {
+    pub session_id: Option<SessionId>,
+    pub request_id: u32,
+}
+
+impl RequestKey {
+    pub fn new(session_id: Option<SessionId>, request_id: u32) -> Self {
+        Self {
+            session_id,
+            request_id,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -31,8 +47,7 @@ impl RequestState {
 
 #[derive(Debug)]
 pub struct RequestEntry {
-    pub request_id: u32,
-    pub session_id: Option<SessionId>,
+    pub key: RequestKey,
     pub biz_type: u8,
     pub created_at: Instant,
     pub deadline_at: Instant,
@@ -40,6 +55,14 @@ pub struct RequestEntry {
 }
 
 impl RequestEntry {
+    pub fn request_id(&self) -> u32 {
+        self.key.request_id
+    }
+
+    pub fn session_id(&self) -> Option<SessionId> {
+        self.key.session_id
+    }
+
     pub fn state(&self) -> RequestState {
         RequestState::from_u8(self.state.load(Ordering::SeqCst)).unwrap_or(RequestState::Dropped)
     }
@@ -70,6 +93,7 @@ pub struct RequestCountersSnapshot {
     pub request_timeout_total: u64,
     pub duplicate_response_total: u64,
     pub session_closed_pending_total: u64,
+    pub response_send_failed_total: u64,
 }
 
 #[derive(Debug, Default)]
@@ -78,6 +102,7 @@ pub struct RequestCounters {
     request_timeout_total: AtomicU64,
     duplicate_response_total: AtomicU64,
     session_closed_pending_total: AtomicU64,
+    response_send_failed_total: AtomicU64,
 }
 
 impl RequestCounters {
@@ -87,16 +112,17 @@ impl RequestCounters {
             request_timeout_total: self.request_timeout_total.load(Ordering::Relaxed),
             duplicate_response_total: self.duplicate_response_total.load(Ordering::Relaxed),
             session_closed_pending_total: self.session_closed_pending_total.load(Ordering::Relaxed),
+            response_send_failed_total: self.response_send_failed_total.load(Ordering::Relaxed),
         }
     }
 }
 
 #[derive(Debug)]
 pub struct RequestRegistry {
-    entries: DashMap<u32, Arc<RequestEntry>>,
-    session_index: DashMap<SessionId, DashSet<u32>>,
+    entries: DashMap<RequestKey, Arc<RequestEntry>>,
+    session_index: DashMap<SessionId, DashSet<RequestKey>>,
     counters: RequestCounters,
-    buckets: Vec<std::sync::Mutex<Vec<u32>>>,
+    buckets: Vec<std::sync::Mutex<Vec<RequestKey>>>,
     bucket_count: usize,
     tick_duration: Duration,
     current_tick: AtomicU64,
@@ -144,42 +170,54 @@ impl RequestRegistry {
         biz_type: u8,
         timeout: Duration,
     ) -> bool {
+        let key = RequestKey::new(session_id, request_id);
         let now = Instant::now();
         let entry = Arc::new(RequestEntry {
-            request_id,
-            session_id,
+            key,
             biz_type,
             created_at: now,
             deadline_at: now + timeout,
             state: AtomicU8::new(RequestState::Pending as u8),
         });
 
-        if self.entries.insert(request_id, entry).is_some() {
+        if self.entries.insert(key, entry).is_some() {
             return false;
         }
 
         if let Some(sid) = session_id {
             let set = self.session_index.entry(sid).or_default();
-            set.insert(request_id);
+            set.insert(key);
         }
 
         self.counters.pending_requests.fetch_add(1, Ordering::Relaxed);
-        self.schedule_for_deadline(request_id, now + timeout);
+        self.schedule_for_deadline(key, now + timeout);
         true
     }
 
-    pub fn get_state(&self, request_id: u32) -> Option<RequestState> {
-        self.entries.get(&request_id).map(|entry| entry.state())
+    pub fn get_state(&self, session_id: Option<SessionId>, request_id: u32) -> Option<RequestState> {
+        self.entries
+            .get(&RequestKey::new(session_id, request_id))
+            .map(|entry| entry.state())
     }
 
-    pub fn mark_responded(&self, request_id: u32) -> MarkResult {
-        let Some(entry) = self.entries.get(&request_id) else {
+    pub fn active_len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn mark_responded(&self, session_id: Option<SessionId>, request_id: u32) -> MarkResult {
+        let key = RequestKey::new(session_id, request_id);
+        let Some(entry) = self.entries.get(&key) else {
+            self.counters
+                .duplicate_response_total
+                .fetch_add(1, Ordering::Relaxed);
             return MarkResult::NotFound;
         };
 
         match entry.try_transition(RequestState::Pending, RequestState::Responded) {
             Ok(_) => {
                 self.counters.pending_requests.fetch_sub(1, Ordering::Relaxed);
+                drop(entry);
+                self.remove_terminal_entry(key);
                 MarkResult::Updated
             }
             Err(state) => {
@@ -193,8 +231,8 @@ impl RequestRegistry {
         }
     }
 
-    pub fn mark_timed_out(&self, request_id: u32) -> MarkResult {
-        let Some(entry) = self.entries.get(&request_id) else {
+    pub fn mark_timed_out(&self, key: RequestKey) -> MarkResult {
+        let Some(entry) = self.entries.get(&key) else {
             return MarkResult::NotFound;
         };
 
@@ -204,20 +242,25 @@ impl RequestRegistry {
                 self.counters
                     .request_timeout_total
                     .fetch_add(1, Ordering::Relaxed);
+                drop(entry);
+                self.remove_terminal_entry(key);
                 MarkResult::Updated
             }
             Err(state) => MarkResult::Already(state),
         }
     }
 
-    pub fn mark_dropped(&self, request_id: u32) -> MarkResult {
-        let Some(entry) = self.entries.get(&request_id) else {
+    pub fn mark_dropped(&self, session_id: Option<SessionId>, request_id: u32) -> MarkResult {
+        let key = RequestKey::new(session_id, request_id);
+        let Some(entry) = self.entries.get(&key) else {
             return MarkResult::NotFound;
         };
 
         match entry.try_transition(RequestState::Pending, RequestState::Dropped) {
             Ok(_) => {
                 self.counters.pending_requests.fetch_sub(1, Ordering::Relaxed);
+                drop(entry);
+                self.remove_terminal_entry(key);
                 MarkResult::Updated
             }
             Err(state) => MarkResult::Already(state),
@@ -231,14 +274,17 @@ impl RequestRegistry {
 
         let mut closed = 0usize;
 
-        for request_id in ids.iter() {
-            if let Some(entry) = self.entries.get(request_id.key()) {
+        for key in ids.iter() {
+            if let Some(entry) = self.entries.get(key.key()) {
                 if entry
                     .try_transition(RequestState::Pending, RequestState::SessionClosed)
                     .is_ok()
                 {
                     closed += 1;
                     self.counters.pending_requests.fetch_sub(1, Ordering::Relaxed);
+                    let key = *key.key();
+                    drop(entry);
+                    self.entries.remove(&key);
                 }
             }
         }
@@ -250,6 +296,12 @@ impl RequestRegistry {
         }
 
         closed
+    }
+
+    pub fn record_response_send_failed(&self) {
+        self.counters
+            .response_send_failed_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn counters_snapshot(&self) -> RequestCountersSnapshot {
@@ -280,8 +332,8 @@ impl RequestRegistry {
         let now = Instant::now();
         let mut timed_out = 0usize;
 
-        for request_id in drained {
-            let Some(entry) = self.entries.get(&request_id) else {
+        for key in drained {
+            let Some(entry) = self.entries.get(&key) else {
                 continue;
             };
 
@@ -290,18 +342,28 @@ impl RequestRegistry {
             }
 
             if entry.deadline_at <= now {
-                if self.mark_timed_out(request_id) == MarkResult::Updated {
+                drop(entry);
+                if self.mark_timed_out(key) == MarkResult::Updated {
                     timed_out += 1;
                 }
             } else {
-                self.schedule_for_deadline(request_id, entry.deadline_at);
+                self.schedule_for_deadline(key, entry.deadline_at);
             }
         }
 
         timed_out
     }
 
-    fn schedule_for_deadline(&self, request_id: u32, deadline_at: Instant) {
+    fn remove_terminal_entry(&self, key: RequestKey) {
+        self.entries.remove(&key);
+        if let Some(session_id) = key.session_id {
+            if let Some(set) = self.session_index.get(&session_id) {
+                set.remove(&key);
+            }
+        }
+    }
+
+    fn schedule_for_deadline(&self, key: RequestKey, deadline_at: Instant) {
         let now = Instant::now();
         let ticks_from_now = if deadline_at <= now {
             1
@@ -316,7 +378,7 @@ impl RequestRegistry {
         let bucket_idx = (target_tick as usize) % self.bucket_count;
 
         if let Ok(mut bucket) = self.buckets[bucket_idx].lock() {
-            bucket.push(request_id);
+            bucket.push(key);
         }
     }
 }
@@ -329,40 +391,66 @@ mod tests {
     fn register_and_transition_to_responded_once() {
         let registry = RequestRegistry::new();
         let request_id = 42;
+        let session_id = Some(SessionId(7));
 
-        assert!(registry.register(request_id, Some(SessionId(7)), 1, Duration::from_secs(3)));
-        assert_eq!(registry.get_state(request_id), Some(RequestState::Pending));
-
-        assert_eq!(registry.mark_responded(request_id), MarkResult::Updated);
-        assert_eq!(registry.get_state(request_id), Some(RequestState::Responded));
+        assert!(registry.register(request_id, session_id, 1, Duration::from_secs(3)));
+        assert_eq!(
+            registry.get_state(session_id, request_id),
+            Some(RequestState::Pending)
+        );
 
         assert_eq!(
-            registry.mark_responded(request_id),
-            MarkResult::Already(RequestState::Responded)
+            registry.mark_responded(session_id, request_id),
+            MarkResult::Updated
+        );
+        assert_eq!(registry.get_state(session_id, request_id), None);
+
+        assert_eq!(
+            registry.mark_responded(session_id, request_id),
+            MarkResult::NotFound
         );
 
         let snapshot = registry.counters_snapshot();
         assert_eq!(snapshot.pending_requests, 0);
         assert_eq!(snapshot.duplicate_response_total, 1);
+        assert_eq!(registry.active_len(), 0);
+    }
+
+    #[test]
+    fn same_request_id_is_isolated_by_session() {
+        let registry = RequestRegistry::new();
+
+        assert!(registry.register(77, Some(SessionId(1)), 0, Duration::from_secs(3)));
+        assert!(registry.register(77, Some(SessionId(2)), 0, Duration::from_secs(3)));
+
+        assert_eq!(
+            registry.mark_responded(Some(SessionId(1)), 77),
+            MarkResult::Updated
+        );
+        assert_eq!(registry.get_state(Some(SessionId(1)), 77), None);
+        assert_eq!(
+            registry.get_state(Some(SessionId(2)), 77),
+            Some(RequestState::Pending)
+        );
+        assert_eq!(registry.pending_count(), 1);
     }
 
     #[test]
     fn timeout_only_updates_pending() {
         let registry = RequestRegistry::new();
         let request_id = 100;
+        let key = RequestKey::new(None, request_id);
 
         assert!(registry.register(request_id, None, 2, Duration::from_secs(1)));
-        assert_eq!(registry.mark_timed_out(request_id), MarkResult::Updated);
-        assert_eq!(registry.get_state(request_id), Some(RequestState::TimedOut));
+        assert_eq!(registry.mark_timed_out(key), MarkResult::Updated);
+        assert_eq!(registry.get_state(None, request_id), None);
 
-        assert_eq!(
-            registry.mark_timed_out(request_id),
-            MarkResult::Already(RequestState::TimedOut)
-        );
+        assert_eq!(registry.mark_timed_out(key), MarkResult::NotFound);
 
         let snapshot = registry.counters_snapshot();
         assert_eq!(snapshot.pending_requests, 0);
         assert_eq!(snapshot.request_timeout_total, 1);
+        assert_eq!(registry.active_len(), 0);
     }
 
     #[test]
@@ -377,20 +465,25 @@ mod tests {
         let closed = registry.close_session_pending(sid);
         assert_eq!(closed, 2);
 
-        assert_eq!(registry.get_state(1), Some(RequestState::SessionClosed));
-        assert_eq!(registry.get_state(2), Some(RequestState::SessionClosed));
-        assert_eq!(registry.get_state(3), Some(RequestState::Pending));
+        assert_eq!(registry.get_state(Some(sid), 1), None);
+        assert_eq!(registry.get_state(Some(sid), 2), None);
+        assert_eq!(
+            registry.get_state(Some(SessionId(1000)), 3),
+            Some(RequestState::Pending)
+        );
 
         let snapshot = registry.counters_snapshot();
         assert_eq!(snapshot.pending_requests, 1);
         assert_eq!(snapshot.session_closed_pending_total, 2);
+        assert_eq!(registry.active_len(), 1);
     }
 
     #[test]
-    fn duplicate_register_is_rejected() {
+    fn duplicate_register_is_rejected_within_same_session() {
         let registry = RequestRegistry::new();
-        assert!(registry.register(77, None, 0, Duration::from_secs(2)));
-        assert!(!registry.register(77, None, 0, Duration::from_secs(2)));
+        let sid = Some(SessionId(9));
+        assert!(registry.register(77, sid, 0, Duration::from_secs(2)));
+        assert!(!registry.register(77, sid, 0, Duration::from_secs(2)));
     }
 
     #[test]
@@ -407,7 +500,17 @@ mod tests {
         }
 
         assert!(timeout_total >= 1);
-        assert_eq!(registry.get_state(1), Some(RequestState::TimedOut));
-        assert_eq!(registry.get_state(2), Some(RequestState::Pending));
+        assert_eq!(registry.get_state(None, 1), None);
+        assert_eq!(registry.get_state(None, 2), Some(RequestState::Pending));
+        assert_eq!(registry.active_len(), 1);
+    }
+
+    #[test]
+    fn response_send_failure_is_counted() {
+        let registry = RequestRegistry::new();
+        registry.record_response_send_failed();
+
+        let snapshot = registry.counters_snapshot();
+        assert_eq!(snapshot.response_send_failed_total, 1);
     }
 }

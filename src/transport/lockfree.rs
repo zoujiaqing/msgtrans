@@ -319,7 +319,6 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::thread;
-    use std::time::Duration;
 
     #[test]
     fn test_lockfree_hashmap_basic() {

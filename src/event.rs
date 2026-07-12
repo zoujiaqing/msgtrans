@@ -765,7 +765,7 @@ impl TransportContext {
                 ..
             } => {
                 if let Some(registry) = request_registry {
-                    match registry.mark_responded(self.message_id) {
+                    match registry.mark_responded(self.peer, self.message_id) {
                         MarkResult::Updated => {}
                         MarkResult::Already(state) => {
                             tracing::debug!(
@@ -776,7 +776,12 @@ impl TransportContext {
                             return;
                         }
                         MarkResult::NotFound => {
-                            // Registry is optional in transition period; fallback to local guard.
+                            tracing::debug!(
+                                "[RESPOND] Skip response for inactive request: request_id={}, session_id={:?}",
+                                self.message_id,
+                                self.peer
+                            );
+                            return;
                         }
                     }
                 }

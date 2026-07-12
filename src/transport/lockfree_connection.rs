@@ -473,7 +473,6 @@ impl LockFreeConnection {
 mod tests {
     use super::*;
     use crate::packet::PacketType;
-    use bytes::Bytes;
 
     // Mock connection for testing
     struct MockConnection {

@@ -810,6 +810,8 @@ impl TransportServer {
 
         if self.protocol_configs.is_empty() {
             tracing::warn!("[WARN] No protocols configured, server cannot start listening");
+            self.is_running
+                .store(false, std::sync::atomic::Ordering::SeqCst);
             return Err(TransportError::config_error(
                 "protocols",
                 "No protocols configured",
@@ -823,7 +825,6 @@ impl TransportServer {
 
         // Create vector of listen tasks
         let mut listen_tasks = Vec::new();
-        listen_tasks.push(self.start_request_timeout_scanner());
 
         // Start server for each protocol configuration
         for (protocol_name, protocol_config) in &self.protocol_configs {
@@ -856,16 +857,28 @@ impl TransportServer {
                                 protocol_name,
                                 e
                             );
+                            self.is_running
+                                .store(false, std::sync::atomic::Ordering::SeqCst);
+                            for task in listen_tasks {
+                                task.abort();
+                            }
                             return Err(e);
                         }
                     }
                 }
                 Err(e) => {
                     tracing::error!("[ERROR] {} server build failed: {:?}", protocol_name, e);
+                    self.is_running
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                    for task in listen_tasks {
+                        task.abort();
+                    }
                     return Err(e);
                 }
             }
         }
+
+        listen_tasks.push(self.start_request_timeout_scanner());
 
         tracing::info!("[TARGET] All protocol servers started, waiting for connections...");
 
@@ -1074,6 +1087,7 @@ impl TransportServer {
                         }
                         // Create unified TransportContext
                         let server_clone = self.clone();
+                        let request_registry = self.request_registry.clone();
                         let mut context = crate::event::TransportContext::new_request_with_registry(
                             Some(session_id),
                             packet.header.message_id,
@@ -1086,6 +1100,7 @@ impl TransportServer {
                             packet.payload.clone(),
                             std::sync::Arc::new(move |response_data: Vec<u8>| {
                                 let server = server_clone.clone();
+                                let request_registry = request_registry.clone();
                                 let request_message_id = packet.header.message_id;
                                 let request_biz_type = packet.header.biz_type;
                                 tokio::spawn(async move {
@@ -1110,6 +1125,7 @@ impl TransportServer {
                                             tracing::debug!("[SUCCESS] Response sent successfully: session={}, request_id={}", session_id, request_message_id);
                                         }
                                         Err(e) => {
+                                            request_registry.record_response_send_failed();
                                             tracing::error!("[ERROR] Failed to send response: session={}, request_id={}, error={:?}", session_id, request_message_id, e);
                                         }
                                     }
