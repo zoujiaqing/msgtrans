@@ -334,6 +334,8 @@ pub struct QuicAdapter<C> {
     shutdown_sender: mpsc::UnboundedSender<()>,
     /// Event loop handle
     event_loop_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Frame decode policy (0=Lenient, 1=Strict), shared with the read task.
+    frame_policy: Arc<std::sync::atomic::AtomicU8>,
 }
 
 impl<C> QuicAdapter<C> {
@@ -361,6 +363,9 @@ impl<C> QuicAdapter<C> {
         // Create communication channels
         let (send_queue_tx, send_queue_rx) = mpsc::channel(SEND_QUEUE_CAPACITY);
         let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel();
+        let frame_policy = Arc::new(std::sync::atomic::AtomicU8::new(
+            crate::packet::FramePolicy::Lenient as u8,
+        ));
 
         // Start event loop
         let event_loop_handle = Self::start_event_loop(
@@ -370,6 +375,7 @@ impl<C> QuicAdapter<C> {
             shutdown_rx,
             event_sender.clone(),
             is_server,
+            frame_policy.clone(),
         )
         .await;
 
@@ -382,6 +388,7 @@ impl<C> QuicAdapter<C> {
             event_sender,
             shutdown_sender: shutdown_tx,
             event_loop_handle: Some(event_loop_handle),
+            frame_policy,
         })
     }
 
@@ -413,6 +420,7 @@ impl<C> QuicAdapter<C> {
         mut shutdown_signal: mpsc::UnboundedReceiver<()>,
         event_sender: broadcast::Sender<TransportEvent>,
         is_server: bool,
+        frame_policy: Arc<std::sync::atomic::AtomicU8>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let current_session_id =
@@ -478,6 +486,7 @@ impl<C> QuicAdapter<C> {
             let read_session_id = session_id.clone();
             let read_event_sender = event_sender.clone();
             let read_shutdown_flag = shutdown_flag.clone();
+            let read_frame_policy = frame_policy.clone();
             let read_task = tokio::spawn(async move {
                 let mut recv_stream = recv_stream;
                 let mut header_buf = [0u8; 4];
@@ -529,11 +538,37 @@ impl<C> QuicAdapter<C> {
                                         current_session_id
                                     );
 
+                                    let strict = crate::packet::FramePolicy::from(
+                                        read_frame_policy
+                                            .load(std::sync::atomic::Ordering::Relaxed),
+                                    ) == crate::packet::FramePolicy::Strict;
                                     let packet = if payload_buf.len() < 16 {
+                                        if strict {
+                                            let _ = read_event_sender.send(
+                                                TransportEvent::ConnectionClosed {
+                                                    reason: crate::error::CloseReason::Error(
+                                                        "Undecodable frame (strict policy)"
+                                                            .to_string(),
+                                                    ),
+                                                },
+                                            );
+                                            break;
+                                        }
                                         Packet::one_way(0, payload_buf)
                                     } else {
                                         match Packet::from_bytes(&payload_buf) {
                                             Ok(packet) => packet,
+                                            Err(_) if strict => {
+                                                let _ = read_event_sender.send(
+                                                    TransportEvent::ConnectionClosed {
+                                                        reason: crate::error::CloseReason::Error(
+                                                            "Undecodable frame (strict policy)"
+                                                                .to_string(),
+                                                        ),
+                                                    },
+                                                );
+                                                break;
+                                            }
                                             Err(_) => Packet::one_way(0, payload_buf),
                                         }
                                     };
@@ -787,6 +822,11 @@ impl<C: Send + Sync + 'static> Connection for QuicAdapter<C> {
         &self,
     ) -> Option<tokio::sync::broadcast::Receiver<crate::event::TransportEvent>> {
         Some(self.event_sender.subscribe())
+    }
+
+    fn set_frame_policy(&self, policy: crate::packet::FramePolicy) {
+        self.frame_policy
+            .store(policy as u8, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
