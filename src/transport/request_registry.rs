@@ -283,6 +283,36 @@ impl RequestRegistry {
         }
     }
 
+    /// Abandon a request (caller gave up or the connection dropped): mark it
+    /// Dropped and drop its waiter so the receiver observes cancellation.
+    /// Returns true if a pending request was aborted.
+    pub fn abort_waiter(&self, session_id: Option<SessionId>, request_id: u32) -> bool {
+        let aborted = matches!(
+            self.mark_dropped(session_id, request_id),
+            MarkResult::Updated
+        );
+        self.waiters
+            .remove(&RequestKey::new(session_id, request_id));
+        aborted
+    }
+
+    /// Abort every in-flight request (e.g. the connection closed), dropping all
+    /// waiters. Returns the number aborted.
+    pub fn abort_all(&self) -> usize {
+        let keys: Vec<RequestKey> = self.entries.iter().map(|e| *e.key()).collect();
+        let mut aborted = 0;
+        for key in keys {
+            if matches!(
+                self.mark_dropped(key.session_id, key.request_id),
+                MarkResult::Updated
+            ) {
+                aborted += 1;
+            }
+            self.waiters.remove(&key);
+        }
+        aborted
+    }
+
     pub fn get_state(&self, session_id: Option<SessionId>, request_id: u32) -> Option<RequestState> {
         self.entries
             .get(&RequestKey::new(session_id, request_id))
@@ -680,5 +710,34 @@ mod tests {
         assert!(registry
             .try_register_waiter(90, sid, 0, Duration::from_secs(5))
             .is_err());
+    }
+
+    #[test]
+    fn abort_waiter_drops_receiver() {
+        let registry = RequestRegistry::new();
+        let sid = Some(SessionId(11));
+        let mut rx = registry
+            .try_register_waiter(100, sid, 0, Duration::from_secs(5))
+            .expect("registers");
+        assert!(registry.abort_waiter(sid, 100));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
+        assert_eq!(registry.get_state(sid, 100), None);
+    }
+
+    #[test]
+    fn abort_all_drops_every_waiter() {
+        let registry = RequestRegistry::new();
+        let mut rx1 = registry
+            .try_register_waiter(1, Some(SessionId(1)), 0, Duration::from_secs(5))
+            .expect("registers");
+        let mut rx2 = registry
+            .try_register_waiter(2, None, 0, Duration::from_secs(5))
+            .expect("registers");
+        assert_eq!(registry.abort_all(), 2);
+        assert!(rx1.try_recv().is_err());
+        assert!(rx2.try_recv().is_err());
     }
 }
