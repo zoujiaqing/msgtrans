@@ -10,6 +10,7 @@
 //!                     ↑ also receives Send/Close commands from TransportServer
 //! ```
 
+use crate::transport::request_registry::{MarkResult, RequestRegistry};
 use crate::{event::TransportEvent, packet::Packet, transport::transport::Transport, SessionId};
 use async_trait::async_trait;
 use flume::{bounded, Receiver, Sender};
@@ -73,13 +74,20 @@ pub trait SessionHandler: Send + Sync + 'static {
 pub struct SessionSender {
     session_id: SessionId,
     transport: Arc<Transport>,
+    /// Inbound request registry (actor mode), used to mark responses idempotently.
+    inbound_registry: Option<Arc<RequestRegistry>>,
 }
 
 impl SessionSender {
-    pub(crate) fn new(session_id: SessionId, transport: Arc<Transport>) -> Self {
+    pub(crate) fn new(
+        session_id: SessionId,
+        transport: Arc<Transport>,
+        inbound_registry: Option<Arc<RequestRegistry>>,
+    ) -> Self {
         Self {
             session_id,
             transport,
+            inbound_registry,
         }
     }
 
@@ -101,6 +109,19 @@ impl SessionSender {
         biz_type: u8,
         data: Vec<u8>,
     ) -> Result<(), crate::TransportError> {
+        // Idempotent response: mark the inbound request Responded so the registry
+        // stops tracking it and duplicate/late responses are dropped — giving the
+        // actor path the same response semantics as the legacy path.
+        if let Some(registry) = &self.inbound_registry {
+            if registry.mark_responded(Some(self.session_id), message_id) != MarkResult::Updated {
+                tracing::debug!(
+                    "[ACTOR] Skip duplicate/late/unknown response: session={}, id={}",
+                    self.session_id,
+                    message_id
+                );
+                return Ok(());
+            }
+        }
         let response_packet = Packet {
             header: crate::packet::FixedHeader {
                 version: 1,
@@ -277,6 +298,7 @@ pub struct SessionActor {
     transport: Arc<Transport>,
     rx: Receiver<ActorMessage>,
     handler: Arc<dyn SessionHandler>,
+    inbound_registry: Option<Arc<RequestRegistry>>,
 }
 
 impl SessionActor {
@@ -292,7 +314,19 @@ impl SessionActor {
             transport,
             rx,
             handler,
+            inbound_registry: None,
         }
+    }
+
+    /// Attach the inbound request registry (actor mode) for idempotent responses
+    /// and shared lifecycle tracking. Internal, so the public `new` signature and
+    /// `create_session_actor` stay unchanged.
+    pub(crate) fn with_inbound_registry(
+        mut self,
+        inbound_registry: Option<Arc<RequestRegistry>>,
+    ) -> Self {
+        self.inbound_registry = inbound_registry;
+        self
     }
 
     /// Run the actor's event loop with batch processing
@@ -313,7 +347,11 @@ impl SessionActor {
         let mut batch: Vec<ActorMessage> = Vec::with_capacity(BATCH_SIZE);
 
         // Create sender once, reuse for all messages (it's Clone + cheap)
-        let sender = SessionSender::new(self.session_id, self.transport.clone());
+        let sender = SessionSender::new(
+            self.session_id,
+            self.transport.clone(),
+            self.inbound_registry.clone(),
+        );
 
         loop {
             batch.clear();

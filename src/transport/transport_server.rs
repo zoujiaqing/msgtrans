@@ -465,6 +465,7 @@ impl TransportServer {
                 handler.clone(),
                 self.actor_buffer_size,
             );
+            let actor = actor.with_inbound_registry(Some(self.request_registry.clone()));
             match self.session_handles.insert(session_id, handle.clone()) {
                 Ok(_) => {
                     tokio::spawn(actor.run());
@@ -508,6 +509,17 @@ impl TransportServer {
                                 )
                             {
                                 continue;
+                            }
+                            // Register inbound requests so the actor path shares the
+                            // same lifecycle treatment (timeout scan, batch-fail on
+                            // session close) and idempotent respond as legacy mode.
+                            if packet.header.packet_type == crate::packet::PacketType::Request {
+                                server_clone.request_registry.register(
+                                    packet.header.message_id,
+                                    Some(session_id),
+                                    packet.header.biz_type,
+                                    DEFAULT_REQUEST_LIFECYCLE_TIMEOUT,
+                                );
                             }
                         }
 
