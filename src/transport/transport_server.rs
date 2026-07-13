@@ -55,6 +55,7 @@ pub struct TransportServer {
     message_id_counter: std::sync::atomic::AtomicU32,
     session_handler: Option<Arc<dyn SessionHandler>>,
     actor_buffer_size: usize,
+    frame_policy: crate::packet::FramePolicy,
 }
 
 impl TransportServer {
@@ -80,6 +81,7 @@ impl TransportServer {
             message_id_counter: std::sync::atomic::AtomicU32::new(20000),
             session_handler: None,
             actor_buffer_size: DEFAULT_ACTOR_BUFFER_SIZE,
+            frame_policy: crate::packet::FramePolicy::Lenient,
         })
     }
 
@@ -111,6 +113,7 @@ impl TransportServer {
             message_id_counter: std::sync::atomic::AtomicU32::new(20000),
             session_handler: None,
             actor_buffer_size: DEFAULT_ACTOR_BUFFER_SIZE,
+            frame_policy: crate::packet::FramePolicy::Lenient,
         })
     }
 
@@ -144,12 +147,20 @@ impl TransportServer {
             message_id_counter: std::sync::atomic::AtomicU32::new(20000),
             session_handler: Some(handler),
             actor_buffer_size: buffer_size.unwrap_or(DEFAULT_ACTOR_BUFFER_SIZE),
+            frame_policy: crate::packet::FramePolicy::Lenient,
         })
     }
 
     /// Check if server is using actor mode
     pub fn is_actor_mode(&self) -> bool {
         self.session_handler.is_some()
+    }
+
+    /// Set the frame decode policy applied to accepted connections. Internal;
+    /// used by TransportServerBuilder to keep the public new*() signatures stable.
+    pub(crate) fn with_frame_policy(mut self, policy: crate::packet::FramePolicy) -> Self {
+        self.frame_policy = policy;
+        self
     }
 
     /// [LOCKFREE] Send packet to specified session
@@ -417,6 +428,7 @@ impl TransportServer {
         // [FIX] Use existing session ID from connection instead of generating new one
         let session_id = connection.session_id();
         let mut connection = connection;
+        connection.set_frame_policy(self.frame_policy);
 
         let transport = Arc::new(crate::transport::transport::Transport::with_context(
             self.config.clone(),
@@ -1381,6 +1393,7 @@ impl Clone for TransportServer {
             session_handles: self.session_handles.clone(),
             session_handler: self.session_handler.clone(),
             actor_buffer_size: self.actor_buffer_size,
+            frame_policy: self.frame_policy,
         }
     }
 }

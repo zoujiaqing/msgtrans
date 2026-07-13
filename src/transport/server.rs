@@ -93,6 +93,8 @@ pub struct TransportServerBuilder {
     session_handler: Option<std::sync::Arc<dyn super::session_actor::SessionHandler>>,
     /// Buffer size for actor channels
     actor_buffer_size: Option<usize>,
+    /// Frame decode policy applied to accepted connections.
+    frame_policy: crate::packet::FramePolicy,
 }
 
 impl TransportServerBuilder {
@@ -108,6 +110,7 @@ impl TransportServerBuilder {
             protocol_configs: std::collections::HashMap::new(),
             session_handler: None,
             actor_buffer_size: None,
+            frame_policy: crate::packet::FramePolicy::Lenient,
         }
     }
 
@@ -120,6 +123,15 @@ impl TransportServerBuilder {
     /// Server-specific: maximum connections
     pub fn max_connections(mut self, max: usize) -> Self {
         self.max_connections = max;
+        self
+    }
+
+    /// Set the frame decode policy applied to accepted connections (default Lenient).
+    ///
+    /// Under `Strict`, WebSocket/QUIC connections that receive an undecodable
+    /// frame are closed instead of downgrading it to a raw one-way message.
+    pub fn with_frame_policy(mut self, policy: crate::packet::FramePolicy) -> Self {
+        self.frame_policy = policy;
         self
     }
 
@@ -210,6 +222,7 @@ impl TransportServerBuilder {
             )
             .await?
         };
+        let transport_server = transport_server.with_frame_policy(self.frame_policy);
 
         tracing::info!("[SUCCESS] TransportServer build completed");
         Ok(transport_server)
