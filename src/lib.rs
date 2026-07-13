@@ -77,7 +77,7 @@ impl From<SessionId> for u64 {
 pub use command::{ConnectionInfo, TransportCommand, TransportStats};
 pub use error::{CloseReason, TransportError};
 pub use event::{ClientEvent, QuicEvent, TcpEvent, TransportEvent, WebSocketEvent};
-pub use packet::{Packet, PacketError, PacketType};
+pub use packet::{FramePolicy, Packet, PacketError, PacketType};
 pub use stream::{ClientEventStream, EventStream, PacketStream};
 
 pub use transport::{

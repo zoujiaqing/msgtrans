@@ -67,6 +67,31 @@ impl From<CompressionType> for u8 {
     }
 }
 
+/// How a protocol adapter treats a frame it cannot decode as a msgtrans packet.
+///
+/// The default is `Lenient`, preserving the historical WebSocket/QUIC behavior
+/// of delivering undecodable bytes as a raw one-way message. `Strict` treats
+/// such frames as a protocol error and closes the connection (matching how the
+/// TCP adapter already handles a malformed first packet).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum FramePolicy {
+    /// Deliver undecodable bytes as a raw one-way message (default).
+    #[default]
+    Lenient = 0,
+    /// Treat undecodable frames as a protocol error and close the connection.
+    Strict = 1,
+}
+
+impl From<u8> for FramePolicy {
+    fn from(value: u8) -> Self {
+        match value {
+            1 => FramePolicy::Strict,
+            _ => FramePolicy::Lenient,
+        }
+    }
+}
+
 /// Reserved field flags
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReservedFlags(u16);
