@@ -441,9 +441,13 @@ impl TransportServer {
         let event_receiver_opt = connection.event_stream();
 
         // Server manages its own event routing, skip Transport's internal consumer
+        // [G8-TIMING] 定位串行 session setup 各子阶段耗时
+        let _t = std::time::Instant::now();
         transport
             .set_connection_no_consumer(connection, session_id)
             .await;
+        let set_connection_ms = _t.elapsed().as_secs_f64() * 1000.0;
+        let _t_register = std::time::Instant::now();
 
         // Insert into transport layer mapping
         if let Err(e) = self.transports.insert(session_id, transport.clone()) {
@@ -468,6 +472,8 @@ impl TransportServer {
 
         // Register connection state
         self.state_manager.add_connection(session_id);
+        let register_ms = _t_register.elapsed().as_secs_f64() * 1000.0;
+        let _t_actor = std::time::Instant::now();
 
         // Actor mode: create per-session actor and keep a handle for event forwarding.
         let actor_handle = if let Some(handler) = &self.session_handler {
@@ -495,6 +501,8 @@ impl TransportServer {
         } else {
             None
         };
+        let actor_spawn_ms = _t_actor.elapsed().as_secs_f64() * 1000.0;
+        let _t_evloop = std::time::Instant::now();
 
         // [LOOP] Start event consumption loop, converting TransportEvent to ServerEvent
         // [FIX] Use the pre-subscribed event receiver to ensure no messages are lost
@@ -578,6 +586,11 @@ impl TransportServer {
             );
         }
 
+        let event_loop_spawn_ms = _t_evloop.elapsed().as_secs_f64() * 1000.0;
+        tracing::info!(
+            "[G8-TIMING] add_session {} set_conn={:.1} register={:.1} actor={:.1} evloop={:.1} ms",
+            session_id, set_connection_ms, register_ms, actor_spawn_ms, event_loop_spawn_ms
+        );
         tracing::info!(
             "[SUCCESS] TransportServer added session: {} (using Transport abstraction)",
             session_id
@@ -988,6 +1001,7 @@ impl TransportServer {
                     accept_count
                 );
 
+                let _t_accept = std::time::Instant::now();
                 match tokio::time::timeout(LISTENER_POLL_INTERVAL, server.accept()).await {
                     Err(_) => {
                         // Poll timeout, loop again and check stop flag.
@@ -995,6 +1009,8 @@ impl TransportServer {
                     }
                     Ok(accept_result) => match accept_result {
                         Ok(mut connection) => {
+                            // [G8-TIMING] accept 等待时长（有 backlog 时应≈0）
+                            let accept_wait_ms = _t_accept.elapsed().as_secs_f64() * 1000.0;
                             accept_count += 1;
                             tracing::info!(
                                 "[SUCCESS] {} accept successful! Connection #{}",
@@ -1023,7 +1039,13 @@ impl TransportServer {
                             );
 
                             // Add to session management
+                            let _t_add = std::time::Instant::now();
                             let actual_session_id = server_clone.add_session(connection).await;
+                            let add_session_ms = _t_add.elapsed().as_secs_f64() * 1000.0;
+                            tracing::info!(
+                                "[G8-TIMING] {} accept#{} accept_wait={:.1} add_session={:.1} ms",
+                                protocol_name, accept_count, accept_wait_ms, add_session_ms
+                            );
 
                             // Send connection established event
                             let connect_event = ServerEvent::ConnectionEstablished {
