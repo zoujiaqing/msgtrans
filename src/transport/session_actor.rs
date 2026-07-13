@@ -136,7 +136,14 @@ impl SessionSender {
             ext_header: Vec::new(),
             payload: data,
         };
-        self.transport.send(response_packet).await
+        let result = self.transport.send(response_packet).await;
+        if result.is_err() {
+            if let Some(registry) = &self.inbound_registry {
+                // Keep the actor path's failure metric consistent with legacy mode.
+                registry.record_response_send_failed();
+            }
+        }
+        result
     }
 
     /// Get the session ID

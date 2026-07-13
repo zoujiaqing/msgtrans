@@ -537,6 +537,23 @@ impl TransportServer {
                             .await;
                     }
                 }
+                // Teardown: proactively fail this session's pending requests when
+                // the consumption loop ends, instead of waiting for a later
+                // remove/session-close to reap them.
+                let closed_inbound = server_clone
+                    .request_registry
+                    .close_session_pending(session_id);
+                let failed_outbound = server_clone
+                    .request_tracker
+                    .fail_session(Some(session_id));
+                if closed_inbound > 0 || failed_outbound > 0 {
+                    tracing::debug!(
+                        "[END] Session {} loop ended: closed {} inbound, failed {} outbound pending",
+                        session_id,
+                        closed_inbound,
+                        failed_outbound
+                    );
+                }
                 tracing::info!(
                     "[END] TransportServer event consumption loop ended for session {}",
                     session_id
