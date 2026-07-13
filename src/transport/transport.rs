@@ -9,7 +9,6 @@ use crate::{
     Packet, SessionId, TransportError,
 };
 use bytes::Bytes;
-use dashmap::DashMap;
 use std::sync::{
     atomic::{AtomicU32, Ordering},
     Arc,
@@ -46,15 +45,23 @@ impl RequestTrackerKey {
     }
 }
 
+/// Fallback lifecycle deadline for waiter-based requests. The real timeout is
+/// enforced by the caller (tokio::time::timeout); this only bounds the entry if
+/// the caller forgets to remove it.
+const REQUEST_WAITER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Request/response waiter, kept as a thin facade over `RequestRegistry` — the
+/// single source of truth for request lifecycle. Preserves the historical
+/// `next_id` allocation and the `*_with_session*` API used on the hot paths.
 pub struct RequestTracker {
-    pending: DashMap<RequestTrackerKey, oneshot::Sender<Packet>>,
+    registry: Arc<crate::transport::request_registry::RequestRegistry>,
     next_id: AtomicU32,
 }
 
 impl RequestTracker {
     pub fn new() -> Self {
         Self {
-            pending: DashMap::new(),
+            registry: Arc::new(crate::transport::request_registry::RequestRegistry::new()),
             next_id: AtomicU32::new(1),
         }
     }
@@ -62,15 +69,37 @@ impl RequestTracker {
     /// Create RequestTracker with custom starting ID
     pub fn new_with_start_id(start_id: u32) -> Self {
         Self {
-            pending: DashMap::new(),
+            registry: Arc::new(crate::transport::request_registry::RequestRegistry::new()),
             next_id: AtomicU32::new(start_id),
         }
     }
+
+    fn register_waiter(
+        &self,
+        session_id: Option<SessionId>,
+        id: u32,
+    ) -> oneshot::Receiver<Packet> {
+        match self
+            .registry
+            .try_register_waiter(id, session_id, 0, REQUEST_WAITER_TIMEOUT)
+        {
+            Ok(rx) => rx,
+            Err(_) => {
+                tracing::warn!(
+                    "[REQUEST] Duplicate pending request refused: session_id={:?}, message_id={}",
+                    session_id,
+                    id
+                );
+                // Return an already-cancelled receiver so the caller fails fast
+                // instead of being matched to an unrelated response.
+                let (_tx, rx) = oneshot::channel();
+                rx
+            }
+        }
+    }
     pub fn register(&self) -> (u32, oneshot::Receiver<Packet>) {
-        let (tx, rx) = oneshot::channel();
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.pending.insert(RequestTrackerKey::new(None, id), tx);
-        (id, rx)
+        (id, self.register_waiter(None, id))
     }
 
     /// [FIX] Register request tracking with specified ID
@@ -91,16 +120,7 @@ impl RequestTracker {
         session_id: Option<SessionId>,
         id: u32,
     ) -> (u32, oneshot::Receiver<Packet>) {
-        let (tx, rx) = oneshot::channel();
-        let key = RequestTrackerKey::new(session_id, id);
-        if self.pending.insert(key, tx).is_some() {
-            tracing::warn!(
-                "[REQUEST] Duplicate pending request replaced: session_id={:?}, message_id={}",
-                session_id,
-                id
-            );
-        }
-        (id, rx)
+        (id, self.register_waiter(session_id, id))
     }
 
     pub fn complete(&self, id: u32, packet: Packet) -> bool {
@@ -117,12 +137,7 @@ impl RequestTracker {
         id: u32,
         packet: Packet,
     ) -> bool {
-        if let Some((_, tx)) = self.pending.remove(&RequestTrackerKey::new(session_id, id)) {
-            let _ = tx.send(packet);
-            true
-        } else {
-            false
-        }
+        self.registry.complete_waiter(session_id, id, packet)
     }
 
     pub fn remove(&self, id: u32) -> bool {
@@ -134,31 +149,20 @@ impl RequestTracker {
     }
 
     pub fn remove_with_session_id(&self, session_id: Option<SessionId>, id: u32) -> bool {
-        self.pending
-            .remove(&RequestTrackerKey::new(session_id, id))
-            .is_some()
+        self.registry.abort_waiter(session_id, id)
     }
 
     pub fn fail_session(&self, session_id: Option<SessionId>) -> usize {
-        let keys: Vec<RequestTrackerKey> = self
-            .pending
-            .iter()
-            .filter_map(|entry| {
-                let key = *entry.key();
-                (key.session_id == session_id).then_some(key)
-            })
-            .collect();
-        let removed = keys.len();
-        for key in keys {
-            self.pending.remove(&key);
+        match session_id {
+            Some(sid) => self.registry.close_session_pending(sid),
+            // None-session waiters are per-connection on the client; callers use
+            // fail_all() on teardown, so there is no separate None batch path.
+            None => 0,
         }
-        removed
     }
 
     pub fn fail_all(&self) -> usize {
-        let removed = self.pending.len();
-        self.pending.clear();
-        removed
+        self.registry.abort_all()
     }
 
     pub fn clear(&self) {
