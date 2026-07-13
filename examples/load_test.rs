@@ -418,7 +418,8 @@ async fn run_client(
                     stats.record_connection_failure();
                     return;
                 }
-            };
+            }
+            .danger_skip_verification();
             TransportClientBuilder::new()
                 .with_protocol(quic_config)
                 .connect_timeout(Duration::from_secs(10))
@@ -518,7 +519,7 @@ async fn run_client(
                     stats.record_error();
                     break;
                 }
-            }
+            },
         };
 
         // Wait for interval before sending next message

@@ -553,7 +553,7 @@ impl Default for QuicClientConfig {
             target_address: "127.0.0.1:443".parse().unwrap(),
             server_name: None,
             connect_timeout: Duration::from_secs(10),
-            verify_certificate: false, // 默认不验证证书，适合开发环境
+            verify_certificate: true,
             ca_cert_pem: None,
             max_concurrent_streams: 100,
             max_idle_timeout: Duration::from_secs(30),
@@ -677,6 +677,17 @@ impl QuicClientConfig {
         self
     }
 
+    /// Explicitly disable certificate verification.
+    ///
+    /// This is intended for local development and self-signed test servers only.
+    pub fn danger_skip_verification(mut self) -> Self {
+        tracing::warn!(
+            "[SECURITY] QUIC certificate verification disabled; use only for local testing"
+        );
+        self.verify_certificate = false;
+        self
+    }
+
     /// 设置自定义CA证书
     pub fn with_ca_cert_pem<S: Into<String>>(mut self, cert_pem: S) -> Self {
         self.ca_cert_pem = Some(cert_pem.into());
@@ -744,7 +755,7 @@ impl QuicClientConfig {
     /// 不安全客户端预设（仅用于测试）
     pub fn insecure(target_address: &str) -> Result<Self, ConfigError> {
         Ok(Self::new(target_address)?
-            .with_verify_certificate(false)
+            .danger_skip_verification()
             .with_server_name("localhost"))
     }
 }

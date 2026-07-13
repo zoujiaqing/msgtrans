@@ -5,6 +5,8 @@ use bytes::{Bytes, BytesMut};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
+const MAX_DECOMPRESSED_PAYLOAD_SIZE: usize = 16 * 1024 * 1024;
+
 /// Packet types - simplified to 3 core types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -539,9 +541,17 @@ impl Packet {
 
                     let mut decoder = ZlibDecoder::new(data);
                     let mut result = Vec::new();
+                    let limit = (MAX_DECOMPRESSED_PAYLOAD_SIZE + 1) as u64;
                     decoder
+                        .take(limit)
                         .read_to_end(&mut result)
                         .map_err(|e| PacketError::CompressionError(e.to_string()))?;
+                    if result.len() > MAX_DECOMPRESSED_PAYLOAD_SIZE {
+                        return Err(PacketError::CompressionError(format!(
+                            "decompressed payload exceeds {} bytes",
+                            MAX_DECOMPRESSED_PAYLOAD_SIZE
+                        )));
+                    }
                     Ok(result)
                 }
                 #[cfg(not(feature = "flate2"))]
@@ -552,7 +562,7 @@ impl Packet {
             CompressionType::Zstd => {
                 #[cfg(feature = "zstd")]
                 {
-                    zstd::bulk::decompress(data, 1024 * 1024)
+                    zstd::bulk::decompress(data, MAX_DECOMPRESSED_PAYLOAD_SIZE)
                         .map_err(|e| PacketError::CompressionError(e.to_string()))
                 }
                 #[cfg(not(feature = "zstd"))]
@@ -946,6 +956,38 @@ mod tests {
             let decompressed = Packet::decompress_data(&compressed, CompressionType::Zstd).unwrap();
             assert_eq!(original_data, decompressed);
         }
+    }
+
+    #[cfg(feature = "flate2")]
+    #[test]
+    fn zlib_decompress_rejects_payload_over_limit() {
+        // S3 regression: a small compressed blob that inflates past the 16MB cap
+        // must be rejected instead of exhausting memory via unbounded read_to_end.
+        use flate2::{write::ZlibEncoder, Compression};
+        use std::io::Write;
+
+        let bomb_input = vec![0u8; 17 * 1024 * 1024];
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&bomb_input).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        assert!(
+            Packet::decompress_data(&compressed, CompressionType::Zlib).is_err(),
+            "zlib decompression exceeding the cap must be rejected"
+        );
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn zstd_decompress_rejects_payload_over_limit() {
+        // S3 regression for the zstd path (previously capped at 1MB, now 16MB).
+        let bomb_input = vec![0u8; 17 * 1024 * 1024];
+        let compressed = zstd::bulk::compress(&bomb_input, 3).unwrap();
+
+        assert!(
+            Packet::decompress_data(&compressed, CompressionType::Zstd).is_err(),
+            "zstd decompression exceeding the cap must be rejected"
+        );
     }
 
     #[test]

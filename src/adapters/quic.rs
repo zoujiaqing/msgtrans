@@ -20,10 +20,10 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::{
     command::ConnectionInfo,
+    connection::Connection,
     error::TransportError,
     event::TransportEvent,
     packet::Packet,
-    connection::Connection,
     protocol::{AdapterStats, QuicClientConfig, QuicServerConfig},
     transport::memory_pool::{shared_memory_pool, BufferSize},
     SessionId,
@@ -206,8 +206,8 @@ fn configure_client_with_config(config: &QuicClientConfig) -> Result<ClientConfi
             .with_no_client_auth()
     } else {
         // Do not verify certificates (insecure mode)
-        tracing::debug!(
-            "[SECURITY] QUIC client using insecure mode (skip certificate verification)"
+        tracing::warn!(
+            "[SECURITY] QUIC client skipping certificate verification; this is insecure"
         );
         rustls::ClientConfig::builder()
             .dangerous()

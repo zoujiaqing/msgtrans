@@ -172,11 +172,14 @@ impl TransportError {
 /// 兼容性转换 - 从标准IO错误
 impl From<std::io::Error> for TransportError {
     fn from(error: std::io::Error) -> Self {
+        if error.kind() == std::io::ErrorKind::TimedOut {
+            return TransportError::timeout_error("io", Duration::from_secs(0));
+        }
+
         let retryable = match error.kind() {
             std::io::ErrorKind::ConnectionRefused
             | std::io::ErrorKind::ConnectionAborted
             | std::io::ErrorKind::ConnectionReset
-            | std::io::ErrorKind::TimedOut
             | std::io::ErrorKind::Interrupted => true,
             _ => false,
         };
@@ -191,11 +194,7 @@ impl From<std::io::Error> for TransportError {
 /// Convert from String - for lock-free error handling
 impl From<String> for TransportError {
     fn from(error: String) -> Self {
-        TransportError::Resource {
-            resource: "lockfree_operation".to_string(),
-            current: 0,
-            limit: 0,
-        }
+        TransportError::connection_error(error, false)
     }
 }
 

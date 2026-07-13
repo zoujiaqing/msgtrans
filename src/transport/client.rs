@@ -233,8 +233,6 @@ pub struct TransportClient {
     // [TARGET] Current connection session ID - Uses Arc<RwLock> for modification
     current_session_id: Arc<RwLock<Option<SessionId>>>,
     event_sender: tokio::sync::broadcast::Sender<crate::event::ClientEvent>,
-    // [TARGET] Message ID counter - For automatic message ID generation
-    message_id_counter: std::sync::atomic::AtomicU32,
     event_forwarding_running: Arc<AtomicBool>,
     event_forwarding_task: Arc<RwLock<Option<JoinHandle<()>>>>,
 }
@@ -251,7 +249,6 @@ impl TransportClient {
             protocol_config,
             current_session_id: Arc::new(RwLock::new(None)),
             event_sender: tokio::sync::broadcast::channel(8192).0,
-            message_id_counter: std::sync::atomic::AtomicU32::new(1),
             event_forwarding_running: Arc::new(AtomicBool::new(false)),
             event_forwarding_task: Arc::new(RwLock::new(None)),
         }
@@ -447,9 +444,7 @@ impl TransportClient {
             ));
         }
 
-        let message_id = self
-            .message_id_counter
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let message_id = self.inner.next_message_id();
         let packet = crate::packet::Packet::one_way(message_id, data.to_vec());
 
         tracing::debug!(
@@ -479,9 +474,7 @@ impl TransportClient {
             ));
         }
 
-        let message_id = self
-            .message_id_counter
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let message_id = self.inner.next_message_id();
         let packet = crate::packet::Packet::request(message_id, data.to_vec());
 
         tracing::debug!(
@@ -505,8 +498,7 @@ impl TransportClient {
                 ))
             }
             Err(e) => {
-                // Check if it's a timeout error
-                if e.to_string().contains("timeout") || e.to_string().contains("Timeout") {
+                if matches!(e, TransportError::Timeout { .. }) {
                     Ok(crate::event::TransportResult::new_timeout(None, message_id))
                 } else {
                     Err(e)

@@ -3,10 +3,8 @@ use crate::{
     event::TransportEvent,
     protocol::ProtocolRegistry,
     transport::{
-        config::TransportConfig,
-        connection_state::ConnectionStateManager,
-        context::TransportContext,
-        memory_pool::OptimizedMemoryPool,
+        config::TransportConfig, connection_state::ConnectionStateManager,
+        context::TransportContext, memory_pool::OptimizedMemoryPool,
     },
     Packet, SessionId, TransportError,
 };
@@ -33,8 +31,23 @@ pub struct Transport {
     request_tracker: Arc<RequestTracker>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RequestTrackerKey {
+    pub session_id: Option<SessionId>,
+    pub message_id: u32,
+}
+
+impl RequestTrackerKey {
+    pub fn new(session_id: Option<SessionId>, message_id: u32) -> Self {
+        Self {
+            session_id,
+            message_id,
+        }
+    }
+}
+
 pub struct RequestTracker {
-    pending: DashMap<u32, oneshot::Sender<Packet>>,
+    pending: DashMap<RequestTrackerKey, oneshot::Sender<Packet>>,
     next_id: AtomicU32,
 }
 
@@ -56,29 +69,104 @@ impl RequestTracker {
     pub fn register(&self) -> (u32, oneshot::Receiver<Packet>) {
         let (tx, rx) = oneshot::channel();
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.pending.insert(id, tx);
+        self.pending.insert(RequestTrackerKey::new(None, id), tx);
         (id, rx)
     }
 
     /// [FIX] Register request tracking with specified ID
     pub fn register_with_id(&self, id: u32) -> (u32, oneshot::Receiver<Packet>) {
+        self.register_with_session_id(None, id)
+    }
+
+    pub fn register_with_session(
+        &self,
+        session_id: SessionId,
+        id: u32,
+    ) -> (u32, oneshot::Receiver<Packet>) {
+        self.register_with_session_id(Some(session_id), id)
+    }
+
+    pub fn register_with_session_id(
+        &self,
+        session_id: Option<SessionId>,
+        id: u32,
+    ) -> (u32, oneshot::Receiver<Packet>) {
         let (tx, rx) = oneshot::channel();
-        self.pending.insert(id, tx);
+        let key = RequestTrackerKey::new(session_id, id);
+        if self.pending.insert(key, tx).is_some() {
+            tracing::warn!(
+                "[REQUEST] Duplicate pending request replaced: session_id={:?}, message_id={}",
+                session_id,
+                id
+            );
+        }
         (id, rx)
     }
+
     pub fn complete(&self, id: u32, packet: Packet) -> bool {
-        if let Some((_, tx)) = self.pending.remove(&id) {
+        self.complete_with_session_id(None, id, packet)
+    }
+
+    pub fn complete_with_session(&self, session_id: SessionId, id: u32, packet: Packet) -> bool {
+        self.complete_with_session_id(Some(session_id), id, packet)
+    }
+
+    pub fn complete_with_session_id(
+        &self,
+        session_id: Option<SessionId>,
+        id: u32,
+        packet: Packet,
+    ) -> bool {
+        if let Some((_, tx)) = self.pending.remove(&RequestTrackerKey::new(session_id, id)) {
             let _ = tx.send(packet);
             true
         } else {
             false
         }
     }
+
     pub fn remove(&self, id: u32) -> bool {
-        self.pending.remove(&id).is_some()
+        self.remove_with_session_id(None, id)
     }
-    pub fn clear(&self) {
+
+    pub fn remove_with_session(&self, session_id: SessionId, id: u32) -> bool {
+        self.remove_with_session_id(Some(session_id), id)
+    }
+
+    pub fn remove_with_session_id(&self, session_id: Option<SessionId>, id: u32) -> bool {
+        self.pending
+            .remove(&RequestTrackerKey::new(session_id, id))
+            .is_some()
+    }
+
+    pub fn fail_session(&self, session_id: Option<SessionId>) -> usize {
+        let keys: Vec<RequestTrackerKey> = self
+            .pending
+            .iter()
+            .filter_map(|entry| {
+                let key = *entry.key();
+                (key.session_id == session_id).then_some(key)
+            })
+            .collect();
+        let removed = keys.len();
+        for key in keys {
+            self.pending.remove(&key);
+        }
+        removed
+    }
+
+    pub fn fail_all(&self) -> usize {
+        let removed = self.pending.len();
         self.pending.clear();
+        removed
+    }
+
+    pub fn clear(&self) {
+        self.fail_all();
+    }
+
+    pub fn next_message_id(&self) -> u32 {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 }
 
@@ -141,6 +229,14 @@ impl Transport {
         }
 
         tracing::info!("[CONN] Starting graceful session shutdown: {}", session_id);
+        let failed_pending = self.request_tracker.fail_all();
+        if failed_pending > 0 {
+            tracing::debug!(
+                "[REQUEST] Failed {} pending requests during session {} shutdown",
+                failed_pending,
+                session_id
+            );
+        }
 
         // 2. Execute actual close logic (underlying adapter will automatically send close event)
         self.do_close_session(session_id).await?;
@@ -167,6 +263,14 @@ impl Transport {
         }
 
         tracing::info!("[CONN] Force closing session: {}", session_id);
+        let failed_pending = self.request_tracker.fail_all();
+        if failed_pending > 0 {
+            tracing::debug!(
+                "[REQUEST] Failed {} pending requests during session {} force close",
+                failed_pending,
+                session_id
+            );
+        }
 
         if let Some(conn) = self.connection.lock().await.as_mut() {
             let _ = conn.close().await;
@@ -259,11 +363,25 @@ impl Transport {
         if let Some(mut event_receiver) = event_receiver_opt {
             let this = Arc::clone(self);
             tokio::spawn(async move {
-                tracing::debug!("[LISTEN] Transport event consumer started (session: {})", session_id);
+                tracing::debug!(
+                    "[LISTEN] Transport event consumer started (session: {})",
+                    session_id
+                );
                 while let Ok(event) = event_receiver.recv().await {
                     this.on_event(event).await;
                 }
-                tracing::debug!("[LISTEN] Transport event consumer ended (session: {})", session_id);
+                let failed_pending = this.request_tracker.fail_all();
+                if failed_pending > 0 {
+                    tracing::debug!(
+                        "[REQUEST] Failed {} pending requests after event stream ended (session: {})",
+                        failed_pending,
+                        session_id
+                    );
+                }
+                tracing::debug!(
+                    "[LISTEN] Transport event consumer ended (session: {})",
+                    session_id
+                );
             });
         }
     }
@@ -281,7 +399,10 @@ impl Transport {
         *self.connection.lock().await = Some(connection);
         *self.session_id.lock().await = Some(session_id);
         self.state_manager.add_connection(session_id);
-        tracing::debug!("[SUCCESS] Transport connection set (no consumer): {}", session_id);
+        tracing::debug!(
+            "[SUCCESS] Transport connection set (no consumer): {}",
+            session_id
+        );
     }
 
     /// Get protocol registry
@@ -319,15 +440,24 @@ impl Transport {
 
         // [FIX] Use client-set message_id instead of overriding it
         let client_message_id = packet.header.message_id;
-        let (_, rx) = self.request_tracker.register_with_id(client_message_id);
+        let session_id = self.current_session_id().await;
+        let (_, rx) = self
+            .request_tracker
+            .register_with_session_id(session_id, client_message_id);
 
-        self.send(packet).await?;
-        match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
+        if let Err(e) = self.send(packet).await {
+            self.request_tracker
+                .remove_with_session_id(session_id, client_message_id);
+            return Err(e);
+        }
+        let timeout_duration = std::time::Duration::from_secs(10);
+        match tokio::time::timeout(timeout_duration, rx).await {
             Ok(Ok(resp)) => Ok(resp),
-            Ok(Err(_)) => Err(TransportError::connection_error("Connection closed", false)),
+            Ok(Err(_)) => Err(TransportError::connection_error("Connection closed", true)),
             Err(_) => {
-                self.request_tracker.remove(client_message_id);
-                Err(TransportError::connection_error("Request timeout", false))
+                self.request_tracker
+                    .remove_with_session_id(session_id, client_message_id);
+                Err(TransportError::timeout_error("request", timeout_duration))
             }
         }
     }
@@ -340,8 +470,11 @@ impl Transport {
             match packet_copy.decompress_payload() {
                 Ok(_) => Ok(packet_copy.payload),
                 Err(e) => {
-                    tracing::warn!("[WARN] Failed to decompress packet: {}, using raw data", e);
-                    Ok(packet.payload.clone())
+                    tracing::warn!("[WARN] Failed to decompress packet: {}", e);
+                    Err(TransportError::protocol_error(
+                        "packet",
+                        format!("Failed to decompress packet: {}", e),
+                    ))
                 }
             }
         } else {
@@ -368,7 +501,12 @@ impl Transport {
                             packet.header.packet_type,
                             packet.header.biz_type
                         );
-                        let completed = self.request_tracker.complete(id, packet.clone());
+                        let session_id = self.current_session_id().await;
+                        let completed = self.request_tracker.complete_with_session_id(
+                            session_id,
+                            id,
+                            packet.clone(),
+                        );
                         tracing::info!(
                             "[PROC] Response packet processing result: ID={}, completed={}",
                             id,
@@ -431,6 +569,19 @@ impl Transport {
                     }
                 }
             }
+            crate::event::TransportEvent::ConnectionClosed { reason } => {
+                let failed_pending = self.request_tracker.fail_all();
+                if failed_pending > 0 {
+                    tracing::debug!(
+                        "[REQUEST] Failed {} pending requests after connection closed: {:?}",
+                        failed_pending,
+                        reason
+                    );
+                }
+                let _ = self
+                    .event_sender
+                    .send(crate::event::TransportEvent::ConnectionClosed { reason });
+            }
             // Forward other events directly
             _ => {
                 tracing::trace!("[SEND] Forwarding other event: {:?}", event);
@@ -450,11 +601,9 @@ impl Transport {
         options: super::TransportOptions,
     ) -> Result<Bytes, TransportError> {
         // Use user-provided message_id or generate new one
-        let message_id = options.message_id.unwrap_or_else(|| {
-            self.request_tracker
-                .next_id
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        });
+        let message_id = options
+            .message_id
+            .unwrap_or_else(|| self.request_tracker.next_message_id());
 
         // Create request packet
         let mut packet = crate::packet::Packet {
@@ -484,7 +633,10 @@ impl Transport {
         }
 
         // Register request tracking
-        let (_id, rx) = self.request_tracker.register_with_id(message_id);
+        let session_id = self.current_session_id().await;
+        let (_id, rx) = self
+            .request_tracker
+            .register_with_session_id(session_id, message_id);
 
         tracing::info!(
             "[SEND] Sending request: message_id={}, biz_type={}, timeout={:?}",
@@ -494,7 +646,11 @@ impl Transport {
         );
 
         // Send packet
-        self.send(packet).await?;
+        if let Err(e) = self.send(packet).await {
+            self.request_tracker
+                .remove_with_session_id(session_id, message_id);
+            return Err(e);
+        }
 
         tracing::info!(
             "[WAIT] Waiting for response: message_id={}, timeout={:?}",
@@ -515,31 +671,27 @@ impl Transport {
                     resp.payload.len()
                 );
                 // [FIX] Decompress response data
-                match self.decode_payload(&resp) {
-                    Ok(decoded_data) => Ok(Bytes::from(decoded_data)),
-                    Err(e) => {
-                        tracing::warn!(
-                            "[WARN] Failed to decompress response data: {}, using raw data",
-                            e
-                        );
-                        Ok(Bytes::from(resp.payload))
-                    }
-                }
+                self.decode_payload(&resp).map(Bytes::from)
             }
             Ok(Err(_)) => {
                 tracing::warn!("[WARN] Response channel closed: message_id={}", message_id);
-                Err(TransportError::connection_error("Connection closed", false))
+                Err(TransportError::connection_error("Connection closed", true))
             }
             Err(_) => {
-                self.request_tracker.remove(message_id);
+                self.request_tracker
+                    .remove_with_session_id(session_id, message_id);
                 tracing::warn!(
                     "[WARN] Request timeout: message_id={}, timeout={:?}",
                     message_id,
                     timeout_duration
                 );
-                Err(TransportError::connection_error("Request timeout", false))
+                Err(TransportError::timeout_error("request", timeout_duration))
             }
         }
+    }
+
+    pub(crate) fn next_message_id(&self) -> u32 {
+        self.request_tracker.next_message_id()
     }
 
     /// Send one-way message (with options)
@@ -609,5 +761,67 @@ impl std::fmt::Debug for Transport {
             .field("connected", &"<async>")
             .field("session_id", &"<async>")
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod request_tracker_tests {
+    use super::*;
+
+    #[test]
+    fn cross_session_response_cannot_complete_another_sessions_request() {
+        // S2 regression: a response carrying the same message_id but a different
+        // session must never complete a request registered under another session.
+        let tracker = RequestTracker::new();
+        let victim = SessionId(1);
+        let attacker = SessionId(2);
+
+        let (_, _rx) = tracker.register_with_session(victim, 100);
+
+        assert!(
+            !tracker.complete_with_session(attacker, 100, Packet::response(100, Vec::new())),
+            "attacker session must not complete victim's request"
+        );
+        assert!(
+            tracker.complete_with_session(victim, 100, Packet::response(100, Vec::new())),
+            "victim session must complete its own request"
+        );
+    }
+
+    #[test]
+    fn none_keyed_and_session_keyed_requests_are_distinct() {
+        // A session-tagged response must not satisfy a request registered without a session.
+        let tracker = RequestTracker::new();
+        let (_, _rx) = tracker.register_with_id(42); // key = (None, 42)
+
+        assert!(!tracker.complete_with_session(SessionId(9), 42, Packet::response(42, Vec::new())));
+        assert!(tracker.complete(42, Packet::response(42, Vec::new())));
+    }
+
+    #[test]
+    fn fail_session_clears_only_matching_session() {
+        // T1 regression: closing one connection must not fail other connections' pending requests.
+        let tracker = RequestTracker::new();
+        let (_, _a1) = tracker.register_with_session(SessionId(1), 10);
+        let (_, _a2) = tracker.register_with_session(SessionId(1), 11);
+        let (_, _b1) = tracker.register_with_session(SessionId(2), 10);
+
+        assert_eq!(tracker.fail_session(Some(SessionId(1))), 2);
+
+        // Session 2 is untouched and still completable.
+        assert!(tracker.complete_with_session(SessionId(2), 10, Packet::response(10, Vec::new())));
+        // Session 1 requests are gone.
+        assert!(!tracker.complete_with_session(SessionId(1), 10, Packet::response(10, Vec::new())));
+    }
+
+    #[test]
+    fn fail_all_clears_every_pending_request() {
+        let tracker = RequestTracker::new();
+        let (_, _a) = tracker.register_with_session(SessionId(1), 1);
+        let (_, _b) = tracker.register_with_session(SessionId(2), 2);
+        let (_, _c) = tracker.register_with_id(3);
+
+        assert_eq!(tracker.fail_all(), 3);
+        assert!(!tracker.complete_with_session(SessionId(1), 1, Packet::response(1, Vec::new())));
     }
 }

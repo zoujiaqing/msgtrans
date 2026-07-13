@@ -200,11 +200,7 @@ impl TransportServer {
                             false,
                         ));
                     } else {
-                        tracing::error!(
-                            "[ERROR] Session {} send failed: {:?}",
-                            session_id,
-                            e
-                        );
+                        tracing::error!("[ERROR] Session {} send failed: {:?}", session_id, e);
                         return Err(e);
                     }
                 }
@@ -300,11 +296,18 @@ impl TransportServer {
         }
 
         let message_id = packet.header.message_id;
-        let (_, rx) = self.request_tracker.register_with_id(message_id);
+        let (_, rx) = self
+            .request_tracker
+            .register_with_session(session_id, message_id);
 
         if let Err(e) = self.send_to_session(session_id, packet).await {
-            self.request_tracker.remove(message_id);
-            tracing::error!("[ERROR] Session {} request send failed: {:?}", session_id, e);
+            self.request_tracker
+                .remove_with_session(session_id, message_id);
+            tracing::error!(
+                "[ERROR] Session {} request send failed: {:?}",
+                session_id,
+                e
+            );
             return Err(e);
         }
 
@@ -318,12 +321,17 @@ impl TransportServer {
                 Ok(response)
             }
             Ok(Err(_)) => {
-                self.request_tracker.remove(message_id);
-                Err(TransportError::connection_error("Connection closed", false))
+                self.request_tracker
+                    .remove_with_session(session_id, message_id);
+                Err(TransportError::connection_error("Connection closed", true))
             }
             Err(_) => {
-                self.request_tracker.remove(message_id);
-                Err(TransportError::connection_error("Request timeout", false))
+                self.request_tracker
+                    .remove_with_session(session_id, message_id);
+                Err(TransportError::timeout_error(
+                    "server request",
+                    std::time::Duration::from_secs(10),
+                ))
             }
         }
     }
@@ -392,8 +400,7 @@ impl TransportServer {
                 ))
             }
             Err(e) => {
-                // Check if it's a timeout error
-                if e.to_string().contains("timeout") || e.to_string().contains("Timeout") {
+                if matches!(e, TransportError::Timeout { .. }) {
                     Ok(crate::event::TransportResult::new_timeout(
                         Some(session_id),
                         message_id,
@@ -411,9 +418,10 @@ impl TransportServer {
         let session_id = connection.session_id();
         let mut connection = connection;
 
-        let transport = Arc::new(
-            crate::transport::transport::Transport::with_context(self.config.clone(), &self.context),
-        );
+        let transport = Arc::new(crate::transport::transport::Transport::with_context(
+            self.config.clone(),
+            &self.context,
+        ));
 
         // [FIX] Subscribe to event stream BEFORE setting connection
         // This ensures that when adapter's event loop starts, there's already a subscriber ready
@@ -421,7 +429,9 @@ impl TransportServer {
         let event_receiver_opt = connection.event_stream();
 
         // Server manages its own event routing, skip Transport's internal consumer
-        transport.set_connection_no_consumer(connection, session_id).await;
+        transport
+            .set_connection_no_consumer(connection, session_id)
+            .await;
 
         // Insert into transport layer mapping
         if let Err(e) = self.transports.insert(session_id, transport.clone()) {
@@ -487,12 +497,15 @@ impl TransportServer {
                     );
                     if let Some(handle) = &actor_handle {
                         // In actor mode, complete server-side request futures first.
-                        if let crate::event::TransportEvent::MessageReceived(packet) = &transport_event
+                        if let crate::event::TransportEvent::MessageReceived(packet) =
+                            &transport_event
                         {
                             if packet.header.packet_type == crate::packet::PacketType::Response
-                                && server_clone
-                                    .request_tracker
-                                    .complete(packet.header.message_id, packet.clone())
+                                && server_clone.request_tracker.complete_with_session(
+                                    session_id,
+                                    packet.header.message_id,
+                                    packet.clone(),
+                                )
                             {
                                 continue;
                             }
@@ -539,6 +552,14 @@ impl TransportServer {
                 "[REQUEST] Session {} removed, marked {} pending requests as SessionClosed",
                 session_id,
                 closed_pending
+            );
+        }
+        let failed_pending = self.request_tracker.fail_session(Some(session_id));
+        if failed_pending > 0 {
+            tracing::debug!(
+                "[REQUEST] Session {} removed, failed {} server-side pending requests",
+                session_id,
+                failed_pending
             );
         }
 
@@ -916,10 +937,7 @@ impl TransportServer {
                     .is_running
                     .load(std::sync::atomic::Ordering::SeqCst)
                 {
-                    tracing::info!(
-                        "[STOP] {} listener received stop signal",
-                        protocol_name
-                    );
+                    tracing::info!("[STOP] {} listener received stop signal", protocol_name);
                     break;
                 }
 
@@ -999,11 +1017,7 @@ impl TransportServer {
             }
 
             if let Err(e) = server.shutdown().await {
-                tracing::warn!(
-                    "[WARN] {} server shutdown failed: {:?}",
-                    protocol_name,
-                    e
-                );
+                tracing::warn!("[WARN] {} server shutdown failed: {:?}", protocol_name, e);
             }
 
             tracing::info!("[STOP] {} server stopped", protocol_name);
@@ -1166,7 +1180,11 @@ impl TransportServer {
                         let message_id = packet.header.message_id;
                         tracing::debug!("[RECV] TransportServer received response packet from session {} (ID: {})", session_id, message_id);
 
-                        if self.request_tracker.complete(message_id, packet.clone()) {
+                        if self.request_tracker.complete_with_session(
+                            session_id,
+                            message_id,
+                            packet.clone(),
+                        ) {
                             tracing::debug!(
                                 "[SUCCESS] Successfully completed server request (ID: {})",
                                 message_id

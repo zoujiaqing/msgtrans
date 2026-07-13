@@ -3,7 +3,7 @@ use futures::{Stream, StreamExt};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::sync::{broadcast, mpsc};
-use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 
 /// Unified event stream
 ///
@@ -101,8 +101,11 @@ impl Stream for EventStream {
                     }
                     // Continue loop, get next event
                 }
-                Poll::Ready(Some(Err(_))) => {
-                    // Ignore receive errors, continue trying
+                Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(skipped)))) => {
+                    tracing::warn!(
+                        "[STREAM] EventStream lagged, skipped {} transport events",
+                        skipped
+                    );
                     continue;
                 }
                 Poll::Ready(None) => {
@@ -433,8 +436,11 @@ impl ClientEventStream {
                         false,
                     ));
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    // Event stream lagged, continue receiving
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(
+                        "[STREAM] ClientEventStream lagged, skipped {} transport events",
+                        skipped
+                    );
                     continue;
                 }
             }
@@ -465,8 +471,11 @@ impl ClientEventStream {
                         false,
                     ));
                 }
-                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
-                    // Event stream lagged, continue receiving
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
+                    tracing::warn!(
+                        "[STREAM] ClientEventStream lagged, skipped {} transport events",
+                        skipped
+                    );
                     continue;
                 }
             }

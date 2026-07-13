@@ -1,4 +1,4 @@
-# msgtrans v1.0.6 架构规范
+# msgtrans v1.0.7 架构规范
 
 msgtrans 是一个 **Rust 异步多协议传输库**，为应用层提供统一的 TCP / WebSocket / QUIC 传输接口。
 协议通过 `DynServerConfig` / `DynClientConfig` trait 扩展，框架不硬编码任何协议名称。
@@ -155,31 +155,20 @@ Pending
 
 ## 包协议（Packet Protocol）
 
-### 固定头部（16 bytes, big-endian）
+包协议的唯一真相源是 `docs/WIRE_FORMAT.md`。
 
-```
- 0                   1                   2                   3
- 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                       total_length (u32)                      |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|  ext_len(u16) |  pkt_type(u8) | compress(u8)  |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                       message_id (u32)                        |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|    biz_type (u16)   | reserved / flags (u16)                  |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-```
+架构规范只描述 packet 在分层中的位置，不重复维护字段表，避免 wire format 与实现发生漂移。当前实现使用 16 字节 fixed header：
 
-| 字段 | 大小 | 说明 |
-|------|------|------|
-| total_length | u32 | 整包长度（含头部） |
-| extended_length | u16 | 扩展头部长度 |
-| packet_type | u8 | Request=1, Response=2, OneWay=3 |
-| compression | u8 | None=0, Gzip=1, Zstd=2, Lz4=3 |
-| message_id | u32 | 请求/响应配对标识 |
-| biz_type | u16 | 业务类型码 |
-| reserved | u16 | 保留位（含 fragment / priority 标志） |
+- `version: u8`
+- `compression: u8`
+- `packet_type: u8`
+- `biz_type: u8`
+- `message_id: u32`
+- `ext_header_len: u16`
+- `payload_len: u32`
+- `reserved: u16`
+
+具体字段顺序、取值和跨语言约束以 `docs/WIRE_FORMAT.md` 为准。
 
 ### 零拷贝变体
 
@@ -692,7 +681,7 @@ let result = client.request(b"ping").await?;
 // 带选项发送
 client.send_with_options(data, TransportOptions::new()
     .with_biz_type(1)
-    .with_compression(CompressionType::Gzip)
+    .with_compression(CompressionType::Zstd)
 ).await?;
 ```
 
