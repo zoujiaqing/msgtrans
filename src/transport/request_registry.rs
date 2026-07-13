@@ -1,8 +1,10 @@
+use crate::packet::Packet;
 use crate::SessionId;
 use dashmap::{DashMap, DashSet};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::oneshot;
 
 const DEFAULT_TIMEOUT_BUCKET_COUNT: usize = 256;
 const DEFAULT_TIMEOUT_TICK: Duration = Duration::from_millis(100);
@@ -120,6 +122,10 @@ impl RequestCounters {
 #[derive(Debug)]
 pub struct RequestRegistry {
     entries: DashMap<RequestKey, Arc<RequestEntry>>,
+    /// Response waiters, keyed like `entries`. Present only for requests whose
+    /// caller is awaiting a response (the request/response path); pure
+    /// lifecycle-tracked requests (e.g. inbound server requests) have no waiter.
+    waiters: DashMap<RequestKey, oneshot::Sender<Packet>>,
     session_index: DashMap<SessionId, DashSet<RequestKey>>,
     counters: RequestCounters,
     buckets: Vec<std::sync::Mutex<Vec<RequestKey>>>,
@@ -154,6 +160,7 @@ impl RequestRegistry {
 
         Self {
             entries: DashMap::new(),
+            waiters: DashMap::new(),
             session_index: DashMap::new(),
             counters: RequestCounters::default(),
             buckets,
@@ -192,6 +199,47 @@ impl RequestRegistry {
         self.counters.pending_requests.fetch_add(1, Ordering::Relaxed);
         self.schedule_for_deadline(key, now + timeout);
         true
+    }
+
+    /// Register a request together with a response waiter, returning the receiver
+    /// the caller awaits. This is the request/response path: the registry is both
+    /// the lifecycle source of truth and the response waker.
+    pub fn register_waiter(
+        &self,
+        request_id: u32,
+        session_id: Option<SessionId>,
+        biz_type: u8,
+        timeout: Duration,
+    ) -> oneshot::Receiver<Packet> {
+        let (tx, rx) = oneshot::channel();
+        let key = RequestKey::new(session_id, request_id);
+        self.register(request_id, session_id, biz_type, timeout);
+        // If a duplicate somehow exists, the newer waiter replaces the old one
+        // (the previous receiver then resolves to Canceled).
+        self.waiters.insert(key, tx);
+        rx
+    }
+
+    /// Complete a request with its response: wake the waiter (if any) and move
+    /// lifecycle state to Responded. Returns true iff a pending request matched
+    /// (same session + id), which is what prevents cross-session response injection.
+    pub fn complete_waiter(
+        &self,
+        session_id: Option<SessionId>,
+        request_id: u32,
+        packet: Packet,
+    ) -> bool {
+        match self.mark_responded(session_id, request_id) {
+            MarkResult::Updated => {
+                if let Some((_, tx)) =
+                    self.waiters.remove(&RequestKey::new(session_id, request_id))
+                {
+                    let _ = tx.send(packet);
+                }
+                true
+            }
+            _ => false,
+        }
     }
 
     pub fn get_state(&self, session_id: Option<SessionId>, request_id: u32) -> Option<RequestState> {
@@ -244,6 +292,7 @@ impl RequestRegistry {
                     .fetch_add(1, Ordering::Relaxed);
                 drop(entry);
                 self.remove_terminal_entry(key);
+                self.waiters.remove(&key); // drop waiter -> receiver observes cancellation
                 MarkResult::Updated
             }
             Err(state) => MarkResult::Already(state),
@@ -285,6 +334,7 @@ impl RequestRegistry {
                     let key = *key.key();
                     drop(entry);
                     self.entries.remove(&key);
+                    self.waiters.remove(&key); // drop waiter -> receiver observes cancellation
                 }
             }
         }
@@ -512,5 +562,61 @@ mod tests {
 
         let snapshot = registry.counters_snapshot();
         assert_eq!(snapshot.response_send_failed_total, 1);
+    }
+
+    #[test]
+    fn register_waiter_completes_with_response() {
+        let registry = RequestRegistry::new();
+        let sid = Some(SessionId(3));
+        let mut rx = registry.register_waiter(50, sid, 0, Duration::from_secs(5));
+        assert_eq!(registry.get_state(sid, 50), Some(RequestState::Pending));
+
+        let resp = Packet::response(50, b"pong".to_vec());
+        assert!(registry.complete_waiter(sid, 50, resp));
+        let got = rx.try_recv().expect("response delivered to waiter");
+        assert_eq!(got.message_id(), 50);
+        assert_eq!(registry.get_state(sid, 50), None);
+    }
+
+    #[test]
+    fn complete_waiter_rejects_wrong_session() {
+        let registry = RequestRegistry::new();
+        let mut rx = registry.register_waiter(60, Some(SessionId(1)), 0, Duration::from_secs(5));
+        assert!(!registry.complete_waiter(
+            Some(SessionId(2)),
+            60,
+            Packet::response(60, Vec::new())
+        ));
+        assert!(rx.try_recv().is_err());
+        assert!(registry.complete_waiter(
+            Some(SessionId(1)),
+            60,
+            Packet::response(60, Vec::new())
+        ));
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn timeout_drops_waiter() {
+        let registry = RequestRegistry::new();
+        let key = RequestKey::new(None, 70);
+        let mut rx = registry.register_waiter(70, None, 0, Duration::from_secs(1));
+        assert_eq!(registry.mark_timed_out(key), MarkResult::Updated);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
+    }
+
+    #[test]
+    fn close_session_drops_waiter() {
+        let registry = RequestRegistry::new();
+        let sid = SessionId(88);
+        let mut rx = registry.register_waiter(80, Some(sid), 0, Duration::from_secs(5));
+        assert_eq!(registry.close_session_pending(sid), 1);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
     }
 }
