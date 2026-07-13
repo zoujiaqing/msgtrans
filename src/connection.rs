@@ -31,6 +31,11 @@ pub trait Connection: Send + Sync + std::any::Any {
     fn event_stream(
         &self,
     ) -> Option<tokio::sync::broadcast::Receiver<crate::event::TransportEvent>>;
+
+    /// Set the frame decode policy for this connection. Adapters that support it
+    /// (WebSocket, QUIC) override this; others (e.g. TCP, which is always strict
+    /// on a malformed first packet) keep the default no-op.
+    fn set_frame_policy(&self, _policy: crate::packet::FramePolicy) {}
 }
 
 /// Unified server interface - Accept new connections

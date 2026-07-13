@@ -92,6 +92,8 @@ pub struct WebSocketAdapter<C> {
     event_loop_handle: Option<tokio::task::JoinHandle<()>>,
     /// Connection status
     is_connected: Arc<std::sync::atomic::AtomicBool>,
+    /// Frame decode policy (0=Lenient, 1=Strict), shared with the event loop.
+    frame_policy: Arc<std::sync::atomic::AtomicU8>,
 }
 
 impl<C> WebSocketAdapter<C> {
@@ -110,6 +112,9 @@ impl<C> WebSocketAdapter<C> {
             shutdown_sender: shutdown_tx,
             event_loop_handle: None,
             is_connected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            frame_policy: Arc::new(std::sync::atomic::AtomicU8::new(
+                crate::packet::FramePolicy::Lenient as u8,
+            )),
         }
     }
 
@@ -126,6 +131,9 @@ impl<C> WebSocketAdapter<C> {
 
         let session_id = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let is_connected = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let frame_policy = Arc::new(std::sync::atomic::AtomicU8::new(
+            crate::packet::FramePolicy::Lenient as u8,
+        ));
 
         // Create communication channels
         let (send_queue_tx, send_queue_rx) = mpsc::channel(SEND_QUEUE_CAPACITY);
@@ -139,6 +147,7 @@ impl<C> WebSocketAdapter<C> {
             send_queue_rx,
             shutdown_rx,
             event_sender.clone(),
+            frame_policy.clone(),
         )
         .await;
 
@@ -152,6 +161,7 @@ impl<C> WebSocketAdapter<C> {
             shutdown_sender: shutdown_tx,
             event_loop_handle: Some(event_loop_handle),
             is_connected,
+            frame_policy,
         })
     }
 
@@ -168,6 +178,7 @@ impl<C> WebSocketAdapter<C> {
         mut send_queue: mpsc::Receiver<Packet>,
         mut shutdown_signal: mpsc::UnboundedReceiver<()>,
         event_sender: broadcast::Sender<TransportEvent>,
+        frame_policy: Arc<std::sync::atomic::AtomicU8>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let current_session_id =
@@ -187,7 +198,10 @@ impl<C> WebSocketAdapter<C> {
                     read_result = stream.next() => {
                         match read_result {
                             Some(Ok(message)) => {
-                                match Self::process_websocket_message(message) {
+                                let policy = crate::packet::FramePolicy::from(
+                                    frame_policy.load(std::sync::atomic::Ordering::Relaxed),
+                                );
+                                match Self::process_websocket_message(message, policy) {
                                     MessageProcessResult::Packet(packet) => {
                                         tracing::debug!("[RECV] WebSocket received packet: {} bytes (session: {})", packet.payload.len(), current_session_id);
 
@@ -337,13 +351,18 @@ impl<C> WebSocketAdapter<C> {
     }
 
     /// Process WebSocket message - optimized version
-    fn process_websocket_message(message: Message) -> MessageProcessResult {
+    fn process_websocket_message(
+        message: Message,
+        frame_policy: crate::packet::FramePolicy,
+    ) -> MessageProcessResult {
+        let strict = frame_policy == crate::packet::FramePolicy::Strict;
         match message {
             Message::Binary(data) => {
-                // [PERF] Optimization: WebSocket guarantees message integrity, can parse directly
-                // Pre-check minimum length to avoid unnecessary parsing attempts
+                // Pre-check minimum length.
                 if data.len() < 16 {
-                    // Data too short, cannot be valid Packet, create basic data packet directly
+                    if strict {
+                        return MessageProcessResult::Error(WebSocketError::InvalidMessageType);
+                    }
                     let packet = Packet::one_way(0, data.clone());
                     return MessageProcessResult::Packet(packet);
                 }
@@ -358,8 +377,11 @@ impl<C> WebSocketAdapter<C> {
                         MessageProcessResult::Packet(packet)
                     }
                     Err(e) => {
+                        if strict {
+                            tracing::debug!("[RECV] WebSocket packet parse failed under strict policy: {:?}", e);
+                            return MessageProcessResult::Error(WebSocketError::InvalidMessageType);
+                        }
                         tracing::debug!("[RECV] WebSocket packet parsing failed: {:?}, creating basic data packet", e);
-                        // If parsing fails, create a basic data packet
                         let packet = Packet::one_way(0, data.clone());
                         MessageProcessResult::Packet(packet)
                     }
@@ -445,6 +467,11 @@ impl<C: Send + Sync + 'static> Connection for WebSocketAdapter<C> {
         &self,
     ) -> Option<tokio::sync::broadcast::Receiver<crate::event::TransportEvent>> {
         Some(self.event_sender.subscribe())
+    }
+
+    fn set_frame_policy(&self, policy: crate::packet::FramePolicy) {
+        self.frame_policy
+            .store(policy as u8, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
