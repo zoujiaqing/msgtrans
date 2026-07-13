@@ -121,7 +121,7 @@ use std::time::Duration;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Configure client - configuration-driven protocol selection
     let tcp_config = TcpClientConfig::new("127.0.0.1:8001")?
-        .with_timeout(Duration::from_secs(30));
+        .with_connect_timeout(Duration::from_secs(30));
 
     // Build client - zero configuration with high performance
     let mut client = TransportClientBuilder::new()
@@ -284,22 +284,6 @@ while let Some(event) = events.recv().await {
         _ => {}
     }
 }
-```
-
-### 🧠 Intelligent Optimization
-
-```rust
-// CPU-aware automatic optimization - zero configuration high performance
-let config = ConnectionConfig::auto_optimized(); // Auto-tuning based on CPU core count
-
-// Intelligent connection pool - adaptive load
-let server = TransportServerBuilder::new()
-    .connection_pool_config(
-        ConnectionPoolConfig::adaptive()  // Dynamic scaling
-            .with_initial_size(100)
-            .with_max_size(10000)
-    )
-    .build().await?;
 ```
 
 ### 📦 Zero-Copy Optimization
@@ -466,9 +450,12 @@ use std::time::Instant;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Local / self-signed test server: skip certificate verification.
+    // In production, drop danger_skip_verification() and configure a real
+    // server name and CA instead, e.g. .with_ca_cert_pem(ca_pem).
     let config = QuicClientConfig::new("127.0.0.1:8003")?
         .with_server_name("localhost")
-        .with_alpn(vec![b"msgtrans".to_vec()]);
+        .danger_skip_verification();
 
     let client = TransportClientBuilder::new()
         .with_protocol(config)
@@ -532,7 +519,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 // TCP Server - High reliability configuration
 let tcp_config = TcpServerConfig::new("0.0.0.0:8001")?
     .with_max_connections(10000)
-    .with_keepalive(Duration::from_secs(60))
+    .with_keepalive(Some(Duration::from_secs(60)))
     .with_nodelay(true)
     .with_reuse_addr(true);
 
@@ -544,9 +531,8 @@ let ws_config = WebSocketServerConfig::new("0.0.0.0:8002")?
 
 // QUIC Server - Next-generation protocol configuration
 let quic_config = QuicServerConfig::new("0.0.0.0:8003")?
-    .with_cert_path("cert.pem")
-    .with_key_path("key.pem")
-    .with_alpn(vec![b"h3".to_vec(), b"msgtrans".to_vec()])
+    .with_cert_pem(std::fs::read_to_string("cert.pem")?)
+    .with_key_pem(std::fs::read_to_string("key.pem")?)
     .with_max_concurrent_streams(1000);
 ```
 
@@ -561,14 +547,12 @@ let server = TransportServerBuilder::new()
 // High-performance configuration - manual tuning
 let server = TransportServerBuilder::new()
     .with_protocol(tcp_config)
-    .connection_config(ConnectionConfig::high_performance())
     .max_connections(50000)
     .build().await?;
 
 // Resource-saving configuration - low memory environment
 let server = TransportServerBuilder::new()
     .with_protocol(tcp_config)
-    .connection_config(ConnectionConfig::memory_optimized())
     .max_connections(1000)
     .build().await?;
 ```
@@ -599,12 +583,12 @@ use msgtrans::error::{TransportError, CloseReason};
 // Message sending error handling
 match client.send("Hello, World!".as_bytes()).await {
     Ok(result) => println!("✅ Message sent successfully (ID: {})", result.message_id),
-    Err(TransportError::ConnectionLost { .. }) => {
+    Err(TransportError::Connection { .. }) => {
         println!("🔗 Connection lost, attempting reconnection");
         client.connect().await?;
     }
-    Err(TransportError::ProtocolError { protocol, error }) => {
-        println!("⚠️ Protocol error [{}]: {}", protocol, error);
+    Err(TransportError::Protocol { protocol, reason }) => {
+        println!("⚠️ Protocol error [{}]: {}", protocol, reason);
     }
     Err(e) => println!("❌ Other error: {}", e),
 }
@@ -620,7 +604,7 @@ match client.request("Get status".as_bytes()).await {
             None => println!("⏰ Request timeout (ID: {})", result.message_id),
         }
     }
-    Err(TransportError::Timeout { duration }) => {
+    Err(TransportError::Timeout { duration, .. }) => {
         println!("⏰ Request timeout: {:?}", duration);
     }
     Err(e) => println!("❌ Request failed: {}", e),
@@ -629,7 +613,7 @@ match client.request("Get status".as_bytes()).await {
 // Server-side sending error handling
 match server.send(session_id, "Response data".as_bytes()).await {
     Ok(result) => println!("✅ Successfully sent to session {}", session_id),
-    Err(TransportError::ConnectionLost { .. }) => {
+    Err(TransportError::Connection { .. }) => {
         println!("🔗 Session {} connection disconnected", session_id);
         // Automatic session cleanup
     }
@@ -640,21 +624,13 @@ match server.send(session_id, "Response data".as_bytes()).await {
 ### 🔄 Connection Management
 
 ```rust
-// Connection pool management
-let pool_config = ConnectionPoolConfig::adaptive()
-    .with_initial_size(100)
-    .with_max_size(10000)
-    .with_idle_timeout(Duration::from_secs(300))
-    .with_health_check_interval(Duration::from_secs(30));
-
-// Graceful shutdown
+// Graceful shutdown: drains active sessions using the configured timeout
 let server = TransportServerBuilder::new()
     .with_protocol(tcp_config)
-    .graceful_shutdown_timeout(Duration::from_secs(30))
+    .graceful_shutdown(Some(Duration::from_secs(30)))
     .build().await?;
 
-// Smooth restart support
-server.start_graceful_shutdown().await?;
+server.stop().await;
 ```
 
 ## 📚 Documentation and Examples

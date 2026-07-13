@@ -61,12 +61,12 @@ use msgtrans::{
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 配置多个协议 - 同一业务逻辑支持多协议
-    let tcp_config = TcpServerConfig::new("127.0.0.1:8001");
+    let tcp_config = TcpServerConfig::new("127.0.0.1:8001")?;
     
-    let websocket_config = WebSocketServerConfig::new("127.0.0.1:8001")
+    let websocket_config = WebSocketServerConfig::new("127.0.0.1:8002")?
         .with_path("/ws");
     
-    let quic_config = QuicServerConfig::new("127.0.0.1:8001");
+    let quic_config = QuicServerConfig::new("127.0.0.1:8003")?;
 
     // 构建多协议服务器
     let mut server = TransportServerBuilder::new()
@@ -118,8 +118,8 @@ use std::time::Duration;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 配置客户端 - 配置驱动的协议选择
-    let tcp_config = TcpClientConfig::new("127.0.0.1:8001")
-        .with_timeout(Duration::from_secs(30));
+    let tcp_config = TcpClientConfig::new("127.0.0.1:8001")?
+        .with_connect_timeout(Duration::from_secs(30));
 
     // 构建客户端 - 零配置即高性能
     let mut client = TransportClientBuilder::new()
@@ -196,11 +196,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```rust
 // 同样的服务器代码，不同的协议配置
 let server = TransportServerBuilder::new()
-    .with_protocol(TcpServerConfig::new("0.0.0.0:8080"))
+    .with_protocol(TcpServerConfig::new("0.0.0.0:8080")?)
     .build().await?;  // TCP版本
 
 let server = TransportServerBuilder::new()
-    .with_protocol(QuicServerConfig::new("0.0.0.0:8080"))
+    .with_protocol(QuicServerConfig::new("0.0.0.0:8080")?)
     .build().await?;  // QUIC版本 - 业务逻辑完全相同
 ```
 
@@ -282,22 +282,6 @@ while let Some(event) = events.recv().await {
         _ => {}
     }
 }
-```
-
-### 🧠 智能化优化
-
-```rust
-// CPU感知的自动优化 - 零配置高性能
-let config = ConnectionConfig::auto_optimized(); // 根据CPU核心数自动调优
-
-// 智能连接池 - 自适应负载
-let server = TransportServerBuilder::new()
-    .connection_pool_config(
-        ConnectionPoolConfig::adaptive()  // 动态扩缩容
-            .with_initial_size(100)
-            .with_max_size(10000)
-    )
-    .build().await?;
 ```
 
 ### 📦 零拷贝优化
@@ -397,7 +381,7 @@ use std::collections::HashMap;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = WebSocketServerConfig::new("127.0.0.1:8080")
+    let config = WebSocketServerConfig::new("127.0.0.1:8080")?
         .with_path("/chat");
 
     let server = TransportServerBuilder::new()
@@ -462,9 +446,12 @@ use std::time::Instant;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = QuicClientConfig::new("127.0.0.1:8003")
+    // 本地 / 自签测试服务器：跳过证书验证。
+    // 生产环境请去掉 danger_skip_verification()，改为配置真实域名与 CA，
+    // 例如 .with_ca_cert_pem(ca_pem)。
+    let config = QuicClientConfig::new("127.0.0.1:8003")?
         .with_server_name("localhost")
-        .with_alpn(vec![b"msgtrans".to_vec()]);
+        .danger_skip_verification();
 
     let client = TransportClientBuilder::new()
         .with_protocol(config)
@@ -526,23 +513,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```rust
 // TCP服务器 - 高可靠性配置
-let tcp_config = TcpServerConfig::new("0.0.0.0:8001")
+let tcp_config = TcpServerConfig::new("0.0.0.0:8001")?
     .with_max_connections(10000)
-    .with_keepalive(Duration::from_secs(60))
+    .with_keepalive(Some(Duration::from_secs(60)))
     .with_nodelay(true)
     .with_reuse_addr(true);
 
 // WebSocket服务器 - Web集成配置
-let ws_config = WebSocketServerConfig::new("0.0.0.0:8002")
+let ws_config = WebSocketServerConfig::new("0.0.0.0:8002")?
     .with_path("/api/ws")
     .with_max_frame_size(1024 * 1024)
     .with_max_connections(5000);
 
 // QUIC服务器 - 下一代协议配置
-let quic_config = QuicServerConfig::new("0.0.0.0:8003")
-    .with_cert_path("cert.pem")
-    .with_key_path("key.pem")
-    .with_alpn(vec![b"h3".to_vec(), b"msgtrans".to_vec()])
+let quic_config = QuicServerConfig::new("0.0.0.0:8003")?
+    .with_cert_pem(std::fs::read_to_string("cert.pem")?)
+    .with_key_pem(std::fs::read_to_string("key.pem")?)
     .with_max_concurrent_streams(1000);
 ```
 
@@ -557,14 +543,12 @@ let server = TransportServerBuilder::new()
 // 高性能配置 - 手动调优
 let server = TransportServerBuilder::new()
     .with_protocol(tcp_config)
-    .connection_config(ConnectionConfig::high_performance())
     .max_connections(50000)
     .build().await?;
 
 // 资源节约配置 - 低内存环境
 let server = TransportServerBuilder::new()
     .with_protocol(tcp_config)
-    .connection_config(ConnectionConfig::memory_optimized())
     .max_connections(1000)
     .build().await?;
 ```
@@ -595,12 +579,12 @@ use msgtrans::error::{TransportError, CloseReason};
 // 发送消息的错误处理
 match client.send("Hello, World!".as_bytes()).await {
     Ok(result) => println!("✅ 消息发送成功 (ID: {})", result.message_id),
-    Err(TransportError::ConnectionLost { .. }) => {
+    Err(TransportError::Connection { .. }) => {
         println!("🔗 连接丢失，尝试重连");
         client.connect().await?;
     }
-    Err(TransportError::ProtocolError { protocol, error }) => {
-        println!("⚠️ 协议错误 [{}]: {}", protocol, error);
+    Err(TransportError::Protocol { protocol, reason }) => {
+        println!("⚠️ 协议错误 [{}]: {}", protocol, reason);
     }
     Err(e) => println!("❌ 其他错误: {}", e),
 }
@@ -616,7 +600,7 @@ match client.request("Get status".as_bytes()).await {
             None => println!("⏰ 请求超时 (ID: {})", result.message_id),
         }
     }
-    Err(TransportError::Timeout { duration }) => {
+    Err(TransportError::Timeout { duration, .. }) => {
         println!("⏰ 请求超时: {:?}", duration);
     }
     Err(e) => println!("❌ 请求失败: {}", e),
@@ -625,7 +609,7 @@ match client.request("Get status".as_bytes()).await {
 // 服务端发送的错误处理
 match server.send(session_id, "Response data".as_bytes()).await {
     Ok(result) => println!("✅ 向会话 {} 发送成功", session_id),
-    Err(TransportError::ConnectionLost { .. }) => {
+    Err(TransportError::Connection { .. }) => {
         println!("🔗 会话 {} 连接已断开", session_id);
         // 自动清理会话
     }
@@ -636,21 +620,13 @@ match server.send(session_id, "Response data".as_bytes()).await {
 ### 🔄 连接管理
 
 ```rust
-// 连接池管理
-let pool_config = ConnectionPoolConfig::adaptive()
-    .with_initial_size(100)
-    .with_max_size(10000)
-    .with_idle_timeout(Duration::from_secs(300))
-    .with_health_check_interval(Duration::from_secs(30));
-
-// 优雅关闭
+// 优雅关闭：按配置的超时排空活跃会话
 let server = TransportServerBuilder::new()
     .with_protocol(tcp_config)
-    .graceful_shutdown_timeout(Duration::from_secs(30))
+    .graceful_shutdown(Some(Duration::from_secs(30)))
     .build().await?;
 
-// 平滑重启支持
-server.start_graceful_shutdown().await?;
+server.stop().await;
 ```
 
 ## 📚 文档和示例
