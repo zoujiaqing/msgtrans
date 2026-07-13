@@ -212,6 +212,13 @@ impl Transport {
         }
     }
 
+    /// Apply a frame decode policy to the underlying connection (if connected).
+    pub(crate) async fn set_frame_policy(&self, policy: crate::packet::FramePolicy) {
+        if let Some(conn) = self.connection.lock().await.as_ref() {
+            conn.set_frame_policy(policy);
+        }
+    }
+
     /// [TARGET] Core method: disconnect connection (graceful shutdown)
     pub async fn disconnect(&self) -> Result<(), TransportError> {
         if let Some(session_id) = self.current_session_id().await {

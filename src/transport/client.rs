@@ -141,6 +141,8 @@ pub struct TransportClientBuilder {
     transport_config: TransportConfig,
     /// Protocol configuration storage - Client only supports one protocol connection
     protocol_config: Option<Box<dyn DynClientConfig>>,
+    /// Frame decode policy applied to the connection.
+    frame_policy: crate::packet::FramePolicy,
 }
 
 impl TransportClientBuilder {
@@ -154,12 +156,22 @@ impl TransportClientBuilder {
             connection_monitoring: false,
             transport_config: TransportConfig::default(),
             protocol_config: None,
+            frame_policy: crate::packet::FramePolicy::Lenient,
         }
     }
 
     /// Set protocol configuration - Client specific
     pub fn with_protocol<T: DynClientConfig>(mut self, config: T) -> Self {
         self.protocol_config = Some(Box::new(config));
+        self
+    }
+
+    /// Set the frame decode policy applied to the connection (default Lenient).
+    ///
+    /// Under `Strict`, an undecodable frame from the server closes the connection
+    /// instead of being downgraded to a raw one-way message.
+    pub fn with_frame_policy(mut self, policy: crate::packet::FramePolicy) -> Self {
+        self.frame_policy = policy;
         self
     }
 
@@ -214,6 +226,7 @@ impl TransportClientBuilder {
             transport,
             self.retry_config,
             self.protocol_config,
+            self.frame_policy,
         ))
     }
 }
@@ -230,6 +243,7 @@ pub struct TransportClient {
     retry_config: RetryConfig,
     // Client protocol configuration
     protocol_config: Option<Box<dyn DynClientConfig>>,
+    frame_policy: crate::packet::FramePolicy,
     // [TARGET] Current connection session ID - Uses Arc<RwLock> for modification
     current_session_id: Arc<RwLock<Option<SessionId>>>,
     event_sender: tokio::sync::broadcast::Sender<crate::event::ClientEvent>,
@@ -242,11 +256,13 @@ impl TransportClient {
         transport: Transport,
         retry_config: RetryConfig,
         protocol_config: Option<Box<dyn DynClientConfig>>,
+        frame_policy: crate::packet::FramePolicy,
     ) -> Self {
         Self {
             inner: Arc::new(transport),
             retry_config,
             protocol_config,
+            frame_policy,
             current_session_id: Arc::new(RwLock::new(None)),
             event_sender: tokio::sync::broadcast::channel(8192).0,
             event_forwarding_running: Arc::new(AtomicBool::new(false)),
@@ -269,6 +285,9 @@ impl TransportClient {
 
         // Connect using stored protocol configuration
         let session_id = self.connect_with_stored_config(&protocol_config).await?;
+
+        // Apply the configured frame policy to the freshly-established connection.
+        self.inner.set_frame_policy(self.frame_policy).await;
 
         // Update current session ID (internal use)
         let mut current_session = self.current_session_id.write().await;
