@@ -89,6 +89,16 @@ pub enum MarkResult {
     NotFound,
 }
 
+/// Returned by `try_register_waiter` when a live pending request already exists
+/// for the same (session_id, request_id). The new waiter is refused rather than
+/// silently replacing the old one (which would cancel the old receiver and could
+/// misroute the response).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DuplicateRequest {
+    pub session_id: Option<SessionId>,
+    pub request_id: u32,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct RequestCountersSnapshot {
     pub pending_requests: u64,
@@ -187,8 +197,12 @@ impl RequestRegistry {
             state: AtomicU8::new(RequestState::Pending as u8),
         });
 
-        if self.entries.insert(key, entry).is_some() {
-            return false;
+        use dashmap::mapref::entry::Entry;
+        match self.entries.entry(key) {
+            Entry::Occupied(_) => return false, // duplicate: refuse, do not replace
+            Entry::Vacant(vacant) => {
+                vacant.insert(entry);
+            }
         }
 
         if let Some(sid) = session_id {
@@ -204,20 +218,28 @@ impl RequestRegistry {
     /// Register a request together with a response waiter, returning the receiver
     /// the caller awaits. This is the request/response path: the registry is both
     /// the lifecycle source of truth and the response waker.
-    pub fn register_waiter(
+    ///
+    /// Refuses (returns `Err(DuplicateRequest)`) if a live pending request already
+    /// exists for the same (session_id, request_id), rather than silently replacing
+    /// its waiter — which would cancel the old receiver and could misroute the
+    /// response to the wrong caller.
+    pub fn try_register_waiter(
         &self,
         request_id: u32,
         session_id: Option<SessionId>,
         biz_type: u8,
         timeout: Duration,
-    ) -> oneshot::Receiver<Packet> {
+    ) -> Result<oneshot::Receiver<Packet>, DuplicateRequest> {
+        if !self.register(request_id, session_id, biz_type, timeout) {
+            return Err(DuplicateRequest {
+                session_id,
+                request_id,
+            });
+        }
         let (tx, rx) = oneshot::channel();
-        let key = RequestKey::new(session_id, request_id);
-        self.register(request_id, session_id, biz_type, timeout);
-        // If a duplicate somehow exists, the newer waiter replaces the old one
-        // (the previous receiver then resolves to Canceled).
-        self.waiters.insert(key, tx);
-        rx
+        self.waiters
+            .insert(RequestKey::new(session_id, request_id), tx);
+        Ok(rx)
     }
 
     /// Complete a request with its response: wake the waiter (if any) and move
@@ -568,7 +590,9 @@ mod tests {
     fn register_waiter_completes_with_response() {
         let registry = RequestRegistry::new();
         let sid = Some(SessionId(3));
-        let mut rx = registry.register_waiter(50, sid, 0, Duration::from_secs(5));
+        let mut rx = registry
+            .try_register_waiter(50, sid, 0, Duration::from_secs(5))
+            .expect("fresh key registers");
         assert_eq!(registry.get_state(sid, 50), Some(RequestState::Pending));
 
         let resp = Packet::response(50, b"pong".to_vec());
@@ -581,7 +605,9 @@ mod tests {
     #[test]
     fn complete_waiter_rejects_wrong_session() {
         let registry = RequestRegistry::new();
-        let mut rx = registry.register_waiter(60, Some(SessionId(1)), 0, Duration::from_secs(5));
+        let mut rx = registry
+            .try_register_waiter(60, Some(SessionId(1)), 0, Duration::from_secs(5))
+            .expect("fresh key registers");
         assert!(!registry.complete_waiter(
             Some(SessionId(2)),
             60,
@@ -600,7 +626,9 @@ mod tests {
     fn timeout_drops_waiter() {
         let registry = RequestRegistry::new();
         let key = RequestKey::new(None, 70);
-        let mut rx = registry.register_waiter(70, None, 0, Duration::from_secs(1));
+        let mut rx = registry
+            .try_register_waiter(70, None, 0, Duration::from_secs(1))
+            .expect("fresh key registers");
         assert_eq!(registry.mark_timed_out(key), MarkResult::Updated);
         assert!(matches!(
             rx.try_recv(),
@@ -612,11 +640,26 @@ mod tests {
     fn close_session_drops_waiter() {
         let registry = RequestRegistry::new();
         let sid = SessionId(88);
-        let mut rx = registry.register_waiter(80, Some(sid), 0, Duration::from_secs(5));
+        let mut rx = registry
+            .try_register_waiter(80, Some(sid), 0, Duration::from_secs(5))
+            .expect("fresh key registers");
         assert_eq!(registry.close_session_pending(sid), 1);
         assert!(matches!(
             rx.try_recv(),
             Err(oneshot::error::TryRecvError::Closed)
         ));
+    }
+
+    #[test]
+    fn try_register_waiter_refuses_duplicate() {
+        let registry = RequestRegistry::new();
+        let sid = Some(SessionId(5));
+        let _rx = registry
+            .try_register_waiter(90, sid, 0, Duration::from_secs(5))
+            .expect("first registers");
+        // Second waiter for the same key is refused, not silently replaced.
+        assert!(registry
+            .try_register_waiter(90, sid, 0, Duration::from_secs(5))
+            .is_err());
     }
 }
