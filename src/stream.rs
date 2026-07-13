@@ -24,7 +24,17 @@ impl EventStream {
         }
     }
 
-    /// Create event stream with session filter
+    /// Create event stream with session filter.
+    ///
+    /// Deprecated: session-level filtering cannot see core data events because
+    /// `TransportEvent` does not carry a session id (only `RequestReceived` does),
+    /// so `MessageReceived` / `ConnectionClosed` are silently dropped by the filter.
+    /// Filter at the `ServerEvent` layer instead (e.g. `TransportServer::subscribe_events`
+    /// or the `SessionHandler` API).
+    #[deprecated(
+        since = "1.0.7",
+        note = "session filtering drops MessageReceived/ConnectionClosed; filter at the ServerEvent layer instead"
+    )]
     pub fn with_session_filter(
         receiver: broadcast::Receiver<TransportEvent>,
         session_id: SessionId,
@@ -35,7 +45,14 @@ impl EventStream {
         }
     }
 
-    /// Filter events for specific session
+    /// Filter events for specific session.
+    ///
+    /// Deprecated: filtering by session silently drops core data events; filter at
+    /// the `ServerEvent` layer instead. See `with_session_filter` for details.
+    #[deprecated(
+        since = "1.0.7",
+        note = "session filtering drops MessageReceived/ConnectionClosed; filter at the ServerEvent layer instead"
+    )]
     pub fn filter_session(mut self, session_id: SessionId) -> Self {
         self.session_filter = Some(session_id);
         self
@@ -181,7 +198,15 @@ impl PacketStream {
         }
     }
 
-    /// Create packet stream with session filter
+    /// Create packet stream with session filter.
+    ///
+    /// Deprecated: session filtering drops core data events; filter at the
+    /// `ServerEvent` layer instead. See `EventStream::with_session_filter`.
+    #[deprecated(
+        since = "1.0.7",
+        note = "session filtering drops MessageReceived/ConnectionClosed; filter at the ServerEvent layer instead"
+    )]
+    #[allow(deprecated)]
     pub fn with_session_filter(
         receiver: broadcast::Receiver<TransportEvent>,
         session_id: SessionId,
@@ -317,7 +342,15 @@ impl StreamFactory {
         ConnectionStream::new(receiver)
     }
 
-    /// Create session-filtered event stream
+    /// Create session-filtered event stream.
+    ///
+    /// Deprecated: session filtering drops core data events; filter at the
+    /// `ServerEvent` layer instead. See `EventStream::with_session_filter`.
+    #[deprecated(
+        since = "1.0.7",
+        note = "session filtering drops MessageReceived/ConnectionClosed; filter at the ServerEvent layer instead"
+    )]
+    #[allow(deprecated)]
     pub fn session_event_stream(
         receiver: broadcast::Receiver<TransportEvent>,
         session_id: SessionId,
@@ -325,7 +358,15 @@ impl StreamFactory {
         EventStream::with_session_filter(receiver, session_id)
     }
 
-    /// Create session-filtered packet stream
+    /// Create session-filtered packet stream.
+    ///
+    /// Deprecated: session filtering drops core data events; filter at the
+    /// `ServerEvent` layer instead. See `EventStream::with_session_filter`.
+    #[deprecated(
+        since = "1.0.7",
+        note = "session filtering drops MessageReceived/ConnectionClosed; filter at the ServerEvent layer instead"
+    )]
+    #[allow(deprecated)]
     pub fn session_packet_stream(
         receiver: broadcast::Receiver<TransportEvent>,
         session_id: SessionId,
