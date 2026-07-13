@@ -2,7 +2,7 @@
 
 [![Rust](https://img.shields.io/badge/rust-1.80+-orange.svg)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-Apache-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.0.0-green.svg)](Cargo.toml)
+[![Version](https://img.shields.io/badge/version-1.0.7-green.svg)](Cargo.toml)
 
 🌐 语言: [English](README.md) | [简体中文](README.zh-CN.md)
 
@@ -46,7 +46,7 @@
 
 ```toml
 [dependencies]
-msgtrans = "1.0.0"
+msgtrans = "1.0"
 ```
 
 ### 创建多协议服务器
