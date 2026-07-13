@@ -602,7 +602,7 @@ impl TransportClient {
                             let transport = transport_for_response.clone();
                             let message_id = packet.header.message_id;
 
-                            let context = crate::event::TransportContext::new_request(
+                            let context = crate::event::TransportContext::new_request_with_registry(
                                 None,
                                 message_id,
                                 packet.header.biz_type,
@@ -612,33 +612,34 @@ impl TransportClient {
                                     Some(packet.ext_header.clone())
                                 },
                                 packet.payload.clone(),
-                                Arc::new(move |response_data: Vec<u8>| {
-                                    let transport = transport.clone();
-                                    tokio::spawn(async move {
-                                        // [TARGET] Create response packet
-                                        let response_packet = crate::packet::Packet {
-                                            header: crate::packet::FixedHeader {
-                                                version: 1,
-                                                compression: crate::packet::CompressionType::None,
-                                                packet_type: crate::packet::PacketType::Response,
-                                                biz_type: 0,
-                                                message_id,
-                                                ext_header_len: 0,
-                                                payload_len: response_data.len() as u32,
-                                                reserved: crate::packet::ReservedFlags::new(),
-                                            },
-                                            ext_header: Vec::new(),
-                                            payload: response_data,
-                                        };
-
-                                        if let Err(e) = transport.send(response_packet).await {
-                                            tracing::error!(
-                                                "[ERROR] TransportClient response send failed: {}",
-                                                e
-                                            );
-                                        }
-                                    });
-                                }),
+                                Arc::new(
+                                    move |response_data: Vec<u8>| -> futures::future::BoxFuture<
+                                        'static,
+                                        Result<(), crate::error::TransportError>,
+                                    > {
+                                        let transport = transport.clone();
+                                        Box::pin(async move {
+                                            let response_packet = crate::packet::Packet {
+                                                header: crate::packet::FixedHeader {
+                                                    version: 1,
+                                                    compression:
+                                                        crate::packet::CompressionType::None,
+                                                    packet_type:
+                                                        crate::packet::PacketType::Response,
+                                                    biz_type: 0,
+                                                    message_id,
+                                                    ext_header_len: 0,
+                                                    payload_len: response_data.len() as u32,
+                                                    reserved: crate::packet::ReservedFlags::new(),
+                                                },
+                                                ext_header: Vec::new(),
+                                                payload: response_data,
+                                            };
+                                            transport.send(response_packet).await
+                                        })
+                                    },
+                                ),
+                                None,
                             );
 
                             let client_event = crate::event::ClientEvent::MessageReceived(context);
