@@ -1141,39 +1141,46 @@ impl TransportServer {
                                 Some(packet.ext_header.clone())
                             },
                             packet.payload.clone(),
-                            std::sync::Arc::new(move |response_data: Vec<u8>| {
-                                let server = server_clone.clone();
-                                let request_registry = request_registry.clone();
-                                let request_message_id = packet.header.message_id;
-                                let request_biz_type = packet.header.biz_type;
-                                tokio::spawn(async move {
-                                    tracing::debug!("[RESPOND] Creating response packet: request_id={}, request_biz_type={}, response_size={} bytes", request_message_id, request_biz_type, response_data.len());
-                                    let response_packet = crate::packet::Packet {
-                                        header: crate::packet::FixedHeader {
-                                            version: 1,
-                                            compression: crate::packet::CompressionType::None,
-                                            packet_type: crate::packet::PacketType::Response,
-                                            biz_type: 0,
-                                            message_id: request_message_id,
-                                            ext_header_len: 0,
-                                            payload_len: response_data.len() as u32,
-                                            reserved: crate::packet::ReservedFlags::new(),
-                                        },
-                                        ext_header: Vec::new(),
-                                        payload: response_data,
-                                    };
-                                    match server.send_to_session(session_id, response_packet).await
-                                    {
-                                        Ok(_) => {
-                                            tracing::debug!("[SUCCESS] Response sent successfully: session={}, request_id={}", session_id, request_message_id);
+                            std::sync::Arc::new(
+                                move |response_data: Vec<u8>| -> futures::future::BoxFuture<
+                                    'static,
+                                    Result<(), crate::TransportError>,
+                                > {
+                                    let server = server_clone.clone();
+                                    let request_registry = request_registry.clone();
+                                    let request_message_id = packet.header.message_id;
+                                    let request_biz_type = packet.header.biz_type;
+                                    Box::pin(async move {
+                                        tracing::debug!("[RESPOND] Creating response packet: request_id={}, request_biz_type={}, response_size={} bytes", request_message_id, request_biz_type, response_data.len());
+                                        let response_packet = crate::packet::Packet {
+                                            header: crate::packet::FixedHeader {
+                                                version: 1,
+                                                compression: crate::packet::CompressionType::None,
+                                                packet_type: crate::packet::PacketType::Response,
+                                                biz_type: 0,
+                                                message_id: request_message_id,
+                                                ext_header_len: 0,
+                                                payload_len: response_data.len() as u32,
+                                                reserved: crate::packet::ReservedFlags::new(),
+                                            },
+                                            ext_header: Vec::new(),
+                                            payload: response_data,
+                                        };
+                                        match server.send_to_session(session_id, response_packet).await
+                                        {
+                                            Ok(_) => {
+                                                tracing::debug!("[SUCCESS] Response sent successfully: session={}, request_id={}", session_id, request_message_id);
+                                                Ok(())
+                                            }
+                                            Err(e) => {
+                                                request_registry.record_response_send_failed();
+                                                tracing::error!("[ERROR] Failed to send response: session={}, request_id={}, error={:?}", session_id, request_message_id, e);
+                                                Err(e)
+                                            }
                                         }
-                                        Err(e) => {
-                                            request_registry.record_response_send_failed();
-                                            tracing::error!("[ERROR] Failed to send response: session={}, request_id={}, error={:?}", session_id, request_message_id, e);
-                                        }
-                                    }
-                                });
-                            }),
+                                    })
+                                },
+                            ),
                             Some(self.request_registry.clone()),
                         );
 

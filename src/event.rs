@@ -668,13 +668,22 @@ pub struct TransportContext {
     kind: TransportContextKind,
 }
 
+/// Responder that sends a response and reports the send result. Returns a boxed
+/// future so `respond` can spawn it fire-and-forget while `respond_checked` can
+/// await the outcome.
+type ResponderFn = Arc<
+    dyn Fn(Vec<u8>) -> futures::future::BoxFuture<'static, Result<(), crate::error::TransportError>>
+        + Send
+        + Sync,
+>;
+
 /// Message type enumeration
 enum TransportContextKind {
     /// One-way message (no response needed)
     OneWay,
     /// Request message (requires response)
     Request {
-        responder: Arc<dyn Fn(Vec<u8>) + Send + Sync + 'static>,
+        responder: ResponderFn,
         responded: Arc<AtomicBool>,
         is_primary: bool, // Mark whether it's the primary instance
         request_registry: Option<Arc<RequestRegistry>>,
@@ -710,6 +719,17 @@ impl TransportContext {
         data: Vec<u8>,
         responder: Arc<dyn Fn(Vec<u8>) + Send + Sync + 'static>,
     ) -> Self {
+        // Adapt the legacy fire-and-forget responder to the checked shape. The old
+        // Fn returns (), so the boxed future always reports success.
+        let responder: ResponderFn = Arc::new(
+            move |data: Vec<u8>| -> futures::future::BoxFuture<
+                'static,
+                Result<(), crate::error::TransportError>,
+            > {
+                responder(data);
+                Box::pin(async { Ok(()) })
+            },
+        );
         Self::new_request_with_registry(peer, message_id, biz_type, ext_header, data, responder, None)
     }
 
@@ -719,7 +739,7 @@ impl TransportContext {
         biz_type: u8,
         ext_header: Option<Vec<u8>>,
         data: Vec<u8>,
-        responder: Arc<dyn Fn(Vec<u8>) + Send + Sync + 'static>,
+        responder: ResponderFn,
         request_registry: Option<Arc<RequestRegistry>>,
     ) -> Self {
         Self {
@@ -790,7 +810,15 @@ impl TransportContext {
                     .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok()
                 {
-                    responder(response);
+                    let fut = responder(response);
+                    tokio::spawn(async move {
+                        if let Err(e) = fut.await {
+                            tracing::debug!(
+                                "[RESPOND] fire-and-forget response send failed: {:?}",
+                                e
+                            );
+                        }
+                    });
                 } else {
                     tracing::debug!(
                         "[RESPOND] TransportContext already responded locally (ID: {})",
@@ -810,6 +838,50 @@ impl TransportContext {
     /// Convenience method: respond with byte data
     pub fn respond_bytes(self, response: &[u8]) {
         self.respond(response.to_vec());
+    }
+
+    /// Respond and await the send result, so the caller can observe delivery
+    /// failures. Additive counterpart to `respond` (which is fire-and-forget).
+    ///
+    /// Returns `Ok(())` for duplicate/late/already-responded requests (idempotent);
+    /// one-way messages return a protocol error.
+    pub async fn respond_checked(
+        mut self,
+        response: Vec<u8>,
+    ) -> Result<(), crate::error::TransportError> {
+        let fut = match &mut self.kind {
+            TransportContextKind::Request {
+                responder,
+                responded,
+                request_registry,
+                ..
+            } => {
+                if let Some(registry) = request_registry {
+                    match registry.mark_responded(self.peer, self.message_id) {
+                        MarkResult::Updated => {}
+                        _ => return Ok(()),
+                    }
+                }
+                if responded
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    Some(responder(response))
+                } else {
+                    None
+                }
+            }
+            TransportContextKind::OneWay => {
+                return Err(crate::error::TransportError::protocol_error(
+                    "generic",
+                    "Cannot respond to one-way message",
+                ));
+            }
+        };
+        match fut {
+            Some(f) => f.await,
+            None => Ok(()),
+        }
     }
 }
 
@@ -959,5 +1031,49 @@ impl TransportResult {
     /// Check if has response data
     pub fn has_response(&self) -> bool {
         self.data.is_some()
+    }
+}
+
+#[cfg(test)]
+mod respond_checked_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn respond_checked_returns_ok_from_responder() {
+        let ok: ResponderFn = Arc::new(|_data| Box::pin(async { Ok(()) }));
+        let ctx = TransportContext::new_request_with_registry(
+            Some(SessionId(1)),
+            42,
+            0,
+            None,
+            b"req".to_vec(),
+            ok,
+            None,
+        );
+        assert!(ctx.respond_checked(b"resp".to_vec()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn respond_checked_propagates_send_error() {
+        let err: ResponderFn = Arc::new(|_data| {
+            Box::pin(async { Err(crate::error::TransportError::connection_error("boom", false)) })
+        });
+        let ctx = TransportContext::new_request_with_registry(
+            Some(SessionId(2)),
+            43,
+            0,
+            None,
+            b"req".to_vec(),
+            err,
+            None,
+        );
+        assert!(ctx.respond_checked(b"resp".to_vec()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn respond_checked_on_one_way_is_error() {
+        let ctx =
+            TransportContext::new_oneway(Some(SessionId(3)), 44, 0, None, b"data".to_vec());
+        assert!(ctx.respond_checked(b"resp".to_vec()).await.is_err());
     }
 }
