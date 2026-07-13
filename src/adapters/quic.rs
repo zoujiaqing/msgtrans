@@ -511,8 +511,16 @@ impl<C> QuicAdapter<C> {
                                 break;
                             }
 
-                            // Read frame payload
-                            let mut payload_buf = vec![0u8; frame_len];
+                            // Read frame payload into an uninitialized buffer to avoid
+                            // zero-filling up to 16 MiB per frame before overwriting it.
+                            let mut payload_buf = Vec::<u8>::with_capacity(frame_len);
+                            // SAFETY: read_exact writes exactly frame_len bytes before it
+                            // returns Ok; on Err we drop payload_buf without ever reading
+                            // its (possibly uninitialized) contents.
+                            #[allow(clippy::uninit_vec)]
+                            unsafe {
+                                payload_buf.set_len(frame_len);
+                            }
                             match recv_stream.read_exact(&mut payload_buf).await {
                                 Ok(_) => {
                                     tracing::debug!(

@@ -272,8 +272,10 @@ impl OptimizedReadBuffer {
                 return Ok(None);
             }
 
-            // Zero-copy parsing: split packet from buffer
-            let packet_bytes = self.buffer.split_to(total_packet_len).freeze();
+            // Split the complete packet out of the read buffer. No freeze(): we only
+            // borrow it as &[u8] for parsing, so turning it into a shared Bytes handle
+            // would allocate an Arc that is immediately dropped.
+            let packet_bytes = self.buffer.split_to(total_packet_len);
 
             // Parse packet
             match Packet::from_bytes(&packet_bytes) {

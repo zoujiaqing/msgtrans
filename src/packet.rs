@@ -423,6 +423,21 @@ impl Packet {
         buf.freeze()
     }
 
+    /// Serialize to a `Vec<u8>` in a single allocation.
+    ///
+    /// Equivalent to `to_bytes().to_vec()` but without the intermediate `Bytes`
+    /// allocation, for sinks that need an owned `Vec` (e.g. the WebSocket adapter).
+    pub fn encode_to_vec(&self) -> Vec<u8> {
+        let total_len = 16 + self.ext_header.len() + self.payload.len();
+        let mut buf = Vec::with_capacity(total_len);
+        buf.extend_from_slice(&self.header.to_bytes());
+        if !self.ext_header.is_empty() {
+            buf.extend_from_slice(&self.ext_header);
+        }
+        buf.extend_from_slice(&self.payload);
+        buf
+    }
+
     /// Deserialize from byte array
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, PacketError> {
         if bytes.len() < 16 {
@@ -909,6 +924,13 @@ mod tests {
         assert_eq!(packet.payload_len(), 11);
         assert_eq!(packet.header.compression, CompressionType::Zstd);
         assert!(packet.header.reserved.is_fragmented());
+    }
+
+    #[test]
+    fn encode_to_vec_matches_to_bytes() {
+        let mut packet = Packet::request(7, b"payload".to_vec());
+        packet.set_ext_header(b"ext");
+        assert_eq!(packet.encode_to_vec(), packet.to_bytes().to_vec());
     }
 
     #[test]
