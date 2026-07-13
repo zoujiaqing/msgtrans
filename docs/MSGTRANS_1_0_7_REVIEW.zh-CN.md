@@ -307,3 +307,17 @@ TCP / WebSocket / QUIC 现在各自维护 framing、读写循环、select、shut
 一句话判断：
 
 `1.0.7` 的下一步不是增加组件，而是把已有组件收敛成一条可证明稳定、可观测、无静默丢消息的主链路。**几乎所有收敛都不破坏 API——真正需要等 `2.0` 的只有「删掉被替换下来的旧 API」这一个动作。**
+
+## 10. 实施进度（1.0.7 收口）
+
+收口标准 1/2/3 已完成并 push 到 `origin/main`：
+
+- **step 2（标准 1）**：`RequestRegistry` 成为请求生命周期唯一核心；`RequestTracker` 降级为其薄委托（保留 pub API + `next_id`）；client/server/actor/legacy 语义统一；actor inbound request 注册 registry + `SessionSender::respond()` 幂等标记。
+- **step 3（标准 2）**：`TransportContext::respond_checked()` 加法，server + client 两侧都真实感知发送失败；旧 `respond()` 保留（内部 spawn future + debug 记失败）。
+- **step 4（标准 3）**：`FramePolicy`（Strict/Lenient）+ WebSocket/QUIC adapter 接入 + `Transport{Server,Client}Builder::with_frame_policy()` 用户入口，经 `Connection::set_frame_policy`（trait default 方法）注入。
+
+**API 红线全程守住**：`RequestTracker`/`RequestKey`/`create_session_actor`/`SessionActor::new`/`new_request`/`TransportServer::new*` 等公共签名一律未改，通过 `pub(crate) with_*` 注入、内部包装老 responder、trait default 方法达成。
+
+**验收**：`cargo test` 48+6+3；`--features flate2,zstd` 50+6+3；`build --examples` 通过；TCP request load test（20 连接 / 5 秒）13.6k msg/s、0 error、请求-响应链路完整——无性能回退。
+
+**收口边界**：step 1-4 构成 1.0.7 的稳定性架构大版本。step 5/6（P2-5 Framer 内核，重写三 adapter）与 step 7（P2-2 QUIC 多流）经评估属高风险 adapter 重写，挪到 `1.0.8` / `1.1.0` 单独、有 review 地做，不塞进 1.0.7 拖累稳定版。破坏性清理（删 `RequestTracker`、改 `RequestKey`、`Packet.payload -> Bytes`、删 legacy/`pub use tokio`）留 `2.0`。
