@@ -187,6 +187,19 @@ impl RequestRegistry {
         biz_type: u8,
         timeout: Duration,
     ) -> bool {
+        // Inbound requests have no caller-side timeout, so they are scheduled into
+        // the timeout wheel and reaped by the background scanner.
+        self.register_impl(request_id, session_id, biz_type, timeout, true)
+    }
+
+    fn register_impl(
+        &self,
+        request_id: u32,
+        session_id: Option<SessionId>,
+        biz_type: u8,
+        timeout: Duration,
+        schedule: bool,
+    ) -> bool {
         let key = RequestKey::new(session_id, request_id);
         let now = Instant::now();
         let entry = Arc::new(RequestEntry {
@@ -211,7 +224,9 @@ impl RequestRegistry {
         }
 
         self.counters.pending_requests.fetch_add(1, Ordering::Relaxed);
-        self.schedule_for_deadline(key, now + timeout);
+        if schedule {
+            self.schedule_for_deadline(key, now + timeout);
+        }
         true
     }
 
@@ -230,7 +245,11 @@ impl RequestRegistry {
         biz_type: u8,
         timeout: Duration,
     ) -> Result<oneshot::Receiver<Packet>, DuplicateRequest> {
-        if !self.register(request_id, session_id, biz_type, timeout) {
+        // Waiter-based (outbound) requests rely on the caller's own timeout
+        // (e.g. tokio::time::timeout) plus explicit removal, so they are NOT
+        // scheduled into the timeout wheel. This also avoids unbounded bucket
+        // growth on clients that run no timeout scanner.
+        if !self.register_impl(request_id, session_id, biz_type, timeout, false) {
             return Err(DuplicateRequest {
                 session_id,
                 request_id,
