@@ -23,13 +23,8 @@
 //!   Ready line written to stdout after `serve()` is invoked:
 //!     `MSGTRANS_E2E_READY ws://127.0.0.1:<ws_port>`
 use msgtrans::{
-    event::ServerEvent,
-    packet::Packet,
-    protocol::QuicServerConfig,
-    protocol::TcpServerConfig,
-    protocol::WebSocketServerConfig,
-    tokio,
-    transport::TransportServerBuilder,
+    event::ServerEvent, packet::Packet, protocol::QuicServerConfig, protocol::TcpServerConfig,
+    protocol::WebSocketServerConfig, tokio, transport::TransportServerBuilder,
 };
 use std::env;
 
@@ -104,10 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         event_count += 1;
                         println!("[RECV] Event #{}: New connection established", event_count);
                         println!("   Session ID: {}", session_id);
-                        println!(
-                            "   Address: {} ↔ {}",
-                            info.local_addr, info.peer_addr
-                        );
+                        println!("   Address: {} ↔ {}", info.local_addr, info.peer_addr);
 
                         // Welcome message + server-initiated request (demo only)
                         let transport_clone = transport.clone();
@@ -187,9 +179,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             tokio::spawn(async move {
                                 let mut packet = Packet::one_way(0, payload);
                                 packet.set_biz_type(biz_type);
-                                let _ = transport_clone
-                                    .send_to_session(session_id, packet)
-                                    .await;
+                                let _ = transport_clone.send_to_session(session_id, packet).await;
                             });
                         }
                     } else {
@@ -209,10 +199,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let echo_message = format!("Echo: {}", msg_text);
                             println!("[SEND] Responding to client request...");
                             context.respond(echo_message.as_bytes().to_vec());
-                            println!(
-                                "[SUCCESS] Client request responded (ID: {})",
-                                message_id
-                            );
+                            println!("[SUCCESS] Client request responded (ID: {})", message_id);
                         } else {
                             let transport_clone = transport.clone();
                             let echo_message = format!("Echo: {}", msg_text);

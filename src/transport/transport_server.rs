@@ -555,9 +555,7 @@ impl TransportServer {
                 let closed_inbound = server_clone
                     .request_registry
                     .close_session_pending(session_id);
-                let failed_outbound = server_clone
-                    .request_tracker
-                    .fail_session(Some(session_id));
+                let failed_outbound = server_clone.request_tracker.fail_session(Some(session_id));
                 if closed_inbound > 0 || failed_outbound > 0 {
                     tracing::debug!(
                         "[END] Session {} loop ended: closed {} inbound, failed {} outbound pending",
@@ -1178,7 +1176,9 @@ impl TransportServer {
                                             ext_header: Vec::new(),
                                             payload: response_data,
                                         };
-                                        match server.send_to_session(session_id, response_packet).await
+                                        match server
+                                            .send_to_session(session_id, response_packet)
+                                            .await
                                         {
                                             Ok(_) => {
                                                 tracing::debug!("[SUCCESS] Response sent successfully: session={}, request_id={}", session_id, request_message_id);

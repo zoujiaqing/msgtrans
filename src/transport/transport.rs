@@ -74,11 +74,7 @@ impl RequestTracker {
         }
     }
 
-    fn register_waiter(
-        &self,
-        session_id: Option<SessionId>,
-        id: u32,
-    ) -> oneshot::Receiver<Packet> {
+    fn register_waiter(&self, session_id: Option<SessionId>, id: u32) -> oneshot::Receiver<Packet> {
         match self
             .registry
             .try_register_waiter(id, session_id, 0, REQUEST_WAITER_TIMEOUT)

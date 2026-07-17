@@ -1,9 +1,9 @@
 use crate::{
     command::{ConnectionInfo, ConnectionState},
+    connection::Connection,
     error::TransportError,
     event::TransportEvent,
     packet::{Packet, PacketError},
-    connection::Connection,
     protocol::{AdapterStats, TcpClientConfig, TcpServerConfig},
     transport::memory_pool::{shared_memory_pool, BufferSize, OptimizedMemoryPool},
     SessionId,
@@ -80,7 +80,7 @@ const MAX_RESYNC_SCAN_DISTANCE: usize = 4096;
 /// Fixed header size
 const FIXED_HEADER_SIZE: usize = 16;
 /// Bound send queue to prevent unbounded memory growth under slow peers.
-const SEND_QUEUE_CAPACITY: usize = 8192;
+const SEND_QUEUE_CAPACITY: usize = 512;
 
 /// Optimized TCP read buffer with frame resync and memory-pool recycling.
 struct OptimizedReadBuffer {
@@ -582,10 +582,17 @@ impl TcpAdapter<TcpClientConfig> {
 impl<C: Send + Sync + 'static> Connection for TcpAdapter<C> {
     async fn send(&mut self, packet: Packet) -> Result<(), TransportError> {
         self.send_queue
-            .send(packet)
-            .await
-            .map_err(|_| TransportError::connection_error("TCP connection closed", false))?;
-        Ok(())
+            .try_send(packet)
+            .map_err(|error| match error {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => TransportError::resource_error(
+                    "tcp_outbound_queue",
+                    self.send_queue.max_capacity(),
+                    self.send_queue.max_capacity(),
+                ),
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                    TransportError::connection_error("TCP connection closed", false)
+                }
+            })
     }
 
     async fn close(&mut self) -> Result<(), TransportError> {

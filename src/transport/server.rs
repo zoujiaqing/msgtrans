@@ -235,7 +235,6 @@ impl Default for TransportServerBuilder {
     }
 }
 
-
 /// Example middleware implementations
 
 /// Logging middleware

@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use crate::protocol::ProtocolRegistry;
-use crate::transport::memory_pool::{init_shared_memory_pool, shared_memory_pool, OptimizedMemoryPool};
+use crate::transport::memory_pool::{
+    init_shared_memory_pool, shared_memory_pool, OptimizedMemoryPool,
+};
 use crate::TransportError;
 
 /// Shared context holding heavy resources that should be created once and reused.

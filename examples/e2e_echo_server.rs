@@ -15,10 +15,7 @@
 //! Stop: SIGINT / SIGTERM.
 
 use msgtrans::{
-    event::ServerEvent,
-    packet::Packet,
-    protocol::WebSocketServerConfig,
-    tokio,
+    event::ServerEvent, packet::Packet, protocol::WebSocketServerConfig, tokio,
     transport::TransportServerBuilder,
 };
 use std::env;
@@ -70,9 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     tokio::spawn(async move {
                         let mut packet = Packet::one_way(0, payload);
                         packet.set_biz_type(biz_type);
-                        let _ = transport_clone
-                            .send_to_session(session_id, packet)
-                            .await;
+                        let _ = transport_clone.send_to_session(session_id, packet).await;
                     });
                 }
             }

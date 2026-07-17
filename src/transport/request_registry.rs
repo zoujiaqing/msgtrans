@@ -70,12 +70,10 @@ impl RequestEntry {
     }
 
     fn try_transition(&self, from: RequestState, to: RequestState) -> Result<(), RequestState> {
-        match self.state.compare_exchange(
-            from as u8,
-            to as u8,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        ) {
+        match self
+            .state
+            .compare_exchange(from as u8, to as u8, Ordering::SeqCst, Ordering::SeqCst)
+        {
             Ok(_) => Ok(()),
             Err(cur) => Err(RequestState::from_u8(cur).unwrap_or(RequestState::Dropped)),
         }
@@ -223,7 +221,9 @@ impl RequestRegistry {
             set.insert(key);
         }
 
-        self.counters.pending_requests.fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .pending_requests
+            .fetch_add(1, Ordering::Relaxed);
         if schedule {
             self.schedule_for_deadline(key, now + timeout);
         }
@@ -272,8 +272,9 @@ impl RequestRegistry {
     ) -> bool {
         match self.mark_responded(session_id, request_id) {
             MarkResult::Updated => {
-                if let Some((_, tx)) =
-                    self.waiters.remove(&RequestKey::new(session_id, request_id))
+                if let Some((_, tx)) = self
+                    .waiters
+                    .remove(&RequestKey::new(session_id, request_id))
                 {
                     let _ = tx.send(packet);
                 }
@@ -313,7 +314,11 @@ impl RequestRegistry {
         aborted
     }
 
-    pub fn get_state(&self, session_id: Option<SessionId>, request_id: u32) -> Option<RequestState> {
+    pub fn get_state(
+        &self,
+        session_id: Option<SessionId>,
+        request_id: u32,
+    ) -> Option<RequestState> {
         self.entries
             .get(&RequestKey::new(session_id, request_id))
             .map(|entry| entry.state())
@@ -334,7 +339,9 @@ impl RequestRegistry {
 
         match entry.try_transition(RequestState::Pending, RequestState::Responded) {
             Ok(_) => {
-                self.counters.pending_requests.fetch_sub(1, Ordering::Relaxed);
+                self.counters
+                    .pending_requests
+                    .fetch_sub(1, Ordering::Relaxed);
                 drop(entry);
                 self.remove_terminal_entry(key);
                 MarkResult::Updated
@@ -357,7 +364,9 @@ impl RequestRegistry {
 
         match entry.try_transition(RequestState::Pending, RequestState::TimedOut) {
             Ok(_) => {
-                self.counters.pending_requests.fetch_sub(1, Ordering::Relaxed);
+                self.counters
+                    .pending_requests
+                    .fetch_sub(1, Ordering::Relaxed);
                 self.counters
                     .request_timeout_total
                     .fetch_add(1, Ordering::Relaxed);
@@ -378,7 +387,9 @@ impl RequestRegistry {
 
         match entry.try_transition(RequestState::Pending, RequestState::Dropped) {
             Ok(_) => {
-                self.counters.pending_requests.fetch_sub(1, Ordering::Relaxed);
+                self.counters
+                    .pending_requests
+                    .fetch_sub(1, Ordering::Relaxed);
                 drop(entry);
                 self.remove_terminal_entry(key);
                 MarkResult::Updated
@@ -401,7 +412,9 @@ impl RequestRegistry {
                     .is_ok()
                 {
                     closed += 1;
-                    self.counters.pending_requests.fetch_sub(1, Ordering::Relaxed);
+                    self.counters
+                        .pending_requests
+                        .fetch_sub(1, Ordering::Relaxed);
                     let key = *key.key();
                     drop(entry);
                     self.entries.remove(&key);
@@ -663,11 +676,7 @@ mod tests {
             Packet::response(60, Vec::new())
         ));
         assert!(rx.try_recv().is_err());
-        assert!(registry.complete_waiter(
-            Some(SessionId(1)),
-            60,
-            Packet::response(60, Vec::new())
-        ));
+        assert!(registry.complete_waiter(Some(SessionId(1)), 60, Packet::response(60, Vec::new())));
         assert!(rx.try_recv().is_ok());
     }
 

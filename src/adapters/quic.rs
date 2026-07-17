@@ -30,7 +30,7 @@ use crate::{
 };
 
 /// Bound send queue to prevent unbounded memory growth under slow links.
-const SEND_QUEUE_CAPACITY: usize = 8192;
+const SEND_QUEUE_CAPACITY: usize = 512;
 
 #[derive(Debug, thiserror::Error)]
 pub enum QuicError {
@@ -559,14 +559,14 @@ impl<C> QuicAdapter<C> {
                                         match Packet::from_bytes(&payload_buf) {
                                             Ok(packet) => packet,
                                             Err(_) if strict => {
-                                                let _ = read_event_sender.send(
-                                                    TransportEvent::ConnectionClosed {
+                                                let _ =
+                                                    read_event_sender
+                                                        .send(TransportEvent::ConnectionClosed {
                                                         reason: crate::error::CloseReason::Error(
                                                             "Undecodable frame (strict policy)"
                                                                 .to_string(),
                                                         ),
-                                                    },
-                                                );
+                                                    });
                                                 break;
                                             }
                                             Err(_) => Packet::one_way(0, payload_buf),
@@ -772,10 +772,17 @@ impl QuicAdapter<QuicClientConfig> {
 impl<C: Send + Sync + 'static> Connection for QuicAdapter<C> {
     async fn send(&mut self, packet: Packet) -> Result<(), TransportError> {
         self.send_queue
-            .send(packet)
-            .await
-            .map_err(|_| TransportError::connection_error("QUIC connection closed", false))?;
-        Ok(())
+            .try_send(packet)
+            .map_err(|error| match error {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => TransportError::resource_error(
+                    "quic_outbound_queue",
+                    self.send_queue.max_capacity(),
+                    self.send_queue.max_capacity(),
+                ),
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                    TransportError::connection_error("QUIC connection closed", false)
+                }
+            })
     }
 
     async fn close(&mut self) -> Result<(), TransportError> {

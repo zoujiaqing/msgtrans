@@ -247,9 +247,7 @@ impl SessionHandle {
             .map_err(|e| {
                 // Extract the TransportEvent from the ActorMessage for the error
                 match e.0 {
-                    ActorMessage::InboundEvent(evt) => {
-                        tokio::sync::mpsc::error::SendError(evt)
-                    }
+                    ActorMessage::InboundEvent(evt) => tokio::sync::mpsc::error::SendError(evt),
                     _ => unreachable!(),
                 }
             })
@@ -258,9 +256,17 @@ impl SessionHandle {
     /// Send a packet through the actor (fire-and-forget, no reply).
     pub async fn send_packet(&self, packet: Packet) -> Result<(), crate::TransportError> {
         self.tx
-            .send_async(ActorMessage::Send(packet))
-            .await
-            .map_err(|_| crate::TransportError::connection_error("Actor channel closed", false))
+            .try_send(ActorMessage::Send(packet))
+            .map_err(|error| match error {
+                flume::TrySendError::Full(_) => crate::TransportError::resource_error(
+                    "session_actor_outbound_queue",
+                    self.tx.len(),
+                    self.tx.capacity().unwrap_or(DEFAULT_ACTOR_BUFFER_SIZE),
+                ),
+                flume::TrySendError::Disconnected(_) => {
+                    crate::TransportError::connection_error("Actor channel closed", false)
+                }
+            })
     }
 
     /// Send a packet through the actor and wait for the send result.
@@ -270,12 +276,20 @@ impl SessionHandle {
     ) -> Result<(), crate::TransportError> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.tx
-            .send_async(ActorMessage::SendWithReply {
+            .try_send(ActorMessage::SendWithReply {
                 packet,
                 reply: reply_tx,
             })
-            .await
-            .map_err(|_| crate::TransportError::connection_error("Actor channel closed", false))?;
+            .map_err(|error| match error {
+                flume::TrySendError::Full(_) => crate::TransportError::resource_error(
+                    "session_actor_outbound_queue",
+                    self.tx.len(),
+                    self.tx.capacity().unwrap_or(DEFAULT_ACTOR_BUFFER_SIZE),
+                ),
+                flume::TrySendError::Disconnected(_) => {
+                    crate::TransportError::connection_error("Actor channel closed", false)
+                }
+            })?;
         reply_rx.await.map_err(|_| {
             crate::TransportError::connection_error("Actor dropped before reply", false)
         })?
@@ -401,9 +415,7 @@ impl SessionActor {
                                     self.session_id,
                                     reason
                                 );
-                                self.handler
-                                    .on_disconnected(self.session_id, reason)
-                                    .await;
+                                self.handler.on_disconnected(self.session_id, reason).await;
                                 should_break = true;
                             }
                             TransportEvent::TransportError { error } => {
@@ -460,7 +472,8 @@ impl SessionActor {
 }
 
 /// Default buffer size for session actor channels
-pub const DEFAULT_ACTOR_BUFFER_SIZE: usize = 2048;
+// Keep the actor and adapter halves within a 1024-packet per-session budget.
+pub const DEFAULT_ACTOR_BUFFER_SIZE: usize = 512;
 
 /// Create a new session actor pair (handle + actor)
 ///
@@ -482,4 +495,34 @@ pub fn create_session_actor(
     let actor = SessionActor::new(session_id, transport, rx, handler);
 
     (handle, actor)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::{config::TransportConfig, context::TransportContext};
+
+    #[tokio::test]
+    async fn outbound_send_fails_fast_when_actor_mailbox_is_full() {
+        let context = TransportContext::new().await.unwrap();
+        let transport = Arc::new(Transport::with_context(
+            TransportConfig::default(),
+            &context,
+        ));
+        let (tx, _rx) = bounded(1);
+        tx.try_send(ActorMessage::Send(Packet::one_way(1, vec![1])))
+            .unwrap();
+        let handle = SessionHandle { tx, transport };
+
+        let error = handle
+            .send_packet_with_reply(Packet::one_way(2, vec![2]))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            crate::TransportError::Resource { ref resource, current: 1, limit: 1 }
+                if resource == "session_actor_outbound_queue"
+        ));
+    }
 }

@@ -320,8 +320,7 @@ impl ServerConfig for WebSocketServerConfig {
 }
 
 impl ClientConfig for WebSocketClientConfig {
-    type Connection =
-        crate::adapters::websocket::WebSocketAdapter<WebSocketClientConfig>;
+    type Connection = crate::adapters::websocket::WebSocketAdapter<WebSocketClientConfig>;
 
     fn validate(&self) -> Result<(), TransportError> {
         ProtocolConfig::validate(self).map_err(|e| {

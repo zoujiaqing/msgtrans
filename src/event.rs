@@ -730,7 +730,9 @@ impl TransportContext {
                 Box::pin(async { Ok(()) })
             },
         );
-        Self::new_request_with_registry(peer, message_id, biz_type, ext_header, data, responder, None)
+        Self::new_request_with_registry(
+            peer, message_id, biz_type, ext_header, data, responder, None,
+        )
     }
 
     pub(crate) fn new_request_with_registry(
@@ -1056,7 +1058,11 @@ mod respond_checked_tests {
     #[tokio::test]
     async fn respond_checked_propagates_send_error() {
         let err: ResponderFn = Arc::new(|_data| {
-            Box::pin(async { Err(crate::error::TransportError::connection_error("boom", false)) })
+            Box::pin(async {
+                Err(crate::error::TransportError::connection_error(
+                    "boom", false,
+                ))
+            })
         });
         let ctx = TransportContext::new_request_with_registry(
             Some(SessionId(2)),
@@ -1072,8 +1078,7 @@ mod respond_checked_tests {
 
     #[tokio::test]
     async fn respond_checked_on_one_way_is_error() {
-        let ctx =
-            TransportContext::new_oneway(Some(SessionId(3)), 44, 0, None, b"data".to_vec());
+        let ctx = TransportContext::new_oneway(Some(SessionId(3)), 44, 0, None, b"data".to_vec());
         assert!(ctx.respond_checked(b"resp".to_vec()).await.is_err());
     }
 }

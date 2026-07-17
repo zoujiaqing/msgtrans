@@ -10,17 +10,12 @@ use tokio_tungstenite::{
 };
 
 use crate::{
-    command::ConnectionState,
-    error::TransportError,
-    event::TransportEvent,
-    packet::Packet,
-    connection::Connection,
-    protocol::AdapterStats,
-    ConnectionInfo, SessionId,
+    command::ConnectionState, connection::Connection, error::TransportError, event::TransportEvent,
+    packet::Packet, protocol::AdapterStats, ConnectionInfo, SessionId,
 };
 
 /// Bound send queue to prevent unbounded memory growth under backpressure.
-const SEND_QUEUE_CAPACITY: usize = 8192;
+const SEND_QUEUE_CAPACITY: usize = 512;
 
 /// WebSocket message processing result
 enum MessageProcessResult {
@@ -378,7 +373,10 @@ impl<C> WebSocketAdapter<C> {
                     }
                     Err(e) => {
                         if strict {
-                            tracing::debug!("[RECV] WebSocket packet parse failed under strict policy: {:?}", e);
+                            tracing::debug!(
+                                "[RECV] WebSocket packet parse failed under strict policy: {:?}",
+                                e
+                            );
                             return MessageProcessResult::Error(WebSocketError::InvalidMessageType);
                         }
                         tracing::debug!("[RECV] WebSocket packet parsing failed: {:?}, creating basic data packet", e);
@@ -417,10 +415,17 @@ impl<C> WebSocketAdapter<C> {
 impl<C: Send + Sync + 'static> Connection for WebSocketAdapter<C> {
     async fn send(&mut self, packet: Packet) -> Result<(), TransportError> {
         self.send_queue
-            .send(packet)
-            .await
-            .map_err(|_| TransportError::connection_error("WebSocket connection closed", false))?;
-        Ok(())
+            .try_send(packet)
+            .map_err(|error| match error {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => TransportError::resource_error(
+                    "websocket_outbound_queue",
+                    self.send_queue.max_capacity(),
+                    self.send_queue.max_capacity(),
+                ),
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                    TransportError::connection_error("WebSocket connection closed", false)
+                }
+            })
     }
 
     async fn close(&mut self) -> Result<(), TransportError> {

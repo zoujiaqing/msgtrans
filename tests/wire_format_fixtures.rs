@@ -161,7 +161,11 @@ fn fixtures_round_trip() {
             "[{}] packet_type",
             label
         );
-        assert_eq!(parsed.header.biz_type, spec.biz_type, "[{}] biz_type", label);
+        assert_eq!(
+            parsed.header.biz_type, spec.biz_type,
+            "[{}] biz_type",
+            label
+        );
         assert_eq!(
             parsed.header.message_id, spec.message_id,
             "[{}] message_id",

@@ -50,10 +50,7 @@ fn build_fixtures() -> Vec<(&'static str, Packet)> {
     let mut out: Vec<(&'static str, Packet)> = Vec::new();
 
     // 01: OneWay, mid=1, biz_type=0, empty ext, empty payload
-    out.push((
-        "01_oneway_empty",
-        Packet::one_way(1, Vec::<u8>::new()),
-    ));
+    out.push(("01_oneway_empty", Packet::one_way(1, Vec::<u8>::new())));
 
     // 02: OneWay, mid=42, biz_type=5, payload="hello world"
     let mut p = Packet::one_way(42, b"hello world".to_vec());
@@ -116,7 +113,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Sanity: ReservedFlags raw round-trips.
     assert_eq!(ReservedFlags::from_raw(0x0006).raw(), 0x0006);
 
-    println!("Writing {} fixtures to {}", fixtures.len(), out_dir.display());
+    println!(
+        "Writing {} fixtures to {}",
+        fixtures.len(),
+        out_dir.display()
+    );
 
     for (name, packet) in &fixtures {
         let bin_path = out_dir.join(format!("{}.bin", name));
