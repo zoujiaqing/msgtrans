@@ -1,3 +1,6 @@
+// The README is the crate documentation, which also makes its examples part of
+// the doctest suite so they cannot drift from the real API.
+#![doc = include_str!("../README.md")]
 #![allow(unused_variables)]
 #![allow(unused_mut)]
 #![allow(dead_code)]
@@ -7,11 +10,7 @@
 #![allow(unused_must_use)]
 #![allow(non_upper_case_globals)]
 
-/// msgtrans - Unified multi-protocol transport library
-///
-/// High-performance Rust transport library providing unified interfaces for TCP, WebSocket and QUIC protocols.
-/// Event-driven architecture with a single `Connection` trait, zero-copy packets, and lock-free internals.
-// Transport layer
+/// Transport layer: client, server, session actors and request lifecycle.
 pub mod transport;
 
 // Protocol adapters

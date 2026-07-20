@@ -2,74 +2,69 @@
 
 [![Rust](https://img.shields.io/badge/rust-1.80+-orange.svg)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-Apache-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.0.7-green.svg)](Cargo.toml)
+[![Crates.io](https://img.shields.io/crates/v/msgtrans.svg)](https://crates.io/crates/msgtrans)
+[![Docs.rs](https://img.shields.io/docsrs/msgtrans)](https://docs.rs/msgtrans)
 
-🌐 语言: [English](README.md) | [简体中文](README.zh-CN.md)
+🌐 语言：[English](README.md) | [简体中文](README.zh-CN.md)
 
-> **企业级现代化多协议通信框架，统一接口支持TCP、WebSocket、QUIC等协议**
+> **现代化多协议通信框架，用统一接口封装 TCP、WebSocket、QUIC**
 
 ## 🌟 核心特性
 
-### ⚡ 极致性能
- - **100万+** 并发连接支持
- - **1000万+/秒** 消息吞吐量
- - **1毫秒** 平均延迟
- - **无锁并发架构** 充分利用多核性能
+### 🏗️ 统一架构
 
-### 🏗️ **统一架构设计**
-- **三层架构抽象**：应用层 → 传输层 → 协议层，层次清晰
-- **协议无关业务**：一套代码，多协议部署
-- **配置驱动设计**：通过配置即可切换协议，无需修改业务逻辑
-- **热插拔扩展**：轻松扩展新协议支持
+- **三层架构**：应用层 → 传输层 → 协议层，职责清晰分离
+- **业务逻辑协议无关**：一套代码，多协议部署
+- **配置驱动**：切换协议只改配置，不动业务逻辑
+- **可插拔适配器**：实现 `Connection` trait 即可接入新协议
 
-### ⚡ **现代化并发架构**
-- **无锁并发设计**：完全消除锁竞争，充分利用多核性能
-- **零拷贝优化**：`SharedPacket` 和 `ArcPacket` 实现内存零拷贝
-- **事件驱动模型**：完全异步非阻塞，高效事件处理
-- **智能化优化**：CPU感知的自动性能调优
+### ⚡ 现代并发
 
-### 🔌 **多协议统一支持**
-- **TCP** - 可靠传输协议
-- **WebSocket** - 实时Web通信
-- **QUIC** - 下一代传输协议
-- **扩展协议** - 轻松实现自定义协议
+- **无锁内核**：按会话的 actor + 无锁 map，热路径上避免 Mutex 竞争
+- **零拷贝报文**：`Packet` 承载 `Bytes` 载荷，尽可能直接交给网络层
+- **事件驱动模型**：全异步、非阻塞
+- **有界背压**：出站队列按连接有界，慢速对端既不会撑爆内存，也不会阻塞扇出循环
 
-### 🎯 **极简API设计**
-- **Builder模式**：链式配置，代码优雅易读
-- **类型安全**：编译时错误检查，运行时稳定可靠
-- **零配置优化**：默认即高性能，开箱即用
-- **向后兼容**：版本升级零迁移成本
+### 🔌 协议
+
+- **TCP** - 可靠流式传输
+- **WebSocket** - 实时 Web 通信
+- **QUIC** - 基于 UDP 的现代传输
+- **自定义协议** - 实现 `Connection` trait
+
+### 🎯 极简 API
+
+- **Builder 模式**：流畅、可读的配置
+- **类型安全**：配置在编译期检查
+- **合理默认值**：开箱即用，按需调优
 
 ## 🚀 快速开始
 
-### 安装依赖
+### 安装
 
 ```toml
 [dependencies]
 msgtrans = "1.0"
 ```
 
-### 创建多协议服务器
+### 创建多协议服务端
 
-```rust
+```rust,no_run
 use msgtrans::{
     transport::TransportServerBuilder,
     protocol::{TcpServerConfig, WebSocketServerConfig, QuicServerConfig},
     event::ServerEvent,
+    tokio,
 };
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 配置多个协议 - 同一业务逻辑支持多协议
+    // 配置多个协议 —— 同一套业务逻辑服务所有协议
     let tcp_config = TcpServerConfig::new("127.0.0.1:8001")?;
-    
-    let websocket_config = WebSocketServerConfig::new("127.0.0.1:8002")?
-        .with_path("/ws");
-    
+    let websocket_config = WebSocketServerConfig::new("127.0.0.1:8002")?.with_path("/ws");
     let quic_config = QuicServerConfig::new("127.0.0.1:8003")?;
 
-    // 构建多协议服务器
-    let mut server = TransportServerBuilder::new()
+    let server = TransportServerBuilder::new()
         .max_connections(10000)
         .with_protocol(tcp_config)
         .with_protocol(websocket_config)
@@ -77,85 +72,80 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()
         .await?;
 
-    println!("🚀 多协议服务器启动成功！");
-    
-    // 获取事件流
-    let mut events = server.events().await?;
-    
-    // 统一的事件处理 - 所有协议使用相同逻辑
-    while let Some(event) = events.recv().await {
-        match event {
-            ServerEvent::ConnectionEstablished { session_id, .. } => {
-                println!("新连接: {}", session_id);
-            }
-            ServerEvent::MessageReceived { session_id, context } => {
-                // 回显消息 - 协议透明
-                let message = String::from_utf8_lossy(&context.data);
-                let response = format!("Echo: {}", message);
-                let _ = server.send(session_id, response.as_bytes()).await;
-            }
-            ServerEvent::ConnectionClosed { session_id, .. } => {
-                println!("连接关闭: {}", session_id);
-            }
-            _ => {}
-        }
-    }
+    // 先订阅事件，避免遗漏
+    let mut events = server.subscribe_events();
 
+    // 启动监听。serve() 会一直运行到服务停止，因此把它 spawn 出去，
+    // 在主任务里处理事件。
+    let server_for_events = server.clone();
+    tokio::spawn(async move {
+        while let Ok(event) = events.recv().await {
+            match event {
+                ServerEvent::ConnectionEstablished { session_id, .. } => {
+                    println!("新连接: {session_id}");
+                }
+                ServerEvent::MessageReceived { session_id, context } => {
+                    // 回显 —— 协议透明
+                    let response = format!("Echo: {}", String::from_utf8_lossy(&context.data));
+                    let _ = server_for_events.send(session_id, response.as_bytes()).await;
+                }
+                ServerEvent::ConnectionClosed { session_id, .. } => {
+                    println!("连接关闭: {session_id}");
+                }
+                _ => {}
+            }
+        }
+    });
+
+    server.serve().await?;
     Ok(())
 }
 ```
 
 ### 创建客户端连接
 
-```rust
+```rust,no_run
 use msgtrans::{
     transport::TransportClientBuilder,
     protocol::TcpClientConfig,
     event::ClientEvent,
+    tokio,
 };
 use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 配置客户端 - 配置驱动的协议选择
     let tcp_config = TcpClientConfig::new("127.0.0.1:8001")?
         .with_connect_timeout(Duration::from_secs(30));
 
-    // 构建客户端 - 零配置即高性能
     let mut client = TransportClientBuilder::new()
         .with_protocol(tcp_config)
         .build()
         .await?;
 
-    // 连接服务器
     client.connect().await?;
 
-    // 发送消息 - 简洁的API，直接发送字节数据
-    let _result = client.send("Hello, MsgTrans!".as_bytes()).await?;
-    println!("✅ 消息发送成功");
+    // 发送单向消息
+    client.send("Hello, MsgTrans!".as_bytes()).await?;
+    println!("消息已发送");
 
     // 发送请求并等待响应
-    match client.request("What time is it?".as_bytes()).await? {
-        result if result.data.is_some() => {
-            let response = String::from_utf8_lossy(result.data.as_ref().unwrap());
-            println!("📥 收到响应: {}", response);
-        }
-        _ => println!("❌ 请求超时或失败"),
+    let result = client.request("What time is it?".as_bytes()).await?;
+    if let Some(data) = result.data {
+        println!("收到响应: {}", String::from_utf8_lossy(&data));
+    } else {
+        println!("请求超时");
     }
 
-    // 接收事件 - 统一的事件模型
-    let mut events = client.events().await?;
+    // 消费事件
+    let mut events = client.subscribe_events();
     tokio::spawn(async move {
-        while let Some(event) = events.recv().await {
+        while let Ok(event) = events.recv().await {
             match event {
                 ClientEvent::MessageReceived(context) => {
-                    let message = String::from_utf8_lossy(&context.data);
-                    println!("📨 收到消息: {}", message);
+                    println!("收到: {}", String::from_utf8_lossy(&context.data));
                 }
-                ClientEvent::Disconnected { .. } => {
-                    println!("🔌 连接已关闭");
-                    break;
-                }
+                ClientEvent::Disconnected { .. } => break,
                 _ => {}
             }
         }
@@ -167,222 +157,143 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## 🏗️ 架构设计
 
-### 📚 三层架构
+### 三层架构
 
+```text
++-------------------------------------+
+|  应用层                             |  <- 业务逻辑，协议无关
++-------------------------------------+
+|  传输层                             |  <- 连接管理，统一 API
+|  - TransportServer / TransportClient|     - 连接生命周期
+|  - SessionActor                     |     - 事件路由
+|  - RequestRegistry                  |     - 请求/响应生命周期
++-------------------------------------+
+|  协议层                             |  <- 协议实现
+|  - TCP / WebSocket / QUIC 适配器    |     - Connection trait
+|  - 协议配置                         |     - 协议注册
++-------------------------------------+
 ```
-┌─────────────────────────────────────┐
-│  🎯 应用层 (Your Application)        │  ← 业务逻辑，协议无关
-├─────────────────────────────────────┤
-│  🚀 传输层 (Transport Layer)         │  ← 连接管理，统一API
-│  ├── TransportServer/Client         │    • 连接生命周期管理
-│  ├── SessionManager                 │    • 事件分发和路由
-│  └── EventStream                    │    • 消息传递和广播
-├─────────────────────────────────────┤
-│  📡 协议层 (Protocol Layer)          │  ← 协议实现，可扩展
-│  ├── TCP/WebSocket/QUIC             │    • 具体协议适配
-│  ├── ProtocolAdapter                │    • 协议配置管理
-│  └── ConfigurationRegistry          │    • 协议注册机制
-└─────────────────────────────────────┘
-```
 
-### 🔄 设计原则
+### 设计原则
 
-#### **统一抽象，协议透明**
-- **TransportServer/Client** 提供统一的业务接口
-- **Transport** 管理单个连接的生命周期
-- **ProtocolAdapter** 隐藏协议实现细节
+**统一抽象、协议透明** —— `TransportServer`/`TransportClient` 暴露一套业务接口；
+每个适配器实现 `Connection` trait，隐藏协议细节。
 
-#### **配置驱动，灵活扩展**
-```rust
-// 同样的服务器代码，不同的协议配置
+**配置驱动** —— 同一套服务端代码可跑在任意协议上，只需改传给 `.with_protocol(..)` 的配置：
+
+```rust,no_run
+# use msgtrans::{transport::TransportServerBuilder, protocol::{TcpServerConfig, QuicServerConfig}};
+# async fn f() -> Result<(), Box<dyn std::error::Error>> {
+// TCP 服务端
 let server = TransportServerBuilder::new()
     .with_protocol(TcpServerConfig::new("0.0.0.0:8080")?)
-    .build().await?;  // TCP版本
+    .build().await?;
 
+// QUIC 服务端 —— 业务逻辑完全相同
 let server = TransportServerBuilder::new()
     .with_protocol(QuicServerConfig::new("0.0.0.0:8080")?)
-    .build().await?;  // QUIC版本 - 业务逻辑完全相同
+    .build().await?;
+# Ok(()) }
 ```
 
-### 🎯 事件驱动模型
+### 事件驱动模型
 
 ```rust
-// 服务端事件类型
-pub enum ServerEvent {
-    ConnectionEstablished { session_id: SessionId, info: ConnectionInfo },
-    MessageReceived { session_id: SessionId, context: TransportContext },
-    MessageSent { session_id: SessionId, message_id: u32 },
-    ConnectionClosed { session_id: SessionId, reason: CloseReason },
-    TransportError { session_id: Option<SessionId>, error: TransportError },
-}
+use msgtrans::{
+    event::{ServerEvent, ClientEvent},
+    command::ConnectionInfo,
+    error::{TransportError, CloseReason},
+    SessionId, TransportContext,
+};
 
-// 客户端事件类型
-pub enum ClientEvent {
-    Connected { info: ConnectionInfo },
-    MessageReceived(TransportContext),
-    MessageSent { message_id: u32 },
-    Disconnected { reason: CloseReason },
-    Error { error: TransportError },
-}
+// 服务端事件
+# fn _server_events(ev: ServerEvent) { match ev {
+ServerEvent::ConnectionEstablished { session_id, info } => { /* ... */ }
+ServerEvent::MessageReceived { session_id, context } => { /* ... */ }
+ServerEvent::MessageSent { session_id, message_id } => { /* ... */ }
+ServerEvent::ConnectionClosed { session_id, reason } => { /* ... */ }
+ServerEvent::TransportError { session_id, error } => { /* ... */ }
+# _ => {} } }
 
-// 简洁的事件处理模式 - 服务端
-let mut events = server.events().await?;
-while let Some(event) = events.recv().await {
-    match event {
-        ServerEvent::MessageReceived { session_id, context } => {
-            // 协议无关的业务处理 - 直接使用字节数据
-            let message = String::from_utf8_lossy(&context.data);
-            let response = format!("处理结果: {}", message);
-            server.send(session_id, response.as_bytes()).await?;
-        }
-        _ => {}
-    }
-}
-
-// 简洁的事件处理模式 - 客户端
-let mut events = client.events().await?;
-while let Some(event) = events.recv().await {
-    match event {
-        ClientEvent::MessageReceived(context) => {
-            // 处理收到的消息 - 直接使用字节数据
-            let message = String::from_utf8_lossy(&context.data);
-            println!("收到: {}", message);
-        }
-        _ => {}
-    }
-}
+// 客户端事件
+# fn _client_events(ev: ClientEvent) { match ev {
+ClientEvent::Connected { info } => { /* ... */ }
+ClientEvent::MessageReceived(context) => { /* ... */ }
+ClientEvent::MessageSent { message_id } => { /* ... */ }
+ClientEvent::Disconnected { reason } => { /* ... */ }
+ClientEvent::Error { error } => { /* ... */ }
+# _ => {} } }
 ```
 
-## ⚡ 现代化特性
+## ⚡ 使用模式
 
-### 🔒 无锁并发架构
+### 并发发送
 
-```rust
-// 用户层API简洁，底层自动无锁优化
-// 并发发送 - 内部使用无锁队列优化
-let tasks: Vec<_> = (0..1000).map(|i| {
-    let client = client.clone();
-    tokio::spawn(async move {
-        let message = format!("Message {}", i);
-        client.send(message.as_bytes()).await
-    })
-}).collect();
+`TransportServer` 可廉价克隆（内部通过 `Arc` 共享状态），因此可以 move 进 spawn
+出的任务里做并发、无锁的会话访问：
 
-// 服务端高并发处理 - 内部使用无锁哈希表管理会话
-let mut events = server.events().await?;
-while let Some(event) = events.recv().await {
-    match event {
-        ServerEvent::MessageReceived { session_id, context } => {
-            // 高并发处理，无锁访问会话
-            tokio::spawn(async move {
-                let response = process_message(&context.data).await;
-                server.send(session_id, &response).await
-            });
-        }
-        _ => {}
+```rust,no_run
+# use msgtrans::{transport::TransportServer, event::ServerEvent};
+# async fn f(server: TransportServer) -> Result<(), Box<dyn std::error::Error>> {
+let mut events = server.subscribe_events();
+while let Ok(event) = events.recv().await {
+    if let ServerEvent::MessageReceived { session_id, context } = event {
+        let server = server.clone();
+        tokio::spawn(async move {
+            let response = format!("Echo: {}", String::from_utf8_lossy(&context.data));
+            let _ = server.send(session_id, response.as_bytes()).await;
+        });
     }
 }
+# Ok(()) }
 ```
 
-### 📦 零拷贝优化
+### 请求 / 响应
 
-```rust
-// 用户API始终简洁 - 内部自动零拷贝优化
-let result = client.send("Hello, World!".as_bytes()).await?;
-
-// 大数据传输 - 自动零拷贝处理
-let large_data = vec![0u8; 1024 * 1024]; // 1MB数据
-let result = client.send(&large_data).await?;
-
-// 请求响应 - 自动零拷贝优化
+```rust,no_run
+# use msgtrans::transport::TransportClient;
+# async fn f(client: &TransportClient) -> Result<(), Box<dyn std::error::Error>> {
 let response = client.request(b"Get user data").await?;
 if let Some(data) = response.data {
-    // 数据传输过程中已自动优化，无需额外拷贝
-    process_response(&data);
+    println!("收到 {} 字节", data.len());
+} else {
+    println!("请求超时");
 }
+# Ok(()) }
 ```
 
 ## 🔌 协议扩展
 
-### 实现自定义协议
+要接入新协议，为你的适配器实现 `Connection` trait，再配一个对应的 config 类型。
+完整可用的参考见内置的 `adapters::{tcp, websocket, quic}`；下面是骨架示意：
 
-```rust
-// 1. 实现协议适配器
-pub struct MyProtocolAdapter {
-    connection: MyConnection,
-    event_sender: broadcast::Sender<TransportEvent>,
+```rust,ignore
+use msgtrans::{connection::Connection, packet::Packet, error::TransportError};
+
+pub struct MyAdapter { /* 协议特有状态 */ }
+
+#[async_trait::async_trait]
+impl Connection for MyAdapter {
+    async fn send(&mut self, packet: Packet) -> Result<(), TransportError> { /* ... */ }
+    // ... 其余 Connection 方法
 }
-
-#[async_trait]
-impl ProtocolAdapter for MyProtocolAdapter {
-    async fn send(&mut self, packet: Packet) -> Result<(), TransportError> {
-        // 实现协议特定的发送逻辑
-        self.connection.send(packet.payload()).await?;
-        Ok(())
-    }
-    
-    fn connection_info(&self) -> ConnectionInfo {
-        // 返回连接信息
-        ConnectionInfo::new("MyProtocol", self.connection.peer_addr())
-    }
-    
-    fn events(&self) -> broadcast::Receiver<TransportEvent> {
-        self.event_sender.subscribe()
-    }
-}
-
-// 2. 实现配置结构
-#[derive(Debug, Clone)]
-pub struct MyProtocolServerConfig {
-    pub bind_address: SocketAddr,
-    pub custom_setting: String,
-}
-
-#[async_trait]
-impl ServerConfig for MyProtocolServerConfig {
-    type Adapter = MyProtocolAdapter;
-    
-    async fn build_server(&self) -> Result<Self::Adapter, TransportError> {
-        // 构建服务器适配器
-        let connection = MyConnection::bind(&self.bind_address).await?;
-        let (event_sender, _) = broadcast::channel(1000);
-        
-        Ok(MyProtocolAdapter {
-            connection,
-            event_sender,
-        })
-    }
-}
-
-// 3. 无缝集成 - 与内置协议完全相同的使用方式
-let my_config = MyProtocolServerConfig {
-    bind_address: "127.0.0.1:9000".parse()?,
-    custom_setting: "custom_value".to_string(),
-};
-
-let server = TransportServerBuilder::new()
-    .with_protocol(my_config)  // 直接使用！
-    .build()
-    .await?;
 ```
 
 ## 📖 使用示例
 
-### 🌐 WebSocket聊天服务器
+### WebSocket 服务端
 
-```rust
+```rust,no_run
 use msgtrans::{
     transport::TransportServerBuilder,
     protocol::WebSocketServerConfig,
     event::ServerEvent,
-    SessionId,
+    tokio,
 };
-use std::collections::HashMap;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = WebSocketServerConfig::new("127.0.0.1:8080")?
-        .with_path("/chat");
+    let config = WebSocketServerConfig::new("127.0.0.1:8080")?.with_path("/chat");
 
     let server = TransportServerBuilder::new()
         .with_protocol(config)
@@ -390,292 +301,166 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()
         .await?;
 
-    println!("🌐 WebSocket聊天服务器: ws://127.0.0.1:8080/chat");
-
-    // 聊天室管理
-    let mut chat_rooms: HashMap<String, Vec<SessionId>> = HashMap::new();
-    let mut events = server.events().await?;
-
-    while let Some(event) = events.recv().await {
-        match event {
-            ServerEvent::MessageReceived { session_id, context } => {
-                let message = String::from_utf8_lossy(&context.data);
-                
-                // 解析聊天命令
-                if message.starts_with("/join ") {
-                    let room = message[6..].to_string();
-                    chat_rooms.entry(room.clone()).or_default().push(session_id);
-                    
-                    let response = format!("已加入房间: {}", room);
-                    let _ = server.send(session_id, response.as_bytes()).await;
-                } else {
-                    // 广播消息到房间内所有用户
-                    for (room, members) in &chat_rooms {
-                        if members.contains(&session_id) {
-                            let broadcast_msg = format!("[{}] {}", room, message);
-                            for &member_id in members {
-                                let _ = server.send(member_id, broadcast_msg.as_bytes()).await;
-                            }
-                            break;
-                        }
-                    }
-                }
+    let mut events = server.subscribe_events();
+    let server_for_events = server.clone();
+    tokio::spawn(async move {
+        while let Ok(event) = events.recv().await {
+            if let ServerEvent::MessageReceived { session_id, context } = event {
+                let msg = String::from_utf8_lossy(&context.data);
+                let _ = server_for_events
+                    .send(session_id, format!("You said: {msg}").as_bytes())
+                    .await;
             }
-            ServerEvent::ConnectionClosed { session_id, .. } => {
-                // 从所有房间移除用户
-                for members in chat_rooms.values_mut() {
-                    members.retain(|&id| id != session_id);
-                }
-            }
-            _ => {}
         }
-    }
+    });
 
+    server.serve().await?;
     Ok(())
 }
 ```
 
-### ⚡ 高性能QUIC客户端
+### QUIC 客户端
 
-```rust
+```rust,no_run
 use msgtrans::{
     transport::TransportClientBuilder,
     protocol::QuicClientConfig,
+    tokio,
 };
-use std::time::Instant;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 本地 / 自签测试服务器：跳过证书验证。
-    // 生产环境请去掉 danger_skip_verification()，改为配置真实域名与 CA，
-    // 例如 .with_ca_cert_pem(ca_pem)。
+    // 本地 / 自签名测试服务端：跳过证书校验。
+    // 生产环境请去掉 danger_skip_verification()，改为配置真实的
+    // server name 和 CA。
     let config = QuicClientConfig::new("127.0.0.1:8003")?
         .with_server_name("localhost")
         .danger_skip_verification();
 
-    let client = TransportClientBuilder::new()
+    let mut client = TransportClientBuilder::new()
         .with_protocol(config)
         .build()
         .await?;
 
     client.connect().await?;
-    println!("✅ QUIC连接建立成功");
 
-    // 高并发消息发送测试
-    let start = Instant::now();
-    let message_count = 10000;
-    
-    let tasks: Vec<_> = (0..message_count).map(|i| {
-        let client = client.clone();
-        tokio::spawn(async move {
-            let message = format!("High-performance message {}", i);
-            client.send(message.as_bytes()).await
-        })
-    }).collect();
-
-    // 等待所有消息发送完成
-    for task in tasks {
-        task.await??;
+    for i in 0..1000u32 {
+        client.send(format!("message {i}").as_bytes()).await?;
     }
-
-    let duration = start.elapsed();
-    println!("🚀 {}条消息发送完成，耗时: {:?}", message_count, duration);
-    println!("📊 平均每秒: {:.0} 条消息", message_count as f64 / duration.as_secs_f64());
-
-    // 测试请求响应性能
-    let start = Instant::now();
-    let request_count = 1000;
-    
-    for i in 0..request_count {
-        let request_data = format!("Request {}", i);
-        match client.request(request_data.as_bytes()).await? {
-            result if result.data.is_some() => {
-                // 请求成功，记录响应时间
-                if i % 100 == 0 {
-                    println!("✅ 请求 {} 完成", i);
-                }
-            }
-            _ => println!("❌ 请求 {} 超时", i),
-        }
-    }
-    
-    let duration = start.elapsed();
-    println!("🔄 {}个请求完成，耗时: {:?}", request_count, duration);
-    println!("📊 平均每秒: {:.0} 个请求", request_count as f64 / duration.as_secs_f64());
-
+    println!("完成");
     Ok(())
 }
 ```
 
 ## 🛠️ 配置选项
 
-### 服务器配置
+### 服务端配置
 
-```rust
-// TCP服务器 - 高可靠性配置
+```rust,no_run
+use msgtrans::protocol::{TcpServerConfig, WebSocketServerConfig, QuicServerConfig};
+use std::time::Duration;
+
+# fn f() -> Result<(), Box<dyn std::error::Error>> {
 let tcp_config = TcpServerConfig::new("0.0.0.0:8001")?
     .with_max_connections(10000)
     .with_keepalive(Some(Duration::from_secs(60)))
     .with_nodelay(true)
     .with_reuse_addr(true);
 
-// WebSocket服务器 - Web集成配置
 let ws_config = WebSocketServerConfig::new("0.0.0.0:8002")?
     .with_path("/api/ws")
     .with_max_frame_size(1024 * 1024)
     .with_max_connections(5000);
 
-// QUIC服务器 - 下一代协议配置
 let quic_config = QuicServerConfig::new("0.0.0.0:8003")?
     .with_cert_pem(std::fs::read_to_string("cert.pem")?)
     .with_key_pem(std::fs::read_to_string("key.pem")?)
     .with_max_concurrent_streams(1000);
+# Ok(()) }
 ```
 
-### 智能化配置
+## 🔧 进阶功能
 
-```rust
-// 零配置 - 自动优化（推荐）
-let server = TransportServerBuilder::new()
-    .with_protocol(tcp_config)
-    .build().await?;  // 自动根据CPU优化
+### 统计信息
 
-// 高性能配置 - 手动调优
-let server = TransportServerBuilder::new()
-    .with_protocol(tcp_config)
-    .max_connections(50000)
-    .build().await?;
-
-// 资源节约配置 - 低内存环境
-let server = TransportServerBuilder::new()
-    .with_protocol(tcp_config)
-    .max_connections(1000)
-    .build().await?;
+```rust,no_run
+# use msgtrans::transport::TransportServer;
+# async fn f(server: &TransportServer) {
+let active = server.session_count().await;
+println!("活跃会话: {active}");
+# }
 ```
 
-## 🔧 高级特性
+### 错误处理
 
-### 📊 内置监控
-
-```rust
-// 实时统计 - 零拷贝性能监控
-let stats = server.get_stats().await;
-println!("活跃连接: {}", stats.active_connections);
-println!("消息总数: {}", stats.total_messages);
-println!("平均延迟: {:?}", stats.average_latency);
-println!("内存使用: {} MB", stats.memory_usage_mb);
-
-// 协议分布统计
-for (protocol, count) in &stats.protocol_distribution {
-    println!("{}: {} 连接", protocol, count);
-}
-```
-
-### 🛡️ 优雅错误处理
-
-```rust
-use msgtrans::error::{TransportError, CloseReason};
-
-// 发送消息的错误处理
+```rust,no_run
+# use msgtrans::{transport::TransportClient, error::TransportError};
+# async fn f(client: &mut TransportClient) -> Result<(), Box<dyn std::error::Error>> {
 match client.send("Hello, World!".as_bytes()).await {
-    Ok(result) => println!("✅ 消息发送成功 (ID: {})", result.message_id),
+    Ok(result) => println!("已发送 (ID: {})", result.message_id),
     Err(TransportError::Connection { .. }) => {
-        println!("🔗 连接丢失，尝试重连");
+        println!("连接丢失，重连中");
         client.connect().await?;
     }
     Err(TransportError::Protocol { protocol, reason }) => {
-        println!("⚠️ 协议错误 [{}]: {}", protocol, reason);
+        println!("协议错误 [{protocol}]: {reason}");
     }
-    Err(e) => println!("❌ 其他错误: {}", e),
+    Err(e) => println!("其他错误: {e}"),
 }
-
-// 请求响应的错误处理
-match client.request("Get status".as_bytes()).await {
-    Ok(result) => {
-        match result.data {
-            Some(data) => {
-                let response = String::from_utf8_lossy(&data);
-                println!("📥 收到响应: {}", response);
-            }
-            None => println!("⏰ 请求超时 (ID: {})", result.message_id),
-        }
-    }
-    Err(TransportError::Timeout { duration, .. }) => {
-        println!("⏰ 请求超时: {:?}", duration);
-    }
-    Err(e) => println!("❌ 请求失败: {}", e),
-}
-
-// 服务端发送的错误处理
-match server.send(session_id, "Response data".as_bytes()).await {
-    Ok(result) => println!("✅ 向会话 {} 发送成功", session_id),
-    Err(TransportError::Connection { .. }) => {
-        println!("🔗 会话 {} 连接已断开", session_id);
-        // 自动清理会话
-    }
-    Err(e) => println!("❌ 发送失败: {}", e),
-}
+# Ok(()) }
 ```
 
-### 🔄 连接管理
+### 优雅关闭
 
-```rust
-// 优雅关闭：按配置的超时排空活跃会话
+```rust,no_run
+use msgtrans::{transport::TransportServerBuilder, protocol::TcpServerConfig};
+use std::time::Duration;
+
+# async fn f() -> Result<(), Box<dyn std::error::Error>> {
 let server = TransportServerBuilder::new()
-    .with_protocol(tcp_config)
+    .with_protocol(TcpServerConfig::new("0.0.0.0:8001")?)
     .graceful_shutdown(Some(Duration::from_secs(30)))
     .build().await?;
 
+// ... 稍后，按配置的超时排空活跃会话：
 server.stop().await;
+# Ok(()) }
 ```
 
-## 📚 文档和示例
+## 📚 文档与示例
 
-### 📖 完整示例
+[`examples/`](examples/) 目录包含完整可运行的程序：
 
-查看 `examples/` 目录获取更多示例：
-
-- [`echo_server.rs`](examples/echo_server.rs) - 多协议回显服务器
-- [`echo_client_tcp.rs`](examples/echo_client_tcp.rs) - TCP客户端示例
-- [`echo_client_websocket.rs`](examples/echo_client_websocket.rs) - WebSocket客户端示例
-- [`echo_client_quic.rs`](examples/echo_client_quic.rs) - QUIC客户端示例
-- [`ultimate_simplification_demo.rs`](examples/ultimate_simplification_demo.rs) - 统一架构演示
-
-### 🚀 运行示例
+- [`echo_server.rs`](examples/echo_server.rs) - 多协议回显服务端
+- [`echo_client_tcp.rs`](examples/echo_client_tcp.rs) - TCP 客户端
+- [`echo_client_websocket.rs`](examples/echo_client_websocket.rs) - WebSocket 客户端
+- [`echo_client_quic.rs`](examples/echo_client_quic.rs) - QUIC 客户端
+- [`load_test.rs`](examples/load_test.rs) / [`load_test_server.rs`](examples/load_test_server.rs) - 压力测试
+- [`packet.rs`](examples/packet.rs) - 报文序列化
 
 ```bash
-# 启动多协议回显服务器
+# 启动多协议回显服务端
 cargo run --example echo_server
 
-# 测试TCP客户端
+# 另开一个终端，运行客户端
 cargo run --example echo_client_tcp
-
-# 测试WebSocket客户端  
-cargo run --example echo_client_websocket
-
-# 测试QUIC客户端
-cargo run --example echo_client_quic
 ```
 
 ## 🏆 适用场景
 
-- **🎮 游戏服务器** - 高并发实时游戏通信
-- **💬 聊天系统** - 多协议即时通讯平台
-- **🔗 微服务通信** - 服务间高效数据传输
-- **📊 实时数据** - 金融、监控等实时系统
-- **🌐 IoT平台** - 大规模设备连接管理
-- **🚪 协议网关** - 多协议转换和代理
+- **游戏服务器** - 高并发实时通信
+- **聊天系统** - 多协议即时消息
+- **微服务通信** - 高效的服务间传输
+- **实时数据** - 金融、监控、遥测等系统
+- **IoT 平台** - 大规模设备连接管理
+- **协议网关** - 多协议转换与代理
 
-## 📝 许可证
+## 📝 许可
 
-本项目采用 [Apache License 2.0](LICENSE) 许可证。
+基于 [Apache License 2.0](LICENSE) 授权。
 
 Copyright © 2024 [zoujiaqing](mailto:zoujiaqing@gmail.com)
 
 ## 🤝 贡献
 
-欢迎提交 Issue 和 Pull Request！请查看 [贡献指南](CONTRIBUTING.md) 了解详细信息。
-
----
-
-> 🎯 **MsgTrans 的使命**: 让多协议通信变得简单、高效、可靠，专注业务逻辑而非底层传输细节。
+欢迎提交 Issue 和 Pull Request。
