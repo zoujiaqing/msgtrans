@@ -70,9 +70,11 @@ pub use protocol_adapter::{
 };
 
 // [POOL] Connection pool exports
+#[allow(deprecated)]
 pub use pool::{ConnectionPool, ExpansionStrategy, OptimizedPoolStatsSnapshot, PoolDetailedStatus};
 
 // [EXPERT] Expert configuration exports
+#[allow(deprecated)]
 pub use expert_config::{ExpertConfig, PerformanceConfig, SmartPoolConfig};
 
 // [BUILDER] Client and server builder exports

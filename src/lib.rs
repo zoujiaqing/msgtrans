@@ -28,6 +28,10 @@ pub mod stream;
 
 // New modules
 pub mod connection;
+#[deprecated(
+    since = "1.0.9",
+    note = "experimental plugin system, not wired into the transport path; scheduled for removal in 2.0"
+)]
 pub mod plugin;
 
 // Type definitions
@@ -79,6 +83,9 @@ pub use event::{ClientEvent, QuicEvent, TcpEvent, TransportEvent, WebSocketEvent
 pub use packet::{FramePolicy, Packet, PacketError, PacketType};
 pub use stream::{ClientEventStream, EventStream, PacketStream};
 
+// ConnectionPool / ExpertConfig below are deprecated; re-exporting them here is
+// intentional for backward compatibility until 2.0.
+#[allow(deprecated)]
 pub use transport::{
     AcceptorConfig, BackpressureStrategy, CircuitBreakerConfig, ConnectionPool,
     ConnectionPoolConfig, ExpertConfig, LoadBalancerConfig, LockFreeCounter, LockFreeHashMap,
@@ -94,6 +101,11 @@ pub use protocol::{
 };
 // Re-export new abstractions
 pub use connection::{Connection, ConnectionFactory, Server};
+#[allow(deprecated)]
+#[deprecated(
+    since = "1.0.9",
+    note = "experimental plugin system, not wired into the transport path; scheduled for removal in 2.0"
+)]
 pub use plugin::{PluginInfo, PluginManager, ProtocolPlugin};
 
 // Re-export tokio for user convenience

@@ -1,3 +1,5 @@
+// This module *is* the deprecated ExpertConfig; its own impls reference it.
+#![allow(deprecated)]
 use serde::{Deserialize, Serialize};
 /// Expert-level configuration - Advanced Builder configuration options
 ///
@@ -227,6 +229,10 @@ impl PerformanceConfig {
 }
 
 /// Expert configuration collection
+#[deprecated(
+    since = "1.0.9",
+    note = "not wired into the transport path; scheduled for removal in 2.0"
+)]
 #[derive(Debug, Clone)]
 pub struct ExpertConfig {
     /// Smart connection pool configuration

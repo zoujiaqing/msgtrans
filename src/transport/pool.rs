@@ -1,3 +1,5 @@
+// This module *is* the deprecated ConnectionPool; its own impls reference it.
+#![allow(deprecated)]
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 /// Intelligent expansion mechanism - core implementation
@@ -26,6 +28,10 @@ use crate::transport::memory_pool::{OptimizedMemoryPool, OptimizedMemoryStatsSna
 use crate::SessionId;
 
 /// [PERF] Optimized intelligent connection pool
+#[deprecated(
+    since = "1.0.9",
+    note = "not wired into the transport path; scheduled for removal in 2.0"
+)]
 pub struct ConnectionPool {
     /// Connection ID counter
     connection_id_counter: AtomicU64,
