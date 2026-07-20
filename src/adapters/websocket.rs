@@ -284,9 +284,9 @@ impl<C> WebSocketAdapter<C> {
                     // [SEND] Handle outgoing data - zero-copy optimization
                     packet = send_queue.recv() => {
                         if let Some(packet) = packet {
-                            // Serialize straight into the owned Vec that tungstenite
-                            // requires, avoiding an intermediate Bytes allocation.
-                            let message = Message::Binary(packet.encode_to_vec());
+                            // tungstenite takes Bytes directly, so the packet's own
+                            // Bytes buffer is handed over without another copy.
+                            let message = Message::Binary(packet.to_bytes());
 
                             match stream.send(message).await {
                                 Ok(_) => {

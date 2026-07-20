@@ -150,7 +150,8 @@ fn generate_self_signed_cert() -> (CertificateDer<'static>, PrivatePkcs8KeyDer<'
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
     (
         cert.cert.der().clone(),
-        PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()),
+        // rcgen 0.14 renamed CertifiedKey::key_pair to signing_key.
+        PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()),
     )
 }
 
