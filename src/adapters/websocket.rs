@@ -14,8 +14,7 @@ use crate::{
     packet::Packet, protocol::AdapterStats, ConnectionInfo, SessionId,
 };
 
-/// Bound send queue to prevent unbounded memory growth under backpressure.
-const SEND_QUEUE_CAPACITY: usize = 512;
+use crate::adapters::outbound::SEND_QUEUE_CAPACITY;
 
 /// WebSocket message processing result
 enum MessageProcessResult {
@@ -414,18 +413,13 @@ impl<C> WebSocketAdapter<C> {
 #[async_trait]
 impl<C: Send + Sync + 'static> Connection for WebSocketAdapter<C> {
     async fn send(&mut self, packet: Packet) -> Result<(), TransportError> {
-        self.send_queue
-            .try_send(packet)
-            .map_err(|error| match error {
-                tokio::sync::mpsc::error::TrySendError::Full(_) => TransportError::resource_error(
-                    "websocket_outbound_queue",
-                    self.send_queue.max_capacity(),
-                    self.send_queue.max_capacity(),
-                ),
-                tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                    TransportError::connection_error("WebSocket connection closed", false)
-                }
-            })
+        crate::adapters::outbound::send_bounded(
+            &self.send_queue,
+            packet,
+            "websocket_outbound_queue",
+            "WebSocket connection closed",
+        )
+        .await
     }
 
     async fn close(&mut self) -> Result<(), TransportError> {

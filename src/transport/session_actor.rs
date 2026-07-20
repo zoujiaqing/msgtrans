@@ -10,6 +10,7 @@
 //!                     ↑ also receives Send/Close commands from TransportServer
 //! ```
 
+use crate::adapters::outbound::SEND_QUEUE_WAIT;
 use crate::transport::request_registry::{MarkResult, RequestRegistry};
 use crate::{event::TransportEvent, packet::Packet, transport::transport::Transport, SessionId};
 use async_trait::async_trait;
@@ -253,20 +254,29 @@ impl SessionHandle {
             })
     }
 
+    /// Enqueue an actor message with bounded backpressure.
+    ///
+    /// Transient mailbox pressure is absorbed by waiting; a mailbox that stays
+    /// full fails with a resource error rather than stalling the caller. See
+    /// [`crate::adapters::outbound`] for the rationale behind this policy.
+    async fn enqueue(&self, message: ActorMessage) -> Result<(), crate::TransportError> {
+        match tokio::time::timeout(SEND_QUEUE_WAIT, self.tx.send_async(message)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(crate::TransportError::connection_error(
+                "Actor channel closed",
+                false,
+            )),
+            Err(_elapsed) => Err(crate::TransportError::resource_error(
+                "session_actor_outbound_queue",
+                self.tx.len(),
+                self.tx.capacity().unwrap_or(DEFAULT_ACTOR_BUFFER_SIZE),
+            )),
+        }
+    }
+
     /// Send a packet through the actor (fire-and-forget, no reply).
     pub async fn send_packet(&self, packet: Packet) -> Result<(), crate::TransportError> {
-        self.tx
-            .try_send(ActorMessage::Send(packet))
-            .map_err(|error| match error {
-                flume::TrySendError::Full(_) => crate::TransportError::resource_error(
-                    "session_actor_outbound_queue",
-                    self.tx.len(),
-                    self.tx.capacity().unwrap_or(DEFAULT_ACTOR_BUFFER_SIZE),
-                ),
-                flume::TrySendError::Disconnected(_) => {
-                    crate::TransportError::connection_error("Actor channel closed", false)
-                }
-            })
+        self.enqueue(ActorMessage::Send(packet)).await
     }
 
     /// Send a packet through the actor and wait for the send result.
@@ -275,21 +285,11 @@ impl SessionHandle {
         packet: Packet,
     ) -> Result<(), crate::TransportError> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        self.tx
-            .try_send(ActorMessage::SendWithReply {
-                packet,
-                reply: reply_tx,
-            })
-            .map_err(|error| match error {
-                flume::TrySendError::Full(_) => crate::TransportError::resource_error(
-                    "session_actor_outbound_queue",
-                    self.tx.len(),
-                    self.tx.capacity().unwrap_or(DEFAULT_ACTOR_BUFFER_SIZE),
-                ),
-                flume::TrySendError::Disconnected(_) => {
-                    crate::TransportError::connection_error("Actor channel closed", false)
-                }
-            })?;
+        self.enqueue(ActorMessage::SendWithReply {
+            packet,
+            reply: reply_tx,
+        })
+        .await?;
         reply_rx.await.map_err(|_| {
             crate::TransportError::connection_error("Actor dropped before reply", false)
         })?
@@ -472,7 +472,11 @@ impl SessionActor {
 }
 
 /// Default buffer size for session actor channels
-// Keep the actor and adapter halves within a 1024-packet per-session budget.
+//
+// The mailbox is a fast-draining hop in front of the adapter's outbound queue,
+// not the main buffer. Under load testing it never became the bottleneck (all
+// queue-full errors came from the adapter queue), so it stays smaller than
+// `outbound::SEND_QUEUE_CAPACITY`.
 pub const DEFAULT_ACTOR_BUFFER_SIZE: usize = 512;
 
 /// Create a new session actor pair (handle + actor)
@@ -502,17 +506,23 @@ mod tests {
     use super::*;
     use crate::transport::{config::TransportConfig, context::TransportContext};
 
-    #[tokio::test]
-    async fn outbound_send_fails_fast_when_actor_mailbox_is_full() {
+    async fn test_handle(tx: Sender<ActorMessage>) -> SessionHandle {
         let context = TransportContext::new().await.unwrap();
         let transport = Arc::new(Transport::with_context(
             TransportConfig::default(),
             &context,
         ));
+        SessionHandle { tx, transport }
+    }
+
+    /// A mailbox that stays full must fail with a resource error instead of
+    /// stalling the caller indefinitely.
+    #[tokio::test]
+    async fn outbound_send_fails_when_actor_mailbox_stays_full() {
         let (tx, _rx) = bounded(1);
         tx.try_send(ActorMessage::Send(Packet::one_way(1, vec![1])))
             .unwrap();
-        let handle = SessionHandle { tx, transport };
+        let handle = test_handle(tx).await;
 
         let error = handle
             .send_packet_with_reply(Packet::one_way(2, vec![2]))
@@ -524,5 +534,27 @@ mod tests {
             crate::TransportError::Resource { ref resource, current: 1, limit: 1 }
                 if resource == "session_actor_outbound_queue"
         ));
+    }
+
+    /// The regression guard: a mailbox that is only briefly full must still
+    /// accept the packet once the actor drains it.
+    #[tokio::test]
+    async fn transient_full_actor_mailbox_is_absorbed() {
+        let (tx, rx) = bounded(1);
+        tx.try_send(ActorMessage::Send(Packet::one_way(1, vec![1])))
+            .unwrap();
+        let handle = test_handle(tx).await;
+
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let _ = rx.recv_async().await;
+            // Hold the receiver so the channel stays connected.
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        });
+
+        assert!(handle
+            .send_packet(Packet::one_way(2, vec![2]))
+            .await
+            .is_ok());
     }
 }

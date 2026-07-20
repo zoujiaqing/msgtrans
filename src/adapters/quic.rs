@@ -29,8 +29,7 @@ use crate::{
     SessionId,
 };
 
-/// Bound send queue to prevent unbounded memory growth under slow links.
-const SEND_QUEUE_CAPACITY: usize = 512;
+use crate::adapters::outbound::SEND_QUEUE_CAPACITY;
 
 #[derive(Debug, thiserror::Error)]
 pub enum QuicError {
@@ -771,18 +770,13 @@ impl QuicAdapter<QuicClientConfig> {
 #[async_trait]
 impl<C: Send + Sync + 'static> Connection for QuicAdapter<C> {
     async fn send(&mut self, packet: Packet) -> Result<(), TransportError> {
-        self.send_queue
-            .try_send(packet)
-            .map_err(|error| match error {
-                tokio::sync::mpsc::error::TrySendError::Full(_) => TransportError::resource_error(
-                    "quic_outbound_queue",
-                    self.send_queue.max_capacity(),
-                    self.send_queue.max_capacity(),
-                ),
-                tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                    TransportError::connection_error("QUIC connection closed", false)
-                }
-            })
+        crate::adapters::outbound::send_bounded(
+            &self.send_queue,
+            packet,
+            "quic_outbound_queue",
+            "QUIC connection closed",
+        )
+        .await
     }
 
     async fn close(&mut self) -> Result<(), TransportError> {
