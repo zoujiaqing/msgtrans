@@ -176,12 +176,21 @@ impl TransportClientBuilder {
     }
 
     /// Client specific: Connection timeout
+    #[deprecated(
+        since = "1.0.9",
+        note = "no effect; set the connect timeout on the protocol config instead, \
+                e.g. TcpClientConfig::new(addr)?.with_connect_timeout(dur)"
+    )]
     pub fn connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = timeout;
         self
     }
 
     /// Client specific: Connection pool configuration
+    #[deprecated(
+        since = "1.0.9",
+        note = "no effect; a client manages a single connection, there is no pool"
+    )]
     pub fn connection_pool(mut self, config: ConnectionPoolConfig) -> Self {
         self.pool_config = config;
         self
@@ -194,18 +203,24 @@ impl TransportClientBuilder {
     }
 
     /// Client specific: Load balancer
+    #[deprecated(
+        since = "1.0.9",
+        note = "no effect; a client connects to a single endpoint, there is nothing to balance"
+    )]
     pub fn load_balancer(mut self, config: LoadBalancerConfig) -> Self {
         self.load_balancer = Some(config);
         self
     }
 
     /// Client specific: Circuit breaker
+    #[deprecated(since = "1.0.9", note = "no effect; not implemented")]
     pub fn circuit_breaker(mut self, config: CircuitBreakerConfig) -> Self {
         self.circuit_breaker = Some(config);
         self
     }
 
     /// Client specific: Connection monitoring
+    #[deprecated(since = "1.0.9", note = "no effect; not implemented")]
     pub fn enable_connection_monitoring(mut self, enabled: bool) -> Self {
         self.connection_monitoring = enabled;
         self
