@@ -321,8 +321,8 @@ fn configure_server_with_pem(
 
 /// QUIC protocol adapter (generic support for client and server configurations)
 pub struct QuicAdapter<C> {
-    /// Session ID (using atomic type for event loop access)
-    session_id: Arc<std::sync::atomic::AtomicU64>,
+    /// Connection liveness + session id, shared with the event loop.
+    state: crate::adapters::core::ConnState,
     config: C,
     stats: AdapterStats,
     connection_info: ConnectionInfo,
@@ -345,13 +345,13 @@ impl<C> QuicAdapter<C> {
         event_sender: broadcast::Sender<TransportEvent>,
         is_server: bool,
     ) -> Result<Self, QuicError> {
-        let session_id = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let state =
+            crate::adapters::core::ConnState::new(crate::adapters::core::ConnStatus::Connecting);
 
         // Create connection info
         let mut connection_info = ConnectionInfo::default();
         connection_info.protocol = "quic".to_string();
-        connection_info.session_id =
-            SessionId(session_id.load(std::sync::atomic::Ordering::SeqCst));
+        connection_info.session_id = state.session_id();
 
         // Get address information
         if let Some(local_addr) = connection.local_ip() {
@@ -370,7 +370,7 @@ impl<C> QuicAdapter<C> {
         // Start event loop
         let event_loop_handle = Self::start_event_loop(
             connection,
-            session_id.clone(),
+            state.clone(),
             send_queue_rx,
             shutdown_rx,
             event_sender.clone(),
@@ -380,7 +380,7 @@ impl<C> QuicAdapter<C> {
         .await;
 
         Ok(Self {
-            session_id,
+            state,
             config,
             stats: AdapterStats::new(),
             connection_info,
@@ -415,7 +415,7 @@ impl<C> QuicAdapter<C> {
     /// under high load where one direction could starve the other in a select! loop.
     async fn start_event_loop(
         connection: QuinnConnection,
-        session_id: Arc<std::sync::atomic::AtomicU64>,
+        state: crate::adapters::core::ConnState,
         mut send_queue: mpsc::Receiver<Packet>,
         mut shutdown_signal: mpsc::UnboundedReceiver<()>,
         event_sender: broadcast::Sender<TransportEvent>,
@@ -423,8 +423,7 @@ impl<C> QuicAdapter<C> {
         frame_policy: Arc<std::sync::atomic::AtomicU8>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            let current_session_id =
-                SessionId(session_id.load(std::sync::atomic::Ordering::SeqCst));
+            let current_session_id = state.session_id();
             tracing::debug!(
                 "[START] QUIC event loop started with single-stream multiplexing (session: {}, role: {})",
                 current_session_id,
@@ -479,15 +478,18 @@ impl<C> QuicAdapter<C> {
                 current_session_id
             );
 
+            // The bidi stream is up: the connection is now live.
+            state.set_status(crate::adapters::core::ConnStatus::Connected);
+
             // Use a shared shutdown flag for coordinating between read and write tasks
             let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
             // Spawn dedicated READ task
-            let read_session_id = session_id.clone();
+            let read_state = state.clone();
             let read_event_sender = event_sender.clone();
             let read_shutdown_flag = shutdown_flag.clone();
             let read_frame_policy = frame_policy.clone();
-            let read_task = tokio::spawn(async move {
+            let mut read_task = tokio::spawn(async move {
                 let mut recv_stream = recv_stream;
                 let mut header_buf = [0u8; 4];
 
@@ -496,8 +498,7 @@ impl<C> QuicAdapter<C> {
                         break;
                     }
 
-                    let current_session_id =
-                        SessionId(read_session_id.load(std::sync::atomic::Ordering::SeqCst));
+                    let current_session_id = read_state.session_id();
 
                     // Read frame header
                     match recv_stream.read_exact(&mut header_buf).await {
@@ -596,9 +597,7 @@ impl<C> QuicAdapter<C> {
                             }
                         }
                         Err(e) => {
-                            let current_session_id = SessionId(
-                                read_session_id.load(std::sync::atomic::Ordering::SeqCst),
-                            );
+                            let current_session_id = read_state.session_id();
                             tracing::debug!(
                                 "[CLOSE] Stream read ended: {:?} (session: {})",
                                 e,
@@ -616,10 +615,10 @@ impl<C> QuicAdapter<C> {
             });
 
             // Spawn dedicated WRITE task with batching optimization
-            let write_session_id = session_id.clone();
+            let write_state = state.clone();
             let write_event_sender = event_sender.clone();
             let write_shutdown_flag = shutdown_flag.clone();
-            let write_task = tokio::spawn(async move {
+            let mut write_task = tokio::spawn(async move {
                 let mut send_stream = send_stream;
 
                 // Batch write optimization constants
@@ -647,8 +646,7 @@ impl<C> QuicAdapter<C> {
                         break;
                     }
 
-                    let current_session_id =
-                        SessionId(write_session_id.load(std::sync::atomic::Ordering::SeqCst));
+                    let current_session_id = write_state.session_id();
 
                     // Batch serialize all packets into write buffer
                     write_buf.clear();
@@ -704,21 +702,34 @@ impl<C> QuicAdapter<C> {
                 pool.return_buffer(write_buf, BufferSize::Large);
             });
 
-            // Wait for shutdown signal or task completion
+            // Borrow the handles in select! so the losing task is not orphaned
+            // (dropping a JoinHandle by value does not cancel its task).
             tokio::select! {
                 _ = shutdown_signal.recv() => {
                     tracing::info!("[STOP] Received shutdown signal (session: {})", current_session_id);
-                    shutdown_flag.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
-                _ = read_task => {
+                _ = &mut read_task => {
                     tracing::debug!("[CLOSE] Read task ended (session: {})", current_session_id);
-                    shutdown_flag.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
-                _ = write_task => {
+                _ = &mut write_task => {
                     tracing::debug!("[CLOSE] Write task ended (session: {})", current_session_id);
-                    shutdown_flag.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
+            // Signal cooperative shutdown, then give the tasks a brief window to
+            // observe it and exit cleanly (the write task flushes via finish()
+            // before returning). Force-cancel only whatever overruns the window,
+            // via TaskGroup, so no task is ever orphaned.
+            shutdown_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(200), async {
+                let _ = (&mut read_task).await;
+                let _ = (&mut write_task).await;
+            })
+            .await;
+            let mut tasks = crate::adapters::core::TaskGroup::new();
+            tasks.push(read_task);
+            tasks.push(write_task);
+            tasks.abort_all(); // no-op for tasks that already exited
+            state.set_status(crate::adapters::core::ConnStatus::Closed);
 
             tracing::debug!(
                 "[SUCCESS] QUIC event loop ended (session: {})",
@@ -797,23 +808,22 @@ impl<C: Send + Sync + 'static> Connection for QuicAdapter<C> {
     }
 
     fn session_id(&self) -> SessionId {
-        SessionId(self.session_id.load(std::sync::atomic::Ordering::SeqCst))
+        self.state.session_id()
     }
 
     fn set_session_id(&mut self, session_id: SessionId) {
-        self.session_id
-            .store(session_id.0, std::sync::atomic::Ordering::SeqCst);
+        self.state.set_session_id(session_id);
     }
 
     fn connection_info(&self) -> ConnectionInfo {
         let mut info = ConnectionInfo::default();
         info.protocol = "quic".to_string();
-        info.session_id = SessionId(self.session_id.load(std::sync::atomic::Ordering::SeqCst));
+        info.session_id = self.state.session_id();
         info
     }
 
     fn is_connected(&self) -> bool {
-        self.event_loop_handle.is_some()
+        self.state.is_connected()
     }
 
     async fn flush(&mut self) -> Result<(), TransportError> {
