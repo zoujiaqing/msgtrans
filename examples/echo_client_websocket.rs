@@ -26,7 +26,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // [TARGET] Build TransportClient
     let mut transport = TransportClientBuilder::new()
         .with_protocol(websocket_config)
-        .connect_timeout(Duration::from_secs(10))
         .build()
         .await?;
 

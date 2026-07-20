@@ -84,6 +84,10 @@ struct Config {
     mode: TestMode,
     connections: usize,
     duration_secs: u64,
+    /// Warmup seconds run before the measurement window opens. Traffic during
+    /// warmup is not counted, so connection setup and cold-start effects do not
+    /// pollute the steady-state numbers.
+    warmup_secs: u64,
     message_size: usize,
     interval_ms: u64,
     host: String,
@@ -97,6 +101,7 @@ impl Default for Config {
             mode: TestMode::Send,
             connections: 10,
             duration_secs: 10,
+            warmup_secs: 1,
             message_size: 64,
             interval_ms: 10,
             host: "127.0.0.1".to_string(),
@@ -147,6 +152,12 @@ fn parse_args() -> Config {
             "--duration" | "-d" => {
                 if i + 1 < args.len() {
                     config.duration_secs = args[i + 1].parse().unwrap_or(10);
+                    i += 1;
+                }
+            }
+            "--warmup" | "-w" => {
+                if i + 1 < args.len() {
+                    config.warmup_secs = args[i + 1].parse().unwrap_or(1);
                     i += 1;
                 }
             }
@@ -204,7 +215,8 @@ Options:
   -p, --protocol <PROTOCOL>      Protocol to test: tcp, websocket, quic [default: tcp]
   -m, --mode <MODE>              Test mode: send, request [default: send]
   -c, --connections <NUM>        Number of concurrent connections [default: 10]
-  -d, --duration <SECONDS>       Test duration in seconds [default: 10]
+  -d, --duration <SECONDS>       Measurement window in seconds [default: 10]
+  -w, --warmup <SECONDS>         Warmup before measuring, not counted [default: 1]
   -s, --message-size <BYTES>     Message size in bytes [default: 64]
   -i, --interval <MS>            Interval between messages in ms [default: 10]
       --host <HOST>              Server host [default: 127.0.0.1]
@@ -233,16 +245,67 @@ Note: Make sure echo_server is running before starting the load test.
 }
 
 // Statistics collector
+/// Exponential latency histogram, in microseconds.
+///
+/// Bucket `i` counts samples in `[2^i, 2^(i+1))` us. 32 buckets cover 1 us up to
+/// ~4295 s, which is far more than enough. This is lock-free and lossless for
+/// percentile estimation (resolution degrades gracefully at higher latencies,
+/// which is the standard trade-off for Hdics-style latency histograms).
+struct LatencyHistogram {
+    buckets: [AtomicU64; 32],
+}
+
+impl LatencyHistogram {
+    fn new() -> Self {
+        Self {
+            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+
+    fn record(&self, us: u64) {
+        let idx = 63 - us.max(1).leading_zeros() as usize; // floor(log2)
+        self.buckets[idx.min(31)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn total(&self) -> u64 {
+        self.buckets.iter().map(|b| b.load(Ordering::Relaxed)).sum()
+    }
+
+    /// Percentile in microseconds; returns the upper edge of the bucket the
+    /// requested rank falls into.
+    fn percentile(&self, p: f64) -> u64 {
+        let total = self.total();
+        if total == 0 {
+            return 0;
+        }
+        let target = (total as f64 * p).ceil() as u64;
+        let mut cumulative = 0u64;
+        for (i, b) in self.buckets.iter().enumerate() {
+            cumulative += b.load(Ordering::Relaxed);
+            if cumulative >= target {
+                return 1u64 << (i + 1); // upper edge of bucket i
+            }
+        }
+        1u64 << 32
+    }
+}
+
 struct Stats {
+    // Total counters (whole run, including warmup) -- used for correctness
+    // signals like connections and errors.
     messages_sent: AtomicU64,
     messages_received: AtomicU64,
-    bytes_sent: AtomicU64,
-    bytes_received: AtomicU64,
     errors: AtomicU64,
     connections_established: AtomicU64,
     connection_failures: AtomicU64,
-    latency_sum_us: AtomicU64,
-    latency_count: AtomicU64,
+    // Steady-state counters -- only accrue inside the measurement window, so
+    // throughput is not diluted by connect and drain time.
+    measuring: AtomicBool,
+    steady_sent: AtomicU64,
+    steady_received: AtomicU64,
+    steady_bytes_sent: AtomicU64,
+    steady_bytes_received: AtomicU64,
+    latency: LatencyHistogram,
 }
 
 impl Stats {
@@ -250,29 +313,45 @@ impl Stats {
         Self {
             messages_sent: AtomicU64::new(0),
             messages_received: AtomicU64::new(0),
-            bytes_sent: AtomicU64::new(0),
-            bytes_received: AtomicU64::new(0),
             errors: AtomicU64::new(0),
             connections_established: AtomicU64::new(0),
             connection_failures: AtomicU64::new(0),
-            latency_sum_us: AtomicU64::new(0),
-            latency_count: AtomicU64::new(0),
+            measuring: AtomicBool::new(false),
+            steady_sent: AtomicU64::new(0),
+            steady_received: AtomicU64::new(0),
+            steady_bytes_sent: AtomicU64::new(0),
+            steady_bytes_received: AtomicU64::new(0),
+            latency: LatencyHistogram::new(),
         }
+    }
+
+    /// Open the measurement window: steady-state counters accrue from here.
+    fn start_measuring(&self) {
+        self.measuring.store(true, Ordering::Relaxed);
     }
 
     fn record_send(&self, bytes: u64) {
         self.messages_sent.fetch_add(1, Ordering::Relaxed);
-        self.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
+        if self.measuring.load(Ordering::Relaxed) {
+            self.steady_sent.fetch_add(1, Ordering::Relaxed);
+            self.steady_bytes_sent.fetch_add(bytes, Ordering::Relaxed);
+        }
     }
 
     fn record_receive(&self, bytes: u64) {
         self.messages_received.fetch_add(1, Ordering::Relaxed);
-        self.bytes_received.fetch_add(bytes, Ordering::Relaxed);
+        if self.measuring.load(Ordering::Relaxed) {
+            self.steady_received.fetch_add(1, Ordering::Relaxed);
+            self.steady_bytes_received
+                .fetch_add(bytes, Ordering::Relaxed);
+        }
     }
 
+    /// Record a request round-trip latency (only meaningful in request mode).
     fn record_latency(&self, latency_us: u64) {
-        self.latency_sum_us.fetch_add(latency_us, Ordering::Relaxed);
-        self.latency_count.fetch_add(1, Ordering::Relaxed);
+        if self.measuring.load(Ordering::Relaxed) {
+            self.latency.record(latency_us);
+        }
     }
 
     fn record_error(&self) {
@@ -287,68 +366,65 @@ impl Stats {
         self.connection_failures.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn print_report(&self, duration: Duration) {
-        let secs = duration.as_secs_f64();
-        let sent = self.messages_sent.load(Ordering::Relaxed);
-        let received = self.messages_received.load(Ordering::Relaxed);
-        let bytes_sent = self.bytes_sent.load(Ordering::Relaxed);
-        let bytes_received = self.bytes_received.load(Ordering::Relaxed);
+    /// `window` is the steady-state measurement window (excludes warmup, connect
+    /// and drain), which is the only interval throughput should be divided by.
+    fn print_report(&self, window: Duration, mode: TestMode) {
+        let secs = window.as_secs_f64().max(f64::EPSILON);
+        let steady_sent = self.steady_sent.load(Ordering::Relaxed);
+        let steady_recv = self.steady_received.load(Ordering::Relaxed);
+        let steady_tx_bytes = self.steady_bytes_sent.load(Ordering::Relaxed);
+        let steady_rx_bytes = self.steady_bytes_received.load(Ordering::Relaxed);
         let errors = self.errors.load(Ordering::Relaxed);
         let connections = self.connections_established.load(Ordering::Relaxed);
         let conn_failures = self.connection_failures.load(Ordering::Relaxed);
-        let latency_sum = self.latency_sum_us.load(Ordering::Relaxed);
-        let latency_count = self.latency_count.load(Ordering::Relaxed);
-
-        let avg_latency_us = if latency_count > 0 {
-            latency_sum / latency_count
-        } else {
-            0
-        };
 
         println!();
         println!("============================================================");
         println!("                    LOAD TEST RESULTS                       ");
         println!("============================================================");
         println!();
-        println!("Duration:              {:.2} seconds", secs);
+        println!("Measurement window:    {secs:.2} seconds (steady state)");
         println!();
         println!("Connections:");
-        println!("  Established:         {}", connections);
-        println!("  Failed:              {}", conn_failures);
+        println!("  Established:         {connections}");
+        println!("  Failed:              {conn_failures}");
         println!();
-        println!("Messages:");
-        println!("  Sent:                {}", sent);
-        println!("  Received:            {}", received);
-        println!("  Errors:              {}", errors);
+        println!("Messages (in window):");
+        println!("  Sent:                {steady_sent}");
+        println!("  Received:            {steady_recv}");
+        println!("  Errors (total run):  {errors}");
         println!();
-        println!("Throughput:");
-        println!("  Messages/sec (TX):   {:.2}", sent as f64 / secs);
-        println!("  Messages/sec (RX):   {:.2}", received as f64 / secs);
+        println!("Throughput (steady state):");
+        println!("  Messages/sec (TX):   {:.0}", steady_sent as f64 / secs);
+        println!("  Messages/sec (RX):   {:.0}", steady_recv as f64 / secs);
         println!(
-            "  Bytes/sec (TX):      {:.2} KB/s",
-            bytes_sent as f64 / secs / 1024.0
+            "  MB/sec (TX):         {:.2}",
+            steady_tx_bytes as f64 / secs / (1024.0 * 1024.0)
         );
         println!(
-            "  Bytes/sec (RX):      {:.2} KB/s",
-            bytes_received as f64 / secs / 1024.0
+            "  MB/sec (RX):         {:.2}",
+            steady_rx_bytes as f64 / secs / (1024.0 * 1024.0)
         );
         println!();
-        println!("Data Transfer:");
-        println!(
-            "  Total Sent:          {:.2} KB",
-            bytes_sent as f64 / 1024.0
-        );
-        println!(
-            "  Total Received:      {:.2} KB",
-            bytes_received as f64 / 1024.0
-        );
-        println!();
-        println!("Latency:");
-        println!(
-            "  Average:             {:.2} ms",
-            avg_latency_us as f64 / 1000.0
-        );
-        println!();
+        // Latency is a real round-trip only in request mode; in send mode the
+        // call just enqueues, so RTT latency is not meaningful and not reported.
+        if mode == TestMode::Request {
+            let n = self.latency.total();
+            println!("Request latency ({n} samples):");
+            println!(
+                "  p50:                 {:.2} ms",
+                self.latency.percentile(0.50) as f64 / 1000.0
+            );
+            println!(
+                "  p95:                 {:.2} ms",
+                self.latency.percentile(0.95) as f64 / 1000.0
+            );
+            println!(
+                "  p99:                 {:.2} ms",
+                self.latency.percentile(0.99) as f64 / 1000.0
+            );
+            println!();
+        }
         println!("============================================================");
     }
 }
@@ -380,9 +456,9 @@ async fn run_client(
                     return;
                 }
             };
+            let tcp_config = tcp_config.with_connect_timeout(Duration::from_secs(10));
             TransportClientBuilder::new()
                 .with_protocol(tcp_config)
-                .connect_timeout(Duration::from_secs(10))
                 .build()
                 .await
         }
@@ -402,7 +478,6 @@ async fn run_client(
             };
             TransportClientBuilder::new()
                 .with_protocol(ws_config)
-                .connect_timeout(Duration::from_secs(10))
                 .build()
                 .await
         }
@@ -419,10 +494,10 @@ async fn run_client(
                     return;
                 }
             }
-            .danger_skip_verification();
+            .danger_skip_verification()
+            .with_connect_timeout(Duration::from_secs(10));
             TransportClientBuilder::new()
                 .with_protocol(quic_config)
-                .connect_timeout(Duration::from_secs(10))
                 .build()
                 .await
         }
@@ -485,41 +560,42 @@ async fn run_client(
     let interval = Duration::from_millis(config.interval_ms);
 
     while running.load(Ordering::Relaxed) {
-        let start = Instant::now();
         match config.mode {
             TestMode::Send => match transport.send(payload).await {
                 Ok(_) => {
+                    // send() only enqueues; there is no round-trip to time here.
                     stats.record_send(payload.len() as u64);
-                    let latency = start.elapsed().as_micros() as u64;
-                    stats.record_latency(latency);
                 }
                 Err(_) => {
                     stats.record_error();
                     break;
                 }
             },
-            TestMode::Request => match transport.request(payload).await {
-                Ok(result) => {
-                    stats.record_send(payload.len() as u64);
-                    let latency = start.elapsed().as_micros() as u64;
-                    stats.record_latency(latency);
+            TestMode::Request => {
+                let start = Instant::now();
+                match transport.request(payload).await {
+                    Ok(result) => {
+                        let latency = start.elapsed().as_micros() as u64;
+                        stats.record_send(payload.len() as u64);
+                        stats.record_latency(latency);
 
-                    if result.status == TransportStatus::Completed {
-                        let received_len = result
-                            .data
-                            .as_ref()
-                            .map(|data| data.len())
-                            .unwrap_or_default();
-                        stats.record_receive(received_len as u64);
-                    } else {
+                        if result.status == TransportStatus::Completed {
+                            let received_len = result
+                                .data
+                                .as_ref()
+                                .map(|data| data.len())
+                                .unwrap_or_default();
+                            stats.record_receive(received_len as u64);
+                        } else {
+                            stats.record_error();
+                        }
+                    }
+                    Err(_) => {
                         stats.record_error();
+                        break;
                     }
                 }
-                Err(_) => {
-                    stats.record_error();
-                    break;
-                }
-            },
+            }
         };
 
         // Wait for interval before sending next message
@@ -598,6 +674,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 mode,
                 connections: 1,
                 duration_secs: 0,
+                warmup_secs: 0,
                 message_size,
                 interval_ms,
                 host,
@@ -646,8 +723,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Wait for test duration
+    // Warmup: let clients connect and traffic reach steady state. Nothing during
+    // this phase is counted toward throughput/latency.
+    if config.warmup_secs > 0 {
+        println!("Warming up for {} seconds...", config.warmup_secs);
+        tokio::time::sleep(Duration::from_secs(config.warmup_secs)).await;
+    }
+
+    // Open the measurement window.
+    let measure_start = Instant::now();
+    stats.start_measuring();
+    println!("Measuring for {} seconds...", config.duration_secs);
     tokio::time::sleep(Duration::from_secs(config.duration_secs)).await;
+    // Close the window before the drain, so drain time never dilutes throughput.
+    let measure_window = measure_start.elapsed();
 
     // Signal stop
     println!();
@@ -660,11 +749,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     progress_task.abort();
+    let _ = start_time; // whole-run wall clock, no longer used for throughput
 
-    let total_duration = start_time.elapsed();
-
-    // Print results
-    stats.print_report(total_duration);
+    // Print results over the steady-state window only.
+    stats.print_report(measure_window, config.mode);
 
     Ok(())
 }

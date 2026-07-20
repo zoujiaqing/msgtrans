@@ -25,7 +25,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // [TARGET] Build client using new TransportClientBuilder
     let mut transport = TransportClientBuilder::new()
         .with_protocol(tcp_config)
-        .connect_timeout(Duration::from_secs(10))
         .build()
         .await?;
 
