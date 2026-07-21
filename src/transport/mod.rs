@@ -30,8 +30,6 @@ pub mod client;
 ///   automatically use high-performance implementations
 pub mod config;
 pub mod connection_state;
-pub mod expert_config;
-pub mod pool;
 pub mod request_manager;
 pub mod request_registry;
 pub mod server;
@@ -70,12 +68,8 @@ pub use protocol_adapter::{
 };
 
 // [POOL] Connection pool exports
-#[allow(deprecated)]
-pub use pool::{ConnectionPool, ExpansionStrategy, OptimizedPoolStatsSnapshot, PoolDetailedStatus};
 
 // [EXPERT] Expert configuration exports
-#[allow(deprecated)]
-pub use expert_config::{ExpertConfig, PerformanceConfig, SmartPoolConfig};
 
 // [BUILDER] Client and server builder exports
 pub use server::{

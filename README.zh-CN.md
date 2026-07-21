@@ -54,7 +54,6 @@ use msgtrans::{
     transport::TransportServerBuilder,
     protocol::{TcpServerConfig, WebSocketServerConfig, QuicServerConfig},
     event::ServerEvent,
-    tokio,
 };
 
 #[tokio::main]
@@ -109,7 +108,6 @@ use msgtrans::{
     transport::TransportClientBuilder,
     protocol::TcpClientConfig,
     event::ClientEvent,
-    tokio,
 };
 use std::time::Duration;
 
@@ -288,7 +286,6 @@ use msgtrans::{
     transport::TransportServerBuilder,
     protocol::WebSocketServerConfig,
     event::ServerEvent,
-    tokio,
 };
 
 #[tokio::main]
@@ -325,7 +322,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 use msgtrans::{
     transport::TransportClientBuilder,
     protocol::QuicClientConfig,
-    tokio,
 };
 
 #[tokio::main]

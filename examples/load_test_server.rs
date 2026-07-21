@@ -18,7 +18,6 @@ use msgtrans::{
     protocol::QuicServerConfig,
     protocol::TcpServerConfig,
     protocol::WebSocketServerConfig,
-    tokio,
     transport::{SessionHandler, SessionSender, TransportServerBuilder},
     SessionId,
 };

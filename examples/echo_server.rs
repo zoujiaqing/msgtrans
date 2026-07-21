@@ -24,7 +24,7 @@
 //!     `MSGTRANS_E2E_READY ws://127.0.0.1:<ws_port>`
 use msgtrans::{
     event::ServerEvent, packet::Packet, protocol::QuicServerConfig, protocol::TcpServerConfig,
-    protocol::WebSocketServerConfig, tokio, transport::TransportServerBuilder,
+    protocol::WebSocketServerConfig, transport::TransportServerBuilder,
 };
 use std::env;
 

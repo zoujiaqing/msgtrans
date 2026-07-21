@@ -9,11 +9,8 @@ use crate::{
     Packet, SessionId, TransportError,
 };
 use bytes::Bytes;
-use std::sync::{
-    atomic::{AtomicU32, Ordering},
-    Arc,
-};
-use tokio::sync::{broadcast, oneshot, Mutex};
+use std::sync::Arc;
+use tokio::sync::{broadcast, Mutex};
 
 /// Single connection transport abstraction — one instance per socket.
 ///
@@ -27,149 +24,12 @@ pub struct Transport {
     session_id: Arc<Mutex<Option<SessionId>>>,
     state_manager: ConnectionStateManager,
     event_sender: broadcast::Sender<TransportEvent>,
-    request_tracker: Arc<RequestTracker>,
+    request_registry: Arc<crate::transport::request_registry::RequestRegistry>,
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct RequestTrackerKey {
-    pub session_id: Option<SessionId>,
-    pub message_id: u32,
-}
-
-impl RequestTrackerKey {
-    pub fn new(session_id: Option<SessionId>, message_id: u32) -> Self {
-        Self {
-            session_id,
-            message_id,
-        }
-    }
-}
-
 /// Fallback lifecycle deadline for waiter-based requests. The real timeout is
 /// enforced by the caller (tokio::time::timeout); this only bounds the entry if
 /// the caller forgets to remove it.
 const REQUEST_WAITER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// Request/response waiter, kept as a thin facade over `RequestRegistry` — the
-/// single source of truth for request lifecycle. Preserves the historical
-/// `next_id` allocation and the `*_with_session*` API used on the hot paths.
-pub struct RequestTracker {
-    registry: Arc<crate::transport::request_registry::RequestRegistry>,
-    next_id: AtomicU32,
-}
-
-impl RequestTracker {
-    pub fn new() -> Self {
-        Self {
-            registry: Arc::new(crate::transport::request_registry::RequestRegistry::new()),
-            next_id: AtomicU32::new(1),
-        }
-    }
-
-    /// Create RequestTracker with custom starting ID
-    pub fn new_with_start_id(start_id: u32) -> Self {
-        Self {
-            registry: Arc::new(crate::transport::request_registry::RequestRegistry::new()),
-            next_id: AtomicU32::new(start_id),
-        }
-    }
-
-    fn register_waiter(&self, session_id: Option<SessionId>, id: u32) -> oneshot::Receiver<Packet> {
-        match self
-            .registry
-            .try_register_waiter(id, session_id, 0, REQUEST_WAITER_TIMEOUT)
-        {
-            Ok(rx) => rx,
-            Err(_) => {
-                tracing::warn!(
-                    "[REQUEST] Duplicate pending request refused: session_id={:?}, message_id={}",
-                    session_id,
-                    id
-                );
-                // Return an already-cancelled receiver so the caller fails fast
-                // instead of being matched to an unrelated response.
-                let (_tx, rx) = oneshot::channel();
-                rx
-            }
-        }
-    }
-    pub fn register(&self) -> (u32, oneshot::Receiver<Packet>) {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        (id, self.register_waiter(None, id))
-    }
-
-    /// [FIX] Register request tracking with specified ID
-    pub fn register_with_id(&self, id: u32) -> (u32, oneshot::Receiver<Packet>) {
-        self.register_with_session_id(None, id)
-    }
-
-    pub fn register_with_session(
-        &self,
-        session_id: SessionId,
-        id: u32,
-    ) -> (u32, oneshot::Receiver<Packet>) {
-        self.register_with_session_id(Some(session_id), id)
-    }
-
-    pub fn register_with_session_id(
-        &self,
-        session_id: Option<SessionId>,
-        id: u32,
-    ) -> (u32, oneshot::Receiver<Packet>) {
-        (id, self.register_waiter(session_id, id))
-    }
-
-    pub fn complete(&self, id: u32, packet: Packet) -> bool {
-        self.complete_with_session_id(None, id, packet)
-    }
-
-    pub fn complete_with_session(&self, session_id: SessionId, id: u32, packet: Packet) -> bool {
-        self.complete_with_session_id(Some(session_id), id, packet)
-    }
-
-    pub fn complete_with_session_id(
-        &self,
-        session_id: Option<SessionId>,
-        id: u32,
-        packet: Packet,
-    ) -> bool {
-        self.registry.complete_waiter(session_id, id, packet)
-    }
-
-    pub fn remove(&self, id: u32) -> bool {
-        self.remove_with_session_id(None, id)
-    }
-
-    pub fn remove_with_session(&self, session_id: SessionId, id: u32) -> bool {
-        self.remove_with_session_id(Some(session_id), id)
-    }
-
-    pub fn remove_with_session_id(&self, session_id: Option<SessionId>, id: u32) -> bool {
-        self.registry.abort_waiter(session_id, id)
-    }
-
-    pub fn fail_session(&self, session_id: Option<SessionId>) -> usize {
-        match session_id {
-            Some(sid) => self.registry.close_session_pending(sid),
-            // None-session waiters are per-connection on the client; callers use
-            // fail_all() on teardown, so there is no separate None batch path.
-            None => 0,
-        }
-    }
-
-    pub fn fail_all(&self) -> usize {
-        self.registry.abort_all()
-    }
-
-    pub fn clear(&self) {
-        self.fail_all();
-    }
-
-    pub fn next_message_id(&self) -> u32 {
-        self.next_id.fetch_add(1, Ordering::Relaxed)
-    }
-}
-
 impl Transport {
     /// Create Transport from a shared context (synchronous — no global singletons).
     pub fn with_context(config: TransportConfig, ctx: &TransportContext) -> Self {
@@ -182,7 +42,7 @@ impl Transport {
             session_id: Arc::new(Mutex::new(None)),
             state_manager: ConnectionStateManager::new(),
             event_sender,
-            request_tracker: Arc::new(RequestTracker::new()),
+            request_registry: Arc::new(crate::transport::request_registry::RequestRegistry::new()),
         }
     }
 
@@ -236,7 +96,7 @@ impl Transport {
         }
 
         tracing::info!("[CONN] Starting graceful session shutdown: {}", session_id);
-        let failed_pending = self.request_tracker.fail_all();
+        let failed_pending = self.request_registry.abort_all();
         if failed_pending > 0 {
             tracing::debug!(
                 "[REQUEST] Failed {} pending requests during session {} shutdown",
@@ -270,7 +130,7 @@ impl Transport {
         }
 
         tracing::info!("[CONN] Force closing session: {}", session_id);
-        let failed_pending = self.request_tracker.fail_all();
+        let failed_pending = self.request_registry.abort_all();
         if failed_pending > 0 {
             tracing::debug!(
                 "[REQUEST] Failed {} pending requests during session {} force close",
@@ -377,7 +237,7 @@ impl Transport {
                 while let Ok(event) = event_receiver.recv().await {
                     this.on_event(event).await;
                 }
-                let failed_pending = this.request_tracker.fail_all();
+                let failed_pending = this.request_registry.abort_all();
                 if failed_pending > 0 {
                     tracing::debug!(
                         "[REQUEST] Failed {} pending requests after event stream ended (session: {})",
@@ -448,13 +308,24 @@ impl Transport {
         // [FIX] Use client-set message_id instead of overriding it
         let client_message_id = packet.header.message_id;
         let session_id = self.current_session_id().await;
-        let (_, rx) = self
-            .request_tracker
-            .register_with_session_id(session_id, client_message_id);
+        let rx = match self.request_registry.try_register_waiter(
+            client_message_id,
+            session_id,
+            packet.header.biz_type,
+            REQUEST_WAITER_TIMEOUT,
+        ) {
+            Ok(rx) => rx,
+            Err(_) => {
+                return Err(TransportError::connection_error(
+                    "Duplicate in-flight request id",
+                    false,
+                ))
+            }
+        };
 
         if let Err(e) = self.send(packet).await {
-            self.request_tracker
-                .remove_with_session_id(session_id, client_message_id);
+            self.request_registry
+                .abort_waiter(session_id, client_message_id);
             return Err(e);
         }
         let timeout_duration = std::time::Duration::from_secs(10);
@@ -462,8 +333,8 @@ impl Transport {
             Ok(Ok(resp)) => Ok(resp),
             Ok(Err(_)) => Err(TransportError::connection_error("Connection closed", true)),
             Err(_) => {
-                self.request_tracker
-                    .remove_with_session_id(session_id, client_message_id);
+                self.request_registry
+                    .abort_waiter(session_id, client_message_id);
                 Err(TransportError::timeout_error("request", timeout_duration))
             }
         }
@@ -509,11 +380,9 @@ impl Transport {
                             packet.header.biz_type
                         );
                         let session_id = self.current_session_id().await;
-                        let completed = self.request_tracker.complete_with_session_id(
-                            session_id,
-                            id,
-                            packet.clone(),
-                        );
+                        let completed =
+                            self.request_registry
+                                .complete_waiter(session_id, id, packet.clone());
                         tracing::info!(
                             "[PROC] Response packet processing result: ID={}, completed={}",
                             id,
@@ -577,7 +446,7 @@ impl Transport {
                 }
             }
             crate::event::TransportEvent::ConnectionClosed { reason } => {
-                let failed_pending = self.request_tracker.fail_all();
+                let failed_pending = self.request_registry.abort_all();
                 if failed_pending > 0 {
                     tracing::debug!(
                         "[REQUEST] Failed {} pending requests after connection closed: {:?}",
@@ -610,7 +479,7 @@ impl Transport {
         // Use user-provided message_id or generate new one
         let message_id = options
             .message_id
-            .unwrap_or_else(|| self.request_tracker.next_message_id());
+            .unwrap_or_else(|| self.request_registry.next_message_id());
 
         // Create request packet
         let mut packet = crate::packet::Packet {
@@ -641,9 +510,20 @@ impl Transport {
 
         // Register request tracking
         let session_id = self.current_session_id().await;
-        let (_id, rx) = self
-            .request_tracker
-            .register_with_session_id(session_id, message_id);
+        let rx = match self.request_registry.try_register_waiter(
+            message_id,
+            session_id,
+            packet.header.biz_type,
+            REQUEST_WAITER_TIMEOUT,
+        ) {
+            Ok(rx) => rx,
+            Err(_) => {
+                return Err(TransportError::connection_error(
+                    "Duplicate in-flight request id",
+                    false,
+                ))
+            }
+        };
 
         tracing::info!(
             "[SEND] Sending request: message_id={}, biz_type={}, timeout={:?}",
@@ -654,8 +534,7 @@ impl Transport {
 
         // Send packet
         if let Err(e) = self.send(packet).await {
-            self.request_tracker
-                .remove_with_session_id(session_id, message_id);
+            self.request_registry.abort_waiter(session_id, message_id);
             return Err(e);
         }
 
@@ -685,8 +564,7 @@ impl Transport {
                 Err(TransportError::connection_error("Connection closed", true))
             }
             Err(_) => {
-                self.request_tracker
-                    .remove_with_session_id(session_id, message_id);
+                self.request_registry.abort_waiter(session_id, message_id);
                 tracing::warn!(
                     "[WARN] Request timeout: message_id={}, timeout={:?}",
                     message_id,
@@ -698,7 +576,7 @@ impl Transport {
     }
 
     pub(crate) fn next_message_id(&self) -> u32 {
-        self.request_tracker.next_message_id()
+        self.request_registry.next_message_id()
     }
 
     /// Send one-way message (with options)
@@ -708,11 +586,9 @@ impl Transport {
         options: super::TransportOptions,
     ) -> Result<(), TransportError> {
         // Use user-provided message_id or generate new one
-        let message_id = options.message_id.unwrap_or_else(|| {
-            self.request_tracker
-                .next_id
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        });
+        let message_id = options
+            .message_id
+            .unwrap_or_else(|| self.request_registry.next_message_id());
 
         // Create one-way message packet
         let mut packet = crate::packet::Packet {
@@ -757,7 +633,7 @@ impl Clone for Transport {
             session_id: self.session_id.clone(),
             state_manager: self.state_manager.clone(),
             event_sender: self.event_sender.clone(),
-            request_tracker: self.request_tracker.clone(),
+            request_registry: self.request_registry.clone(),
         }
     }
 }
@@ -768,67 +644,5 @@ impl std::fmt::Debug for Transport {
             .field("connected", &"<async>")
             .field("session_id", &"<async>")
             .finish()
-    }
-}
-
-#[cfg(test)]
-mod request_tracker_tests {
-    use super::*;
-
-    #[test]
-    fn cross_session_response_cannot_complete_another_sessions_request() {
-        // S2 regression: a response carrying the same message_id but a different
-        // session must never complete a request registered under another session.
-        let tracker = RequestTracker::new();
-        let victim = SessionId(1);
-        let attacker = SessionId(2);
-
-        let (_, _rx) = tracker.register_with_session(victim, 100);
-
-        assert!(
-            !tracker.complete_with_session(attacker, 100, Packet::response(100, Vec::new())),
-            "attacker session must not complete victim's request"
-        );
-        assert!(
-            tracker.complete_with_session(victim, 100, Packet::response(100, Vec::new())),
-            "victim session must complete its own request"
-        );
-    }
-
-    #[test]
-    fn none_keyed_and_session_keyed_requests_are_distinct() {
-        // A session-tagged response must not satisfy a request registered without a session.
-        let tracker = RequestTracker::new();
-        let (_, _rx) = tracker.register_with_id(42); // key = (None, 42)
-
-        assert!(!tracker.complete_with_session(SessionId(9), 42, Packet::response(42, Vec::new())));
-        assert!(tracker.complete(42, Packet::response(42, Vec::new())));
-    }
-
-    #[test]
-    fn fail_session_clears_only_matching_session() {
-        // T1 regression: closing one connection must not fail other connections' pending requests.
-        let tracker = RequestTracker::new();
-        let (_, _a1) = tracker.register_with_session(SessionId(1), 10);
-        let (_, _a2) = tracker.register_with_session(SessionId(1), 11);
-        let (_, _b1) = tracker.register_with_session(SessionId(2), 10);
-
-        assert_eq!(tracker.fail_session(Some(SessionId(1))), 2);
-
-        // Session 2 is untouched and still completable.
-        assert!(tracker.complete_with_session(SessionId(2), 10, Packet::response(10, Vec::new())));
-        // Session 1 requests are gone.
-        assert!(!tracker.complete_with_session(SessionId(1), 10, Packet::response(10, Vec::new())));
-    }
-
-    #[test]
-    fn fail_all_clears_every_pending_request() {
-        let tracker = RequestTracker::new();
-        let (_, _a) = tracker.register_with_session(SessionId(1), 1);
-        let (_, _b) = tracker.register_with_session(SessionId(2), 2);
-        let (_, _c) = tracker.register_with_id(3);
-
-        assert_eq!(tracker.fail_all(), 3);
-        assert!(!tracker.complete_with_session(SessionId(1), 1, Packet::response(1, Vec::new())));
     }
 }

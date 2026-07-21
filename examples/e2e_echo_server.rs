@@ -15,7 +15,7 @@
 //! Stop: SIGINT / SIGTERM.
 
 use msgtrans::{
-    event::ServerEvent, packet::Packet, protocol::WebSocketServerConfig, tokio,
+    event::ServerEvent, packet::Packet, protocol::WebSocketServerConfig,
     transport::TransportServerBuilder,
 };
 use std::env;

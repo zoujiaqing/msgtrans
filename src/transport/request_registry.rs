@@ -140,6 +140,9 @@ pub struct RequestRegistry {
     bucket_count: usize,
     tick_duration: Duration,
     current_tick: AtomicU64,
+    /// Allocator for outbound request ids (absorbed from the former
+    /// RequestTracker, so the registry owns the whole request lifecycle).
+    next_id: std::sync::atomic::AtomicU32,
 }
 
 impl Default for RequestRegistry {
@@ -151,6 +154,21 @@ impl Default for RequestRegistry {
 impl RequestRegistry {
     pub fn new() -> Self {
         Self::new_with_timing(DEFAULT_TIMEOUT_BUCKET_COUNT, DEFAULT_TIMEOUT_TICK)
+    }
+
+    /// Create a registry whose outbound request ids start at `start_id`.
+    pub fn new_with_start_id(start_id: u32) -> Self {
+        let registry = Self::new();
+        registry
+            .next_id
+            .store(start_id, std::sync::atomic::Ordering::Relaxed);
+        registry
+    }
+
+    /// Allocate the next outbound request id.
+    pub fn next_message_id(&self) -> u32 {
+        self.next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn new_with_timing(bucket_count: usize, tick_duration: Duration) -> Self {
@@ -175,6 +193,7 @@ impl RequestRegistry {
             bucket_count: safe_bucket_count,
             tick_duration: safe_tick,
             current_tick: AtomicU64::new(0),
+            next_id: std::sync::atomic::AtomicU32::new(1),
         }
     }
 

@@ -50,7 +50,6 @@ pub struct TransportServer {
     protocol_configs:
         std::collections::HashMap<String, Box<dyn crate::protocol::adapter::DynServerConfig>>,
     state_manager: ConnectionStateManager,
-    request_tracker: Arc<crate::transport::transport::RequestTracker>,
     request_registry: Arc<crate::transport::request_registry::RequestRegistry>,
     message_id_counter: std::sync::atomic::AtomicU32,
     session_handler: Option<Arc<dyn SessionHandler>>,
@@ -74,10 +73,9 @@ impl TransportServer {
             is_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             protocol_configs: std::collections::HashMap::new(),
             state_manager: ConnectionStateManager::new(),
-            request_tracker: Arc::new(
-                crate::transport::transport::RequestTracker::new_with_start_id(10000),
+            request_registry: Arc::new(
+                crate::transport::request_registry::RequestRegistry::new_with_start_id(10000),
             ),
-            request_registry: Arc::new(crate::transport::request_registry::RequestRegistry::new()),
             message_id_counter: std::sync::atomic::AtomicU32::new(20000),
             session_handler: None,
             actor_buffer_size: DEFAULT_ACTOR_BUFFER_SIZE,
@@ -106,10 +104,9 @@ impl TransportServer {
             is_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             protocol_configs,
             state_manager: ConnectionStateManager::new(),
-            request_tracker: Arc::new(
-                crate::transport::transport::RequestTracker::new_with_start_id(10000),
+            request_registry: Arc::new(
+                crate::transport::request_registry::RequestRegistry::new_with_start_id(10000),
             ),
-            request_registry: Arc::new(crate::transport::request_registry::RequestRegistry::new()),
             message_id_counter: std::sync::atomic::AtomicU32::new(20000),
             session_handler: None,
             actor_buffer_size: DEFAULT_ACTOR_BUFFER_SIZE,
@@ -140,10 +137,9 @@ impl TransportServer {
             is_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             protocol_configs,
             state_manager: ConnectionStateManager::new(),
-            request_tracker: Arc::new(
-                crate::transport::transport::RequestTracker::new_with_start_id(10000),
+            request_registry: Arc::new(
+                crate::transport::request_registry::RequestRegistry::new_with_start_id(10000),
             ),
-            request_registry: Arc::new(crate::transport::request_registry::RequestRegistry::new()),
             message_id_counter: std::sync::atomic::AtomicU32::new(20000),
             session_handler: Some(handler),
             actor_buffer_size: buffer_size.unwrap_or(DEFAULT_ACTOR_BUFFER_SIZE),
@@ -307,13 +303,24 @@ impl TransportServer {
         }
 
         let message_id = packet.header.message_id;
-        let (_, rx) = self
-            .request_tracker
-            .register_with_session(session_id, message_id);
+        let rx = match self.request_registry.try_register_waiter(
+            message_id,
+            Some(session_id),
+            packet.header.biz_type,
+            DEFAULT_REQUEST_LIFECYCLE_TIMEOUT,
+        ) {
+            Ok(rx) => rx,
+            Err(_) => {
+                return Err(TransportError::connection_error(
+                    "Duplicate in-flight request id for this session",
+                    false,
+                ))
+            }
+        };
 
         if let Err(e) = self.send_to_session(session_id, packet).await {
-            self.request_tracker
-                .remove_with_session(session_id, message_id);
+            self.request_registry
+                .abort_waiter(Some(session_id), message_id);
             tracing::error!(
                 "[ERROR] Session {} request send failed: {:?}",
                 session_id,
@@ -332,13 +339,13 @@ impl TransportServer {
                 Ok(response)
             }
             Ok(Err(_)) => {
-                self.request_tracker
-                    .remove_with_session(session_id, message_id);
+                self.request_registry
+                    .abort_waiter(Some(session_id), message_id);
                 Err(TransportError::connection_error("Connection closed", true))
             }
             Err(_) => {
-                self.request_tracker
-                    .remove_with_session(session_id, message_id);
+                self.request_registry
+                    .abort_waiter(Some(session_id), message_id);
                 Err(TransportError::timeout_error(
                     "server request",
                     std::time::Duration::from_secs(10),
@@ -514,8 +521,8 @@ impl TransportServer {
                             &transport_event
                         {
                             if packet.header.packet_type == crate::packet::PacketType::Response
-                                && server_clone.request_tracker.complete_with_session(
-                                    session_id,
+                                && server_clone.request_registry.complete_waiter(
+                                    Some(session_id),
                                     packet.header.message_id,
                                     packet.clone(),
                                 )
@@ -555,7 +562,9 @@ impl TransportServer {
                 let closed_inbound = server_clone
                     .request_registry
                     .close_session_pending(session_id);
-                let failed_outbound = server_clone.request_tracker.fail_session(Some(session_id));
+                let failed_outbound = server_clone
+                    .request_registry
+                    .close_session_pending(session_id);
                 if closed_inbound > 0 || failed_outbound > 0 {
                     tracing::debug!(
                         "[END] Session {} loop ended: closed {} inbound, failed {} outbound pending",
@@ -593,7 +602,7 @@ impl TransportServer {
                 closed_pending
             );
         }
-        let failed_pending = self.request_tracker.fail_session(Some(session_id));
+        let failed_pending = self.request_registry.close_session_pending(session_id);
         if failed_pending > 0 {
             tracing::debug!(
                 "[REQUEST] Session {} removed, failed {} server-side pending requests",
@@ -1228,8 +1237,8 @@ impl TransportServer {
                         let message_id = packet.header.message_id;
                         tracing::debug!("[RECV] TransportServer received response packet from session {} (ID: {})", session_id, message_id);
 
-                        if self.request_tracker.complete_with_session(
-                            session_id,
+                        if self.request_registry.complete_waiter(
+                            Some(session_id),
                             message_id,
                             packet.clone(),
                         ) {
@@ -1387,7 +1396,6 @@ impl Clone for TransportServer {
             is_running: self.is_running.clone(),
             protocol_configs: cloned_configs,
             state_manager: self.state_manager.clone(),
-            request_tracker: self.request_tracker.clone(),
             request_registry: self.request_registry.clone(),
             message_id_counter: std::sync::atomic::AtomicU32::new(20000),
             session_handles: self.session_handles.clone(),
