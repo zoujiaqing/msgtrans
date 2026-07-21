@@ -79,6 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build server
     let transport = TransportServerBuilder::new()
+        .max_connections(10000)
         .actor_buffer_size(4096) // Buffer size per connection
         .protocol(tcp_config)
         .protocol(websocket_config)

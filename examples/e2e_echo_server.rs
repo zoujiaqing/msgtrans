@@ -62,6 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ws_config = WebSocketServerConfig::new(&bind)?;
 
     let transport = TransportServerBuilder::new()
+        .max_connections(64)
         .protocol(ws_config)
         .build(Arc::new(EchoHandler))
         .await?;

@@ -81,6 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let quic_config = QuicServerConfig::new("127.0.0.1:8003")?;
 
     let server = TransportServerBuilder::new()
+        .max_connections(10000)
         .protocol(tcp_config)
         .protocol(websocket_config)
         .protocol(quic_config)
@@ -319,6 +320,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let server = TransportServerBuilder::new()
         .protocol(config)
+        .max_connections(1000)
         .build(Arc::new(Chat))
         .await?;
 

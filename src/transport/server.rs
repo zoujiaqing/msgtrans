@@ -16,6 +16,8 @@ pub struct TransportServerBuilder {
     actor_buffer_size: Option<usize>,
     /// Frame decode policy applied to accepted connections.
     frame_policy: crate::packet::FramePolicy,
+    /// Hard cap on concurrent sessions (None = unlimited).
+    max_connections: Option<usize>,
 }
 
 impl TransportServerBuilder {
@@ -25,7 +27,18 @@ impl TransportServerBuilder {
             protocol_configs: std::collections::HashMap::new(),
             actor_buffer_size: None,
             frame_policy: crate::packet::FramePolicy::Lenient,
+            max_connections: None,
         }
+    }
+
+    /// Cap the number of concurrent sessions across all protocols
+    /// (default: unlimited).
+    ///
+    /// A connection accepted while the server is at capacity is closed
+    /// immediately, before any per-session resources are allocated.
+    pub fn max_connections(mut self, max: usize) -> Self {
+        self.max_connections = Some(max);
+        self
     }
 
     /// Set the frame decode policy applied to accepted connections (default Lenient).
@@ -73,7 +86,10 @@ impl TransportServerBuilder {
             self.actor_buffer_size,
         )
         .await?;
-        let transport_server = transport_server.with_frame_policy(self.frame_policy);
+        let mut transport_server = transport_server.with_frame_policy(self.frame_policy);
+        if let Some(max) = self.max_connections {
+            transport_server = transport_server.with_max_connections(max);
+        }
 
         tracing::info!("[SUCCESS] TransportServer build completed");
         Ok(transport_server)

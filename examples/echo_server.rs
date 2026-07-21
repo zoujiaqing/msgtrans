@@ -179,6 +179,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let transport = TransportServerBuilder::new()
+        .max_connections(if passive { 64 } else { 10 })
         .protocol(tcp_config)
         .protocol(ws_config)
         .protocol(quic_config)

@@ -51,6 +51,10 @@ pub struct TransportServer {
     session_handler: Arc<dyn SessionHandler>,
     actor_buffer_size: usize,
     frame_policy: crate::packet::FramePolicy,
+    /// Hard cap on concurrent sessions across all protocols. Connections
+    /// accepted while at capacity are closed immediately, before a Transport
+    /// or actor is allocated for them. `usize::MAX` = unlimited (default).
+    max_connections: usize,
 }
 
 impl TransportServer {
@@ -91,6 +95,7 @@ impl TransportServer {
             session_handler: handler,
             actor_buffer_size: buffer_size.unwrap_or(DEFAULT_ACTOR_BUFFER_SIZE),
             frame_policy: crate::packet::FramePolicy::Lenient,
+            max_connections: usize::MAX,
         })
     }
 
@@ -98,6 +103,13 @@ impl TransportServer {
     /// used by TransportServerBuilder to keep the public new*() signatures stable.
     pub(crate) fn with_frame_policy(mut self, policy: crate::packet::FramePolicy) -> Self {
         self.frame_policy = policy;
+        self
+    }
+
+    /// Set the concurrent-session cap. Internal; set via
+    /// `TransportServerBuilder::max_connections`.
+    pub(crate) fn with_max_connections(mut self, max: usize) -> Self {
+        self.max_connections = max;
         self
     }
 
@@ -484,12 +496,23 @@ impl TransportServer {
                             }
                         }
 
+                        // The pump can't rely on recv() erroring to learn the
+                        // connection died — the adapter side may keep its sender
+                        // alive. ConnectionClosed is the definitive end-of-stream
+                        // marker, so forward it and stop.
+                        let is_close = matches!(
+                            transport_event,
+                            crate::event::TransportEvent::ConnectionClosed { .. }
+                        );
                         if let Err(e) = handle.send_event(transport_event).await {
                             tracing::warn!(
                                 "[WARN] Failed to forward event to actor for session {}: {:?}",
                                 session_id,
                                 e
                             );
+                            break;
+                        }
+                        if is_close {
                             break;
                         }
                     }
@@ -506,6 +529,15 @@ impl TransportServer {
                         session_id,
                         closed
                     );
+                }
+                // Peer-initiated closes end here without ever passing through
+                // close_session/force_close_session, so the session's map entries
+                // must be reaped now — otherwise they linger until a send fails,
+                // and with a max_connections cap they would pin capacity forever.
+                // (Server-initiated closes already removed them; remove_session
+                // is idempotent, the presence check just avoids warn noise.)
+                if server_clone.transports.get(&session_id).is_some() {
+                    let _ = server_clone.remove_session(session_id).await;
                 }
                 tracing::info!(
                     "[END] TransportServer event consumption loop ended for session {}",
@@ -531,17 +563,9 @@ impl TransportServer {
         let closed_pending = self.request_registry.close_session_pending(session_id);
         if closed_pending > 0 {
             tracing::debug!(
-                "[REQUEST] Session {} removed, marked {} pending requests as SessionClosed",
+                "[REQUEST] Session {} removed, closed {} pending requests",
                 session_id,
                 closed_pending
-            );
-        }
-        let failed_pending = self.request_registry.close_session_pending(session_id);
-        if failed_pending > 0 {
-            tracing::debug!(
-                "[REQUEST] Session {} removed, failed {} server-side pending requests",
-                session_id,
-                failed_pending
             );
         }
 
@@ -925,6 +949,22 @@ impl TransportServer {
                                 accept_count
                             );
 
+                            // Enforce the session cap before allocating a
+                            // Transport/actor for this connection. Rejecting here
+                            // keeps an over-capacity flood cheap: accept, close,
+                            // move on.
+                            let active = server_clone.transports.len();
+                            if active >= server_clone.max_connections {
+                                tracing::warn!(
+                                    "[LIMIT] {} connection rejected: at capacity ({}/{})",
+                                    protocol_name,
+                                    active,
+                                    server_clone.max_connections
+                                );
+                                let _ = connection.close().await;
+                                continue;
+                            }
+
                             // Get connection info
                             let connection_info = connection.connection_info();
                             let peer_addr = connection_info.peer_addr;
@@ -1055,6 +1095,7 @@ impl Clone for TransportServer {
             session_handler: self.session_handler.clone(),
             actor_buffer_size: self.actor_buffer_size,
             frame_policy: self.frame_policy,
+            max_connections: self.max_connections,
         }
     }
 }
