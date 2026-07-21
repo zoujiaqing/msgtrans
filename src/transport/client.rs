@@ -190,9 +190,11 @@ impl TransportClient {
         *current_session = Some(session_id);
         drop(current_session);
 
-        // Ensure stale forwarding task is not reused across reconnects.
-        self.stop_event_forwarding().await;
-        // [START] Start event forwarding task, converting Transport events to ClientEvent
+        // [START] Start event forwarding task (CAS-guarded: first connect
+        // spawns it, reconnects reuse it). It owns the Transport's single
+        // client-event receiver, so it must survive disconnect/reconnect —
+        // aborting it would strand the take-once receiver and make every
+        // later connect() unable to receive events.
         self.start_event_forwarding().await?;
 
         tracing::info!("[SUCCESS] TransportClient connected successfully");
@@ -323,7 +325,6 @@ impl TransportClient {
 
             // Use Transport's unified close method
             self.inner.close_session(session_id).await?;
-            self.stop_event_forwarding().await;
 
             Ok(())
         } else {
@@ -342,7 +343,6 @@ impl TransportClient {
 
             // Use Transport's force close method
             self.inner.force_close_session(session_id).await?;
-            self.stop_event_forwarding().await;
 
             Ok(())
         } else {
@@ -550,10 +550,9 @@ impl TransportClient {
                             );
 
                             if client_event_sender.send(client_event).await.is_err() {
-                                tracing::debug!(
-                                    "[END] Client event consumer dropped, stopping forwarding"
+                                tracing::trace!(
+                                    "[DROP] ClientEvents receiver gone; discarding event"
                                 );
-                                break;
                             }
                         }
                         _ => {
@@ -567,10 +566,9 @@ impl TransportClient {
                                 );
 
                                 if client_event_sender.send(client_event).await.is_err() {
-                                    tracing::debug!(
-                                        "[END] Client event consumer dropped, stopping forwarding"
+                                    tracing::trace!(
+                                        "[DROP] ClientEvents receiver gone; discarding event"
                                     );
-                                    break;
                                 }
                             } else {
                                 tracing::debug!(
@@ -595,13 +593,6 @@ impl TransportClient {
                 "Connection does not support event streams",
                 false,
             ))
-        }
-    }
-
-    async fn stop_event_forwarding(&self) {
-        self.event_forwarding_running.store(false, Ordering::SeqCst);
-        if let Some(handle) = self.event_forwarding_task.write().await.take() {
-            handle.abort();
         }
     }
 

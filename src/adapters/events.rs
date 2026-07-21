@@ -37,15 +37,26 @@ pub struct EventPipeRx {
     close_emitted: bool,
 }
 
-/// Default data-plane capacity, overridable via MSGTRANS_EVENT_PIPE_CAPACITY.
-/// The override exists so saturation tests can shrink the queue to a size a
-/// test burst can actually fill; production leaves it unset.
+static PIPE_CAPACITY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(8192);
+
+/// Data-plane capacity used by adapters when creating their pipe.
 pub fn default_pipe_capacity() -> usize {
-    std::env::var("MSGTRANS_EVENT_PIPE_CAPACITY")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(8192)
+    PIPE_CAPACITY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Override the data-plane capacity (clamped to [1, 65536]).
+///
+/// Test hook: lets saturation tests shrink the queue to a size a burst can
+/// actually fill. Process-global — tests using it must serialize themselves
+/// and restore the default. Slated to become ServerLimits/ClientLimits
+/// configuration at the API freeze; environment variables are deliberately
+/// not consulted, so production behavior cannot be changed from outside.
+#[doc(hidden)]
+pub fn set_default_pipe_capacity(capacity: usize) {
+    PIPE_CAPACITY.store(
+        capacity.clamp(1, 65536),
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// Create a connected pipe with the given data-plane capacity.
@@ -97,6 +108,13 @@ impl EventPipeRx {
     /// `ConnectionClosed` (reason from the control plane, or an abnormal-end
     /// reason if the adapter died without closing), then `None` forever.
     pub async fn next(&mut self) -> Option<TransportEvent> {
+        // Starvation guard: with `biased`, a永远-non-empty data queue would win
+        // every select round and the close arm would never run. Check the
+        // control plane synchronously first, so a published close always shuts
+        // intake before another data event is returned.
+        if !self.close_emitted && self.close_rx.borrow().is_some() {
+            self.data_rx.close();
+        }
         loop {
             tokio::select! {
                 biased;
@@ -208,6 +226,39 @@ mod tests {
                 reason: CloseReason::Normal
             }
         ));
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn close_under_sustained_data_stops_intake_then_drains() {
+        // Starvation shape: queue full, sender alive and pushing. close() must
+        // shut intake even though the data arm would win every biased round.
+        let (tx, mut rx) = event_pipe(2);
+        assert!(tx.deliver(msg(1)).await);
+        assert!(tx.deliver(msg(2)).await); // full
+        tx.close(CloseReason::Normal);
+
+        // Drain one; intake must already be refused (deliver returns false).
+        assert!(matches!(
+            rx.next().await,
+            Some(TransportEvent::MessageReceived(p)) if p.message_id() == 1
+        ));
+        assert!(
+            !tx.deliver(msg(3)).await,
+            "deliver after close must be refused, not queued"
+        );
+        // Remaining queued data, then exactly one close — sender still alive.
+        assert!(matches!(
+            rx.next().await,
+            Some(TransportEvent::MessageReceived(p)) if p.message_id() == 2
+        ));
+        assert!(matches!(
+            rx.next().await,
+            Some(TransportEvent::ConnectionClosed {
+                reason: CloseReason::Normal
+            })
+        ));
+        assert!(rx.next().await.is_none());
         drop(tx);
     }
 

@@ -31,6 +31,7 @@ impl SessionHandler for SlowCounter {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn slow_handler_loses_nothing() {
+    let _capacity = shrink_pipe(8192); // serialize with the saturation test
     const TOTAL: u64 = 300;
     let addr = "127.0.0.1:28876";
     let seen = Arc::new(AtomicU64::new(0));
@@ -76,6 +77,22 @@ async fn slow_handler_loses_nothing() {
 
 use tokio::sync::Notify;
 
+/// The capacity override is process-global, so tests touching it serialize
+/// through this lock and restore the default via guard (panic-safe).
+static CAPACITY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct CapacityGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+impl Drop for CapacityGuard {
+    fn drop(&mut self) {
+        msgtrans::adapters::events::set_default_pipe_capacity(8192);
+    }
+}
+fn shrink_pipe(capacity: usize) -> CapacityGuard {
+    let guard = CAPACITY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    msgtrans::adapters::events::set_default_pipe_capacity(capacity);
+    CapacityGuard(guard)
+}
+
 struct GatedCounter {
     seen: Arc<AtomicU64>,
     gate: Arc<Notify>,
@@ -107,7 +124,7 @@ impl SessionHandler for GatedCounter {
 /// therefore saturated nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn saturated_queues_block_then_deliver_everything_in_order() {
-    std::env::set_var("MSGTRANS_EVENT_PIPE_CAPACITY", "8");
+    let _capacity = shrink_pipe(8);
     const TOTAL: u64 = 100;
     let addr = "127.0.0.1:28877";
     let seen = Arc::new(AtomicU64::new(0));
@@ -172,5 +189,52 @@ async fn saturated_queues_block_then_deliver_everything_in_order() {
         ordered.load(Ordering::SeqCst),
         "delivery order was violated"
     );
-    std::env::remove_var("MSGTRANS_EVENT_PIPE_CAPACITY");
+}
+
+/// The reconnect regression: one TransportClient must survive
+/// connect -> disconnect -> connect and still deliver. The forwarding task
+/// owns the Transport's take-once event receiver, so aborting it on
+/// disconnect (the old behavior) stranded the receiver and broke every later
+/// connect with "does not support event streams".
+#[tokio::test(flavor = "multi_thread")]
+async fn same_client_reconnects_and_still_delivers() {
+    let _capacity = shrink_pipe(8192); // serialize with the saturation test
+    let addr = "127.0.0.1:28878";
+    let seen = Arc::new(AtomicU64::new(0));
+    let server = TransportServerBuilder::new()
+        .protocol(TcpServerConfig::new(addr).expect("cfg"))
+        .build(Arc::new(SlowCounter { seen: seen.clone() }))
+        .await
+        .expect("server");
+    let server_bg = server.clone();
+    tokio::spawn(async move {
+        let _ = server_bg.serve().await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut client = TransportClientBuilder::new()
+        .protocol(TcpClientConfig::new(addr).expect("cfg"))
+        .build()
+        .await
+        .expect("client");
+
+    client.connect().await.expect("first connect");
+    client.send(b"one".as_slice()).await.expect("send 1");
+    client.disconnect().await.expect("disconnect");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    client.connect().await.expect("second connect must succeed");
+    client
+        .send(b"two".as_slice())
+        .await
+        .expect("send after reconnect");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while seen.load(Ordering::Relaxed) < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "server saw {}/2 messages across the reconnect",
+            seen.load(Ordering::Relaxed)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
