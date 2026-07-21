@@ -1,5 +1,9 @@
 # Adapter 内核设计 (1.0.10)
 
+> 状态：**已落地**。`adapters::core`（ConnState + TaskGroup）就位，三个 adapter
+> 全部接入；QUIC 的孤儿 task 收尾已修。三协议 live load test 0 error，QUIC
+> A/B（vs 1.0.9）稳态吞吐/延迟无回退。泛型 EventLoopAdapter 按结论未做。
+
 ## 目标
 
 架构最优 + 性能最优地收敛 TCP / WebSocket / QUIC adapter 的公共逻辑，
