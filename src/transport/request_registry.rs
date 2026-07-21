@@ -940,6 +940,80 @@ mod tests {
         assert_eq!(registry.active_len(), 0);
     }
 
+    /// Hammer register/close from many threads and assert the invariants the
+    /// interleave windows protect. Not a deterministic interleave proof (that
+    /// needs test hooks or Loom, tracked for the backbone round) — but it does
+    /// catch gross violations: Pending entries outliving their session, a
+    /// transiently negative pending counter, or leaked waiters.
+    #[test]
+    fn concurrent_register_close_holds_invariants() {
+        use std::sync::atomic::AtomicBool;
+        let registry = Arc::new(RequestRegistry::new());
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut handles = Vec::new();
+
+        // 4 registering threads x 2 closing threads over a rotating session set.
+        for t in 0..4u64 {
+            let reg = registry.clone();
+            let stop = stop.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut id = 0u32;
+                while !stop.load(Ordering::Relaxed) {
+                    let sid = SessionId(1000 + (id as u64 + t) % 8);
+                    id = id.wrapping_add(1);
+                    // Alternate inbound registers and outbound waiters.
+                    if id % 2 == 0 {
+                        let _ = reg.register(id, Some(sid), 0, Duration::from_secs(5));
+                    } else if let Ok(_rx) =
+                        reg.try_register_waiter(id, Some(sid), 0, Duration::from_secs(5))
+                    {
+                        // Half complete, half abort — both must stay in-session.
+                        if id % 4 == 1 {
+                            reg.complete_waiter(Some(sid), id, Packet::response(id, Vec::new()));
+                        } else {
+                            reg.abort_waiter(Some(sid), id);
+                        }
+                    }
+                    // The counter must never be observed underflowed (huge value).
+                    assert!(
+                        reg.pending_count() < u64::MAX / 2,
+                        "pending counter underflowed"
+                    );
+                }
+            }));
+        }
+        for _ in 0..2 {
+            let reg = registry.clone();
+            let stop = stop.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut n = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    reg.close_session_pending(SessionId(1000 + n % 8));
+                    n += 1;
+                    std::thread::yield_now();
+                }
+            }));
+        }
+
+        std::thread::sleep(Duration::from_millis(300));
+        stop.store(true, Ordering::Relaxed);
+        for h in handles {
+            h.join().expect("no thread may panic");
+        }
+
+        // Quiesce: close every session once more; no Pending entry may survive
+        // its session, so the registry must drain to empty.
+        for sid in 0..8u64 {
+            registry.close_session_pending(SessionId(1000 + sid));
+        }
+        assert_eq!(
+            registry.active_len(),
+            0,
+            "entries leaked past session close"
+        );
+        assert_eq!(registry.pending_count(), 0, "pending counter out of sync");
+    }
+
     #[test]
     fn abort_all_drops_every_waiter() {
         let registry = RequestRegistry::new();

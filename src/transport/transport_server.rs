@@ -397,7 +397,7 @@ impl TransportServer {
     async fn add_session_with_permit(
         &self,
         connection: Box<dyn crate::Connection>,
-        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+        permit: tokio::sync::OwnedSemaphorePermit,
     ) -> SessionId {
         // [FIX] Use existing session ID from connection instead of generating new one
         let session_id = connection.session_id();
@@ -456,7 +456,7 @@ impl TransportServer {
         );
         let actor = actor
             .with_inbound_registry(Some(self.request_registry.clone()))
-            .with_connection_permit(permit);
+            .with_connection_permit(Some(permit));
         let actor_handle = match self.session_handles.insert(session_id, handle.clone()) {
             Ok(_) => {
                 tokio::spawn(actor.run());
@@ -1010,7 +1010,7 @@ impl TransportServer {
                             // to publish here (and no window where a message could
                             // overtake the connect notification).
                             server_clone
-                                .add_session_with_permit(connection, Some(permit))
+                                .add_session_with_permit(connection, permit)
                                 .await;
                         }
                         Err(e) => {
