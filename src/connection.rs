@@ -28,18 +28,12 @@ pub trait Connection: Send + Sync + std::any::Any {
     async fn flush(&mut self) -> Result<(), TransportError>;
 
     /// Get event stream
-    fn event_stream(
-        &self,
-    ) -> Option<tokio::sync::broadcast::Receiver<crate::event::TransportEvent>>;
 
-    /// Take the bounded event pipe (single consumer, once). Adapters migrated
-    /// to the bounded backbone return `Some` here and `None` from
-    /// `event_stream`; legacy adapters do the opposite. The broadcast facade
-    /// disappears once all protocols are migrated.
+    /// Take the bounded event pipe: the connection's single event channel
+    /// (single consumer, take-once). All queued data events are delivered
+    /// first, then exactly one ConnectionClosed.
     #[doc(hidden)]
-    fn take_event_pipe(&mut self) -> Option<crate::adapters::events::EventPipeRx> {
-        None
-    }
+    fn take_event_pipe(&mut self) -> Option<crate::adapters::events::EventPipeRx>;
 
     /// Set the frame decode policy for this connection. Adapters that support it
     /// (WebSocket, QUIC) override this; others (e.g. TCP, which is always strict

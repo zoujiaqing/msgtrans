@@ -124,10 +124,10 @@ impl LockFreeConnection {
 
         // [BRIDGE] Bridge underlying connection event stream to lock-free connection event channel
         let event_tx_for_bridge = event_tx.clone();
-        if let Some(mut connection_events) = connection.event_stream() {
+        if let Some(mut connection_events) = connection.take_event_pipe() {
             tokio::spawn(async move {
                 tracing::debug!("[BRIDGE] Starting event bridge (session: {})", session_id);
-                while let Ok(event) = connection_events.recv().await {
+                while let Some(event) = connection_events.next().await {
                     tracing::trace!("[BRIDGE] Bridging event: {:?}", event);
                     if let Err(_) = event_tx_for_bridge.send(event) {
                         tracing::debug!("[BRIDGE] Event bridge stopped - receiver disconnected");
@@ -431,8 +431,8 @@ impl crate::Connection for LockFreeConnection {
         self.flush_lockfree().await
     }
 
-    fn event_stream(&self) -> Option<broadcast::Receiver<TransportEvent>> {
-        Some(self.subscribe_events())
+    fn take_event_pipe(&mut self) -> Option<crate::adapters::events::EventPipeRx> {
+        None
     }
 }
 
@@ -510,8 +510,7 @@ mod tests {
         async fn flush(&mut self) -> Result<(), TransportError> {
             Ok(())
         }
-
-        fn event_stream(&self) -> Option<broadcast::Receiver<TransportEvent>> {
+        fn take_event_pipe(&mut self) -> Option<crate::adapters::events::EventPipeRx> {
             None
         }
     }

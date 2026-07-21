@@ -416,7 +416,6 @@ impl TransportServer {
         // This ensures that when adapter's event loop starts, there's already a subscriber ready
         // This prevents message loss during the time window between event loop start and consumer loop start
         let event_pipe_opt = connection.take_event_pipe();
-        let event_receiver_opt = connection.event_stream();
 
         // Server manages its own event routing, skip Transport's internal consumer
         transport
@@ -498,31 +497,6 @@ impl TransportServer {
                     }
                 }
                 server_clone.pump_teardown(session_id).await;
-            });
-        } else if let Some(mut event_receiver) = event_receiver_opt {
-            let server_clone = self.clone();
-            tokio::spawn(async move {
-                tracing::info!("[LISTENER] TransportServer starting event consumption loop for session {} (pre-subscribed)", session_id);
-                while let Ok(transport_event) = event_receiver.recv().await {
-                    tracing::trace!(
-                        "[EVENT] TransportServer received event from session {}: {:?}",
-                        session_id,
-                        transport_event
-                    );
-                    if let Some(handle) = &actor_handle {
-                        if !server_clone
-                            .pump_one_event(session_id, handle, transport_event)
-                            .await
-                        {
-                            break;
-                        }
-                    }
-                }
-                server_clone.pump_teardown(session_id).await;
-                tracing::info!(
-                    "[END] TransportServer event consumption loop ended for session {}",
-                    session_id
-                );
             });
         } else {
             tracing::warn!(

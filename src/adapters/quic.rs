@@ -804,12 +804,6 @@ impl<C: Send + Sync + 'static> Connection for QuicAdapter<C> {
         Ok(())
     }
 
-    fn event_stream(
-        &self,
-    ) -> Option<tokio::sync::broadcast::Receiver<crate::event::TransportEvent>> {
-        None
-    }
-
     fn take_event_pipe(&mut self) -> Option<crate::adapters::events::EventPipeRx> {
         self.event_pipe_rx.take()
     }

@@ -221,7 +221,6 @@ impl Transport {
     ) {
         connection.set_session_id(session_id);
         let event_pipe_opt = connection.take_event_pipe();
-        let event_receiver_opt = connection.event_stream();
 
         *self.connection.lock().await = Some(connection);
         *self.session_id.lock().await = Some(session_id);
@@ -253,29 +252,6 @@ impl Transport {
                 }
                 tracing::debug!(
                     "[LISTEN] Transport event consumer ended (pipe, session: {})",
-                    session_id
-                );
-            });
-        } else if let Some(mut event_receiver) = event_receiver_opt {
-            let this = Arc::clone(self);
-            tokio::spawn(async move {
-                tracing::debug!(
-                    "[LISTEN] Transport event consumer started (session: {})",
-                    session_id
-                );
-                while let Ok(event) = event_receiver.recv().await {
-                    this.on_event(event).await;
-                }
-                let failed_pending = this.request_registry.abort_all();
-                if failed_pending > 0 {
-                    tracing::debug!(
-                        "[REQUEST] Failed {} pending requests after event stream ended (session: {})",
-                        failed_pending,
-                        session_id
-                    );
-                }
-                tracing::debug!(
-                    "[LISTEN] Transport event consumer ended (session: {})",
                     session_id
                 );
             });

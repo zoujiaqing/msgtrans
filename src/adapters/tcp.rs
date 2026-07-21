@@ -350,8 +350,10 @@ pub struct TcpAdapter<C> {
 }
 
 impl<C> TcpAdapter<C> {
-    pub async fn new(stream: TcpStream, config: C) -> Result<Self, TcpError> {
-        stream.set_nodelay(true)?;
+    pub async fn new(stream: TcpStream, config: C, nodelay: bool) -> Result<Self, TcpError> {
+        // Wired from the protocol config — previously hardcoded to true, which
+        // made the nodelay option a lie.
+        stream.set_nodelay(nodelay)?;
 
         let local_addr = stream.local_addr()?;
         let peer_addr = stream.peer_addr()?;
@@ -550,7 +552,8 @@ impl TcpAdapter<TcpClientConfig> {
             apply_tcp_keepalive(&stream, keepalive);
         }
 
-        Self::new(stream, config).await
+        let nodelay = config.nodelay;
+        Self::new(stream, config, nodelay).await
     }
 }
 
@@ -597,13 +600,6 @@ impl<C: Send + Sync + 'static> Connection for TcpAdapter<C> {
 
     async fn flush(&mut self) -> Result<(), TransportError> {
         Ok(())
-    }
-
-    fn event_stream(
-        &self,
-    ) -> Option<tokio::sync::broadcast::Receiver<crate::event::TransportEvent>> {
-        // TCP is on the bounded pipe; there is no broadcast to subscribe to.
-        None
     }
 
     fn take_event_pipe(&mut self) -> Option<crate::adapters::events::EventPipeRx> {
@@ -684,7 +680,7 @@ impl TcpServer {
             apply_tcp_keepalive(&stream, keepalive);
         }
 
-        TcpAdapter::new(stream, self.config.clone()).await
+        TcpAdapter::new(stream, self.config.clone(), self.config.nodelay).await
     }
 
     pub(crate) fn local_addr(&self) -> Result<std::net::SocketAddr, TcpError> {
