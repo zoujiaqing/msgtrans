@@ -415,6 +415,7 @@ impl TransportServer {
         // [FIX] Subscribe to event stream BEFORE setting connection
         // This ensures that when adapter's event loop starts, there's already a subscriber ready
         // This prevents message loss during the time window between event loop start and consumer loop start
+        let event_pipe_opt = connection.take_event_pipe();
         let event_receiver_opt = connection.event_stream();
 
         // Server manages its own event routing, skip Transport's internal consumer
@@ -476,8 +477,29 @@ impl TransportServer {
         };
 
         // [LOOP] Pump the connection's transport events into this session's actor.
-        // [FIX] Use the pre-subscribed event receiver to ensure no messages are lost
-        if let Some(mut event_receiver) = event_receiver_opt {
+        // Bounded-backbone adapters hand over a single-consumer pipe (real
+        // backpressure; ends with exactly one ConnectionClosed). Legacy
+        // adapters still expose the broadcast facade until their migration.
+        if let Some(mut pipe) = event_pipe_opt {
+            let server_clone = self.clone();
+            tokio::spawn(async move {
+                tracing::info!(
+                    "[LISTENER] TransportServer pump started for session {} (bounded pipe)",
+                    session_id
+                );
+                while let Some(transport_event) = pipe.next().await {
+                    if let Some(handle) = &actor_handle {
+                        if !server_clone
+                            .pump_one_event(session_id, handle, transport_event)
+                            .await
+                        {
+                            break;
+                        }
+                    }
+                }
+                server_clone.pump_teardown(session_id).await;
+            });
+        } else if let Some(mut event_receiver) = event_receiver_opt {
             let server_clone = self.clone();
             tokio::spawn(async move {
                 tracing::info!("[LISTENER] TransportServer starting event consumption loop for session {} (pre-subscribed)", session_id);
@@ -488,75 +510,15 @@ impl TransportServer {
                         transport_event
                     );
                     if let Some(handle) = &actor_handle {
-                        // Complete server-side request futures before the actor sees it.
-                        if let crate::event::TransportEvent::MessageReceived(packet) =
-                            &transport_event
+                        if !server_clone
+                            .pump_one_event(session_id, handle, transport_event)
+                            .await
                         {
-                            if packet.header.packet_type == crate::packet::PacketType::Response
-                                && server_clone.request_registry.complete_waiter(
-                                    Some(session_id),
-                                    packet.header.message_id,
-                                    packet.clone(),
-                                )
-                            {
-                                continue;
-                            }
-                            // Register inbound requests so they get lifecycle
-                            // treatment (timeout scan, batch-fail on session close)
-                            // and idempotent respond.
-                            if packet.header.packet_type == crate::packet::PacketType::Request {
-                                server_clone.request_registry.register(
-                                    packet.header.message_id,
-                                    Some(session_id),
-                                    packet.header.biz_type,
-                                    DEFAULT_REQUEST_LIFECYCLE_TIMEOUT,
-                                );
-                            }
-                        }
-
-                        // The pump can't rely on recv() erroring to learn the
-                        // connection died — the adapter side may keep its sender
-                        // alive. ConnectionClosed is the definitive end-of-stream
-                        // marker, so forward it and stop.
-                        let is_close = matches!(
-                            transport_event,
-                            crate::event::TransportEvent::ConnectionClosed { .. }
-                        );
-                        if let Err(e) = handle.send_event(transport_event).await {
-                            tracing::warn!(
-                                "[WARN] Failed to forward event to actor for session {}: {:?}",
-                                session_id,
-                                e
-                            );
-                            break;
-                        }
-                        if is_close {
                             break;
                         }
                     }
                 }
-                // Teardown: proactively fail this session's pending requests when
-                // the consumption loop ends, instead of waiting for a later
-                // remove/session-close to reap them.
-                let closed = server_clone
-                    .request_registry
-                    .close_session_pending(session_id);
-                if closed > 0 {
-                    tracing::debug!(
-                        "[END] Session {} loop ended: closed {} pending requests",
-                        session_id,
-                        closed
-                    );
-                }
-                // Peer-initiated closes end here without ever passing through
-                // close_session/force_close_session, so the session's map entries
-                // must be reaped now — otherwise they linger until a send fails,
-                // and with a max_connections cap they would pin capacity forever.
-                // (Server-initiated closes already removed them; remove_session
-                // is idempotent, the presence check just avoids warn noise.)
-                if server_clone.transports.get(&session_id).is_some() {
-                    let _ = server_clone.remove_session(session_id).await;
-                }
+                server_clone.pump_teardown(session_id).await;
                 tracing::info!(
                     "[END] TransportServer event consumption loop ended for session {}",
                     session_id
@@ -611,6 +573,76 @@ impl TransportServer {
         self.state_manager.remove_connection(session_id);
         tracing::info!("[REMOVE] TransportServer removed session: {}", session_id);
         Ok(())
+    }
+
+    /// Handle one pumped transport event for a session: complete server-side
+    /// request futures, give inbound requests lifecycle tracking, then forward
+    /// to the actor. Returns false when the pump should stop (close forwarded,
+    /// or the actor is gone).
+    async fn pump_one_event(
+        &self,
+        session_id: SessionId,
+        handle: &SessionHandle,
+        transport_event: crate::event::TransportEvent,
+    ) -> bool {
+        if let crate::event::TransportEvent::MessageReceived(packet) = &transport_event {
+            if packet.header.packet_type == crate::packet::PacketType::Response
+                && self.request_registry.complete_waiter(
+                    Some(session_id),
+                    packet.header.message_id,
+                    packet.clone(),
+                )
+            {
+                return true;
+            }
+            // Register inbound requests so they get lifecycle treatment
+            // (timeout scan, batch-fail on session close) and idempotent respond.
+            if packet.header.packet_type == crate::packet::PacketType::Request {
+                self.request_registry.register(
+                    packet.header.message_id,
+                    Some(session_id),
+                    packet.header.biz_type,
+                    DEFAULT_REQUEST_LIFECYCLE_TIMEOUT,
+                );
+            }
+        }
+
+        // ConnectionClosed is the definitive end-of-stream marker: forward it,
+        // then stop.
+        let is_close = matches!(
+            transport_event,
+            crate::event::TransportEvent::ConnectionClosed { .. }
+        );
+        if let Err(e) = handle.send_event(transport_event).await {
+            tracing::warn!(
+                "[WARN] Failed to forward event to actor for session {}: {:?}",
+                session_id,
+                e
+            );
+            return false;
+        }
+        !is_close
+    }
+
+    /// Shared pump teardown: fail this session's pending requests and reap its
+    /// map entries. Peer-initiated closes end here without ever passing through
+    /// close_session/force_close_session, so the reap must happen now —
+    /// otherwise entries linger until a send fails, and with a max_connections
+    /// cap they would pin capacity forever. (Server-initiated closes already
+    /// removed them; remove_session is idempotent, the presence check just
+    /// avoids warn noise.)
+    async fn pump_teardown(&self, session_id: SessionId) {
+        let closed = self.request_registry.close_session_pending(session_id);
+        if closed > 0 {
+            tracing::debug!(
+                "[END] Session {} loop ended: closed {} pending requests",
+                session_id,
+                closed
+            );
+        }
+        if self.transports.get(&session_id).is_some() {
+            let _ = self.remove_session(session_id).await;
+        }
     }
 
     /// Feed a server-initiated close into the session's actor mailbox.

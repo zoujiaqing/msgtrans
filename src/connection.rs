@@ -32,6 +32,15 @@ pub trait Connection: Send + Sync + std::any::Any {
         &self,
     ) -> Option<tokio::sync::broadcast::Receiver<crate::event::TransportEvent>>;
 
+    /// Take the bounded event pipe (single consumer, once). Adapters migrated
+    /// to the bounded backbone return `Some` here and `None` from
+    /// `event_stream`; legacy adapters do the opposite. The broadcast facade
+    /// disappears once all protocols are migrated.
+    #[doc(hidden)]
+    fn take_event_pipe(&mut self) -> Option<crate::adapters::events::EventPipeRx> {
+        None
+    }
+
     /// Set the frame decode policy for this connection. Adapters that support it
     /// (WebSocket, QUIC) override this; others (e.g. TCP, which is always strict
     /// on a malformed first packet) keep the default no-op.

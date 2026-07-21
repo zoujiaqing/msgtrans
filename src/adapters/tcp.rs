@@ -15,7 +15,7 @@ use std::sync::Arc;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::{broadcast, mpsc},
+    sync::mpsc,
 };
 
 /// Apply TCP keepalive to a TcpStream (cross-platform via socket2::SockRef)
@@ -341,8 +341,8 @@ pub struct TcpAdapter<C> {
     connection_info: ConnectionInfo,
     /// Send queue
     send_queue: mpsc::Sender<Packet>,
-    /// Event sender
-    event_sender: broadcast::Sender<TransportEvent>,
+    /// Consumer half of the bounded event pipe, taken exactly once.
+    event_pipe_rx: Option<crate::adapters::events::EventPipeRx>,
     /// Shutdown signal sender
     shutdown_sender: mpsc::UnboundedSender<()>,
     /// Event loop handle
@@ -350,11 +350,7 @@ pub struct TcpAdapter<C> {
 }
 
 impl<C> TcpAdapter<C> {
-    pub async fn new(
-        stream: TcpStream,
-        config: C,
-        event_sender: broadcast::Sender<TransportEvent>,
-    ) -> Result<Self, TcpError> {
+    pub async fn new(stream: TcpStream, config: C) -> Result<Self, TcpError> {
         stream.set_nodelay(true)?;
 
         let local_addr = stream.local_addr()?;
@@ -373,6 +369,9 @@ impl<C> TcpAdapter<C> {
 
         let (send_queue_tx, send_queue_rx) = mpsc::channel(SEND_QUEUE_CAPACITY);
         let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel();
+        // Bounded event backbone: the loop task owns the sender half; when the
+        // loop ends the pipe drops and the consumer sees end-of-data.
+        let (event_pipe, event_pipe_rx) = crate::adapters::events::event_pipe(8192);
 
         let memory_pool = shared_memory_pool();
 
@@ -381,7 +380,7 @@ impl<C> TcpAdapter<C> {
             state.clone(),
             send_queue_rx,
             shutdown_rx,
-            event_sender.clone(),
+            event_pipe,
             memory_pool,
         )
         .await;
@@ -392,17 +391,10 @@ impl<C> TcpAdapter<C> {
             stats: AdapterStats::new(),
             connection_info,
             send_queue: send_queue_tx,
-            event_sender,
+            event_pipe_rx: Some(event_pipe_rx),
             shutdown_sender: shutdown_tx,
             event_loop_handle: Some(event_loop_handle),
         })
-    }
-
-    /// Get event stream receiver
-    ///
-    /// This allows clients to subscribe to events sent by TCP adapter internal event loop
-    pub fn subscribe_events(&self) -> broadcast::Receiver<TransportEvent> {
-        self.event_sender.subscribe()
     }
 
     async fn start_event_loop(
@@ -410,7 +402,7 @@ impl<C> TcpAdapter<C> {
         state: crate::adapters::core::ConnState,
         mut send_queue: mpsc::Receiver<Packet>,
         mut shutdown_signal: mpsc::UnboundedReceiver<()>,
-        event_sender: broadcast::Sender<TransportEvent>,
+        event_pipe: crate::adapters::events::EventPipe,
         memory_pool: Arc<OptimizedMemoryPool>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
@@ -434,13 +426,7 @@ impl<C> TcpAdapter<C> {
                             Ok(0) => {
                                 tracing::debug!("[RECV] Peer actively closed TCP connection (session: {})", current_session_id);
                                 // Peer actively closed: notify upper layer that connection is closed for resource cleanup
-                                let close_event = TransportEvent::ConnectionClosed { reason: crate::error::CloseReason::Normal };
-
-                                if let Err(e) = event_sender.send(close_event) {
-                                    tracing::debug!("[CONNECT] Failed to notify upper layer of connection close: session {} - {:?}", current_session_id, e);
-                                } else {
-                                    tracing::debug!("[NOTIFY] Notified upper layer of connection close: session {}", current_session_id);
-                                }
+                                event_pipe.close(crate::error::CloseReason::Normal);
                                 break;
                             }
                             Ok(_) => {
@@ -451,20 +437,22 @@ impl<C> TcpAdapter<C> {
                                             tracing::debug!("[RECV] TCP received packet: {} bytes (session: {})", packet.payload.len(), current_session_id);
                                             tracing::debug!("[DETAIL] Packet details: ID={}, type={:?}, payload_len={}", packet.header.message_id, packet.header.packet_type, packet.payload.len());
 
-                                            // Send receive event
-                                            let event = TransportEvent::MessageReceived(packet);
-
-                                            if let Err(e) = event_sender.send(event) {
-                                                tracing::warn!("[RECV] Failed to send receive event: {:?}", e);
+                                            // Data plane: backpressure. A slow
+                                            // consumer parks the read loop here,
+                                            // which parks the socket via TCP
+                                            // flow control — no event is dropped.
+                                            if !event_pipe
+                                                .deliver(TransportEvent::MessageReceived(packet))
+                                                .await
+                                            {
+                                                tracing::debug!("[RECV] Event consumer gone (session: {})", current_session_id);
+                                                break 'event_loop;
                                             }
                                         }
                                         Ok(None) => break,
                                         Err(e) => {
                                             tracing::error!("[RECV] TCP parse error: {:?} (session: {})", e, current_session_id);
-                                            let close_event = TransportEvent::ConnectionClosed {
-                                                reason: crate::error::CloseReason::Error(format!("{:?}", e)),
-                                            };
-                                            let _ = event_sender.send(close_event);
+                                            event_pipe.close(crate::error::CloseReason::Error(format!("{:?}", e)));
                                             break 'event_loop;
                                         }
                                     }
@@ -473,13 +461,7 @@ impl<C> TcpAdapter<C> {
                             Err(e) => {
                                 tracing::error!("[RECV] TCP connection error: {:?} (session: {})", e, current_session_id);
                                 // Network error: notify upper layer of connection error for resource cleanup
-                                let close_event = TransportEvent::ConnectionClosed { reason: crate::error::CloseReason::Error(format!("{:?}", e)) };
-
-                                if let Err(e) = event_sender.send(close_event) {
-                                    tracing::debug!("[CONNECT] Failed to notify upper layer of connection error: session {} - {:?}", current_session_id, e);
-                                } else {
-                                    tracing::debug!("[NOTIFY] Notified upper layer of connection error: session {}", current_session_id);
-                                }
+                                event_pipe.close(crate::error::CloseReason::Error(format!("{:?}", e)));
                                 break;
                             }
                         }
@@ -492,23 +474,13 @@ impl<C> TcpAdapter<C> {
                                 Ok(_) => {
                                     tracing::debug!("[SEND] TCP send successful: {} bytes (session: {})", packet.payload.len(), current_session_id);
 
-                                    // Send send event
-                                    let event = TransportEvent::MessageSent { packet_id: packet.header.message_id };
-
-                                    if let Err(e) = event_sender.send(event) {
-                                        tracing::warn!("[SEND] Failed to send send event: {:?}", e);
-                                    }
+                                    // Diagnostic tier: droppable under load.
+                                    event_pipe.diagnostic(TransportEvent::MessageSent { packet_id: packet.header.message_id });
                                 }
                                 Err(e) => {
                                     tracing::error!("[SEND] TCP send error: {:?} (session: {})", e, current_session_id);
                                     // Send error: notify upper layer of connection error for resource cleanup
-                                    let close_event = TransportEvent::ConnectionClosed { reason: crate::error::CloseReason::Error(format!("{:?}", e)) };
-
-                                    if let Err(e) = event_sender.send(close_event) {
-                                        tracing::debug!("[CONNECT] Failed to notify upper layer of send error: session {} - {:?}", current_session_id, e);
-                                    } else {
-                                        tracing::debug!("[NOTIFY] Notified upper layer of send error: session {}", current_session_id);
-                                    }
+                                    event_pipe.close(crate::error::CloseReason::Error(format!("{:?}", e)));
                                     break;
                                 }
                             }
@@ -518,9 +490,10 @@ impl<C> TcpAdapter<C> {
                     // [STOP] Handle shutdown signal
                     _ = shutdown_signal.recv() => {
                         tracing::info!("[STOP] Received shutdown signal, stopping TCP event loop (session: {})", current_session_id);
-                        // Active close: no need to send close event, as upper layer initiated the close
-                        // Lower layer protocol close already notified peer, upper layer also knows about the close
-                        tracing::debug!("[CLOSE] Active close, not sending close event");
+                        // Locally initiated close: publish the reason so the
+                        // consumer's single ConnectionClosed carries Normal
+                        // instead of the synthesized abnormal-end reason.
+                        event_pipe.close(crate::error::CloseReason::Normal);
                         break;
                     }
                 }
@@ -577,7 +550,7 @@ impl TcpAdapter<TcpClientConfig> {
             apply_tcp_keepalive(&stream, keepalive);
         }
 
-        Self::new(stream, config, broadcast::channel(8192).0).await
+        Self::new(stream, config).await
     }
 }
 
@@ -629,7 +602,12 @@ impl<C: Send + Sync + 'static> Connection for TcpAdapter<C> {
     fn event_stream(
         &self,
     ) -> Option<tokio::sync::broadcast::Receiver<crate::event::TransportEvent>> {
-        Some(self.event_sender.subscribe())
+        // TCP is on the bounded pipe; there is no broadcast to subscribe to.
+        None
+    }
+
+    fn take_event_pipe(&mut self) -> Option<crate::adapters::events::EventPipeRx> {
+        self.event_pipe_rx.take()
     }
 }
 
@@ -706,7 +684,7 @@ impl TcpServer {
             apply_tcp_keepalive(&stream, keepalive);
         }
 
-        TcpAdapter::new(stream, self.config.clone(), broadcast::channel(8192).0).await
+        TcpAdapter::new(stream, self.config.clone()).await
     }
 
     pub(crate) fn local_addr(&self) -> Result<std::net::SocketAddr, TcpError> {

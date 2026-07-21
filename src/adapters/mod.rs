@@ -1,4 +1,6 @@
 pub(crate) mod core;
+#[doc(hidden)]
+pub mod events;
 pub mod factories;
 pub(crate) mod outbound;
 pub mod quic;

@@ -220,6 +220,7 @@ impl Transport {
         session_id: SessionId,
     ) {
         connection.set_session_id(session_id);
+        let event_pipe_opt = connection.take_event_pipe();
         let event_receiver_opt = connection.event_stream();
 
         *self.connection.lock().await = Some(connection);
@@ -230,7 +231,32 @@ impl Transport {
         self.request_registry.open_session(session_id);
         tracing::debug!("[SUCCESS] Transport connection set: {}", session_id);
 
-        if let Some(mut event_receiver) = event_receiver_opt {
+        if let Some(mut pipe) = event_pipe_opt {
+            // Bounded backbone: single-consumer queue with backpressure; the
+            // pipe ends with exactly one ConnectionClosed.
+            let this = Arc::clone(self);
+            tokio::spawn(async move {
+                tracing::debug!(
+                    "[LISTEN] Transport event consumer started (pipe, session: {})",
+                    session_id
+                );
+                while let Some(event) = pipe.next().await {
+                    this.on_event(event).await;
+                }
+                let failed_pending = this.request_registry.abort_all();
+                if failed_pending > 0 {
+                    tracing::debug!(
+                        "[REQUEST] Failed {} pending requests after event pipe ended (session: {})",
+                        failed_pending,
+                        session_id
+                    );
+                }
+                tracing::debug!(
+                    "[LISTEN] Transport event consumer ended (pipe, session: {})",
+                    session_id
+                );
+            });
+        } else if let Some(mut event_receiver) = event_receiver_opt {
             let this = Arc::clone(self);
             tokio::spawn(async move {
                 tracing::debug!(
