@@ -156,6 +156,45 @@ impl RequestCounters {
     }
 }
 
+/// Per-session lifecycle object, replacing the closing-tombstone TTL.
+///
+/// A session's runtime exists exactly while the session is open: it is created
+/// by `open_session` (called only by the owning accept/connect path) and
+/// removed by `close_session_pending`. Registration cannot create one, so a
+/// register racing a close either finds the runtime and is drained with it, or
+/// finds nothing and is refused — absence *is* the closed state, with no
+/// wall-clock assumption and no per-disconnect memory left behind.
+///
+/// The backbone rework extends this into the full session supervisor
+/// (connection permit, cancellation token, task handles).
+#[derive(Debug)]
+struct SessionRuntime {
+    /// 0 = Open, 1 = Closing. One-way.
+    state: AtomicU8,
+    /// Keys of this session's live requests, drained on close.
+    requests: DashSet<RequestKey>,
+}
+
+impl SessionRuntime {
+    const OPEN: u8 = 0;
+    const CLOSING: u8 = 1;
+
+    fn new() -> Self {
+        Self {
+            state: AtomicU8::new(Self::OPEN),
+            requests: DashSet::new(),
+        }
+    }
+
+    fn is_open(&self) -> bool {
+        self.state.load(Ordering::SeqCst) == Self::OPEN
+    }
+
+    fn begin_close(&self) {
+        self.state.store(Self::CLOSING, Ordering::SeqCst);
+    }
+}
+
 #[derive(Debug)]
 pub struct RequestRegistry {
     entries: DashMap<RequestKey, Arc<RequestEntry>>,
@@ -163,12 +202,8 @@ pub struct RequestRegistry {
     /// caller is awaiting a response (the request/response path); pure
     /// lifecycle-tracked requests (e.g. inbound server requests) have no waiter.
     waiters: DashMap<RequestKey, oneshot::Sender<Packet>>,
-    session_index: DashMap<SessionId, DashSet<RequestKey>>,
-    /// Sessions whose close has begun. Registration re-checks this after
-    /// inserting into `session_index`, closing the window where a register
-    /// in flight during `close_session_pending` slips past the drain and
-    /// leaks a Pending entry. Markers are aged out by the timeout scanner.
-    closing_sessions: DashMap<SessionId, Instant>,
+    /// Live sessions only. See `SessionRuntime` for the lifecycle contract.
+    sessions: DashMap<SessionId, Arc<SessionRuntime>>,
     counters: RequestCounters,
     buckets: Vec<std::sync::Mutex<Vec<RequestKey>>>,
     bucket_count: usize,
@@ -199,6 +234,15 @@ impl RequestRegistry {
         registry
     }
 
+    /// Open a session for request tracking. Called only by the owning
+    /// accept/connect path — registration never creates a session, so a
+    /// session that was closed (or never opened) refuses all requests.
+    pub fn open_session(&self, session_id: SessionId) {
+        self.sessions
+            .entry(session_id)
+            .or_insert_with(|| Arc::new(SessionRuntime::new()));
+    }
+
     /// Allocate the next outbound request id.
     pub fn next_message_id(&self) -> u32 {
         self.next_id
@@ -221,8 +265,7 @@ impl RequestRegistry {
         Self {
             entries: DashMap::new(),
             waiters: DashMap::new(),
-            session_index: DashMap::new(),
-            closing_sessions: DashMap::new(),
+            sessions: DashMap::new(),
             counters: RequestCounters::default(),
             buckets,
             bucket_count: safe_bucket_count,
@@ -257,12 +300,16 @@ impl RequestRegistry {
         timeout: Duration,
         schedule: bool,
     ) -> bool {
-        // Refuse new requests for a session that is already closing.
-        if let Some(sid) = key.session_id {
-            if self.closing_sessions.contains_key(&sid) {
-                return false;
-            }
-        }
+        // Resolve the session runtime up front. No runtime (never opened, or
+        // already closed and removed) means refuse — registration can never
+        // resurrect a session.
+        let runtime = match key.session_id {
+            Some(sid) => match self.sessions.get(&sid) {
+                Some(rt) if rt.is_open() => Some(rt.clone()),
+                _ => return false,
+            },
+            None => None,
+        };
 
         let now = Instant::now();
         let entry = Arc::new(RequestEntry {
@@ -293,14 +340,14 @@ impl RequestRegistry {
             }
         }
 
-        if let Some(sid) = key.session_id {
-            let set = self.session_index.entry(sid).or_default();
-            set.insert(key);
-            drop(set);
-            // Re-check: if the session started closing between our first check
-            // and the index insert, its drain may have run before it could see
-            // this key. Undo, so no Pending entry outlives its session.
-            if self.closing_sessions.contains_key(&sid) {
+        if let Some(rt) = runtime {
+            rt.requests.insert(key);
+            // Re-check: the close marks Closing BEFORE draining, so if we see
+            // Open here our insert happened before the drain read the set and
+            // will be drained with it; if we see Closing, the drain may have
+            // run without our key — undo so no Pending entry outlives its
+            // session.
+            if !rt.is_open() {
                 if let Some(entry) = self.entries.get(&key) {
                     if entry
                         .try_transition(RequestState::Pending, RequestState::SessionClosed)
@@ -313,6 +360,7 @@ impl RequestRegistry {
                         self.remove_terminal_entry(key);
                     }
                 }
+                self.waiters.remove(&key);
                 return false;
             }
         }
@@ -398,6 +446,15 @@ impl RequestRegistry {
     /// Abort every in-flight request (e.g. the connection closed), dropping all
     /// waiters. Returns the number aborted.
     pub fn abort_all(&self) -> usize {
+        // Connection-level teardown: every session this registry tracks is
+        // over. Close their runtimes so late registers are refused, then
+        // abort whatever remains keyed without a session.
+        let sids: Vec<SessionId> = self.sessions.iter().map(|e| *e.key()).collect();
+        for sid in sids {
+            if let Some((_, rt)) = self.sessions.remove(&sid) {
+                rt.begin_close();
+            }
+        }
         let keys: Vec<RequestKey> = self.entries.iter().map(|e| *e.key()).collect();
         let mut aborted = 0;
         for key in keys {
@@ -500,18 +557,19 @@ impl RequestRegistry {
     }
 
     pub fn close_session_pending(&self, session_id: SessionId) -> usize {
-        // Mark first: registrations racing this drain either see the marker and
-        // refuse, or land in the index before the remove below and get drained.
-        self.closing_sessions.insert(session_id, Instant::now());
-
-        let Some((_, ids)) = self.session_index.remove(&session_id) else {
+        // Remove the runtime first (no new registers can find it), mark it
+        // Closing (registers already holding the Arc will undo on re-check),
+        // then drain. Once this returns, absence of the runtime is the
+        // permanent closed state — nothing to age out.
+        let Some((_, runtime)) = self.sessions.remove(&session_id) else {
             return 0;
         };
+        runtime.begin_close();
 
         let mut closed = 0usize;
-
-        for key in ids.iter() {
-            if let Some(entry) = self.entries.get(key.key()) {
+        for key in runtime.requests.iter() {
+            let key = *key.key();
+            if let Some(entry) = self.entries.get(&key) {
                 if entry
                     .try_transition(RequestState::Pending, RequestState::SessionClosed)
                     .is_ok()
@@ -520,13 +578,13 @@ impl RequestRegistry {
                     self.counters
                         .pending_requests
                         .fetch_sub(1, Ordering::Relaxed);
-                    let key = *key.key();
                     drop(entry);
                     self.entries.remove(&key);
                     self.waiters.remove(&key); // drop waiter -> receiver observes cancellation
                 }
             }
         }
+        runtime.requests.clear();
 
         if closed > 0 {
             self.counters
@@ -555,17 +613,7 @@ impl RequestRegistry {
         self.tick_duration
     }
 
-    /// How long a closing marker must outlive the close. Any registration
-    /// racing the close is an in-flight call, not minutes old, so this only
-    /// needs to be generous, not permanent — session ids are never reused.
-    const CLOSING_MARKER_TTL: Duration = Duration::from_secs(60);
-
     pub fn scan_timeout_bucket(&self) -> usize {
-        // Age out old closing markers so the map stays bounded.
-        let now = Instant::now();
-        self.closing_sessions
-            .retain(|_, closed_at| now.duration_since(*closed_at) < Self::CLOSING_MARKER_TTL);
-
         let next_tick = self.current_tick.fetch_add(1, Ordering::SeqCst) + 1;
         let bucket_idx = (next_tick as usize) % self.bucket_count;
         let mut drained = Vec::new();
@@ -606,8 +654,8 @@ impl RequestRegistry {
     fn remove_terminal_entry(&self, key: RequestKey) {
         self.entries.remove(&key);
         if let Some(session_id) = key.session_id {
-            if let Some(set) = self.session_index.get(&session_id) {
-                set.remove(&key);
+            if let Some(rt) = self.sessions.get(&session_id) {
+                rt.requests.remove(&key);
             }
         }
     }
@@ -636,11 +684,18 @@ impl RequestRegistry {
 mod tests {
     use super::*;
 
+    fn open(registry: &RequestRegistry, sids: &[u64]) {
+        for sid in sids {
+            registry.open_session(SessionId(*sid));
+        }
+    }
+
     #[test]
     fn register_and_transition_to_responded_once() {
         let registry = RequestRegistry::new();
         let request_id = 42;
         let session_id = Some(SessionId(7));
+        open(&registry, &[7]);
 
         assert!(registry.register(request_id, session_id, 1, Duration::from_secs(3)));
         assert_eq!(
@@ -671,6 +726,7 @@ mod tests {
     #[test]
     fn same_request_id_is_isolated_by_session() {
         let registry = RequestRegistry::new();
+        open(&registry, &[1, 2]);
 
         assert!(registry.register(77, Some(SessionId(1)), 0, Duration::from_secs(3)));
         assert!(registry.register(77, Some(SessionId(2)), 0, Duration::from_secs(3)));
@@ -715,6 +771,7 @@ mod tests {
     fn close_session_batch_transitions_pending_to_session_closed() {
         let registry = RequestRegistry::new();
         let sid = SessionId(999);
+        open(&registry, &[999, 1000]);
 
         assert!(registry.register(1, Some(sid), 0, Duration::from_secs(5)));
         assert!(registry.register(2, Some(sid), 0, Duration::from_secs(5)));
@@ -746,6 +803,7 @@ mod tests {
     fn duplicate_register_is_rejected_within_same_session() {
         let registry = RequestRegistry::new();
         let sid = Some(SessionId(9));
+        open(&registry, &[9]);
         assert!(registry.register(77, sid, 0, Duration::from_secs(2)));
         assert!(!registry.register(77, sid, 0, Duration::from_secs(2)));
     }
@@ -785,6 +843,7 @@ mod tests {
     fn register_waiter_completes_with_response() {
         let registry = RequestRegistry::new();
         let sid = Some(SessionId(3));
+        open(&registry, &[3]);
         let mut rx = registry
             .try_register_waiter(50, sid, 0, Duration::from_secs(5))
             .expect("fresh key registers");
@@ -806,6 +865,7 @@ mod tests {
     #[test]
     fn complete_waiter_rejects_wrong_session() {
         let registry = RequestRegistry::new();
+        open(&registry, &[1]);
         let mut rx = registry
             .try_register_waiter(60, Some(SessionId(1)), 0, Duration::from_secs(5))
             .expect("fresh key registers");
@@ -837,6 +897,7 @@ mod tests {
     fn close_session_drops_waiter() {
         let registry = RequestRegistry::new();
         let sid = SessionId(88);
+        open(&registry, &[88]);
         let mut rx = registry
             .try_register_waiter(80, Some(sid), 0, Duration::from_secs(5))
             .expect("fresh key registers");
@@ -851,6 +912,7 @@ mod tests {
     fn try_register_waiter_refuses_duplicate() {
         let registry = RequestRegistry::new();
         let sid = Some(SessionId(5));
+        open(&registry, &[5]);
         let _rx = registry
             .try_register_waiter(90, sid, 0, Duration::from_secs(5))
             .expect("first registers");
@@ -864,6 +926,7 @@ mod tests {
     fn abort_waiter_drops_receiver() {
         let registry = RequestRegistry::new();
         let sid = Some(SessionId(11));
+        open(&registry, &[11]);
         let mut rx = registry
             .try_register_waiter(100, sid, 0, Duration::from_secs(5))
             .expect("registers");
@@ -886,6 +949,7 @@ mod tests {
         // responding to it could terminate the outbound entry.
         let registry = RequestRegistry::new();
         let sid = Some(SessionId(42));
+        open(&registry, &[42]);
 
         let mut rx = registry
             .try_register_waiter(500, sid, 0, Duration::from_secs(5))
@@ -922,6 +986,7 @@ mod tests {
         // inbound and the waiter paths refuse.
         let registry = RequestRegistry::new();
         let sid = SessionId(300);
+        open(&registry, &[300]);
 
         assert!(registry.register(1, Some(sid), 0, Duration::from_secs(5)));
         assert_eq!(registry.close_session_pending(sid), 1);
@@ -954,6 +1019,9 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let cursor = Arc::new(AtomicU64::new(1000)); // close frontier
         const WINDOW: u64 = 8;
+        for sid in 1000..1000 + WINDOW {
+            registry.open_session(SessionId(sid));
+        }
         let mut handles = Vec::new();
 
         for t in 0..4u64 {
@@ -993,8 +1061,11 @@ mod tests {
             let cursor = cursor.clone();
             handles.push(std::thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
-                    // Advance the frontier: close the oldest live session.
+                    // Advance the frontier: open the next window session, then
+                    // close the oldest — the owner-opens/owner-closes shape of
+                    // the real accept path.
                     let sid = cursor.fetch_add(1, Ordering::Relaxed);
+                    reg.open_session(SessionId(sid + WINDOW));
                     reg.close_session_pending(SessionId(sid));
                     std::thread::yield_now();
                 }
@@ -1020,15 +1091,31 @@ mod tests {
         assert_eq!(registry.pending_count(), 0, "pending counter out of sync");
         // Same-module access: check the maps the public counters cannot see.
         assert!(registry.waiters.is_empty(), "orphaned waiters leaked");
-        assert!(
-            registry.session_index.is_empty(),
-            "session index sets leaked"
-        );
+        assert!(registry.sessions.is_empty(), "session runtimes leaked");
+    }
+
+    #[test]
+    fn unopened_or_closed_session_refuses_and_cannot_resurrect() {
+        let registry = RequestRegistry::new();
+        // Never opened: refused.
+        assert!(!registry.register(1, Some(SessionId(70)), 0, Duration::from_secs(5)));
+        // Open -> works.
+        registry.open_session(SessionId(70));
+        assert!(registry.register(1, Some(SessionId(70)), 0, Duration::from_secs(5)));
+        // Closed: refused permanently — registration cannot recreate the
+        // runtime, so there is no tombstone and nothing to age out.
+        registry.close_session_pending(SessionId(70));
+        assert!(!registry.register(2, Some(SessionId(70)), 0, Duration::from_secs(5)));
+        assert!(registry
+            .try_register_waiter(3, Some(SessionId(70)), 0, Duration::from_secs(5))
+            .is_err());
+        assert!(registry.sessions.is_empty());
     }
 
     #[test]
     fn abort_all_drops_every_waiter() {
         let registry = RequestRegistry::new();
+        open(&registry, &[1]);
         let mut rx1 = registry
             .try_register_waiter(1, Some(SessionId(1)), 0, Duration::from_secs(5))
             .expect("registers");

@@ -445,6 +445,9 @@ impl TransportServer {
 
         // Register connection state
         self.state_manager.add_connection(session_id);
+        // Open request tracking; a session that was never opened (or already
+        // closed) refuses all request registrations.
+        self.request_registry.open_session(session_id);
 
         // Create this session's actor and keep a handle for event forwarding.
         let (handle, actor) = create_session_actor(

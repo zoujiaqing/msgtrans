@@ -225,6 +225,9 @@ impl Transport {
         *self.connection.lock().await = Some(connection);
         *self.session_id.lock().await = Some(session_id);
         self.state_manager.add_connection(session_id);
+        // Open request tracking for this session; the registry refuses
+        // registrations for sessions that were never opened or already closed.
+        self.request_registry.open_session(session_id);
         tracing::debug!("[SUCCESS] Transport connection set: {}", session_id);
 
         if let Some(mut event_receiver) = event_receiver_opt {
