@@ -48,7 +48,7 @@ impl SessionHandler for EchoHandler {
         }
     }
 
-    async fn on_connected(&self, session_id: SessionId) {
+    async fn on_connected(&self, session_id: SessionId, _info: msgtrans::command::ConnectionInfo) {
         tracing::debug!("[CONNECT] Session {} connected", session_id);
     }
 
@@ -77,15 +77,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create echo handler
     let handler = Arc::new(EchoHandler);
 
-    // Build server with actor mode
+    // Build server
     let transport = TransportServerBuilder::new()
         .max_connections(10000)
-        .with_handler(handler) // Enable actor mode
         .actor_buffer_size(4096) // Buffer size per connection
         .with_protocol(tcp_config)
         .with_protocol(websocket_config)
         .with_protocol(quic_config)
-        .build()
+        .build(handler)
         .await?;
 
     println!("Listening on:");

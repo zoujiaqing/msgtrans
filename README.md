@@ -50,11 +50,28 @@ msgtrans = "1.0"
 ### Create a Multi-Protocol Server
 
 ```rust,no_run
+use async_trait::async_trait;
 use msgtrans::{
-    transport::TransportServerBuilder,
+    transport::{SessionHandler, SessionSender, TransportServerBuilder},
     protocol::{TcpServerConfig, WebSocketServerConfig, QuicServerConfig},
-    event::ServerEvent,
+    packet::Packet,
+    SessionId,
 };
+use std::sync::Arc;
+
+// Business logic lives in a handler. Each connection gets its own actor that
+// calls it, so a slow handler slows only its own connection instead of
+// dropping messages for everyone.
+struct Echo;
+
+#[async_trait]
+impl SessionHandler for Echo {
+    async fn on_message(&self, _session: SessionId, packet: Packet, sender: SessionSender) {
+        // Echo the message back - protocol transparent.
+        let response = format!("Echo: {}", String::from_utf8_lossy(&packet.payload));
+        let _ = sender.send_data(response.into_bytes()).await;
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -68,34 +85,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_protocol(tcp_config)
         .with_protocol(websocket_config)
         .with_protocol(quic_config)
-        .build()
+        .build(Arc::new(Echo))
         .await?;
 
-    // Subscribe to events before serving so nothing is missed.
-    let mut events = server.subscribe_events();
-
-    // Drive the listeners. `serve()` runs until the server is stopped, so spawn
-    // it and handle events on the main task.
-    let server_for_events = server.clone();
-    tokio::spawn(async move {
-        while let Ok(event) = events.recv().await {
-            match event {
-                ServerEvent::ConnectionEstablished { session_id, .. } => {
-                    println!("New connection: {session_id}");
-                }
-                ServerEvent::MessageReceived { session_id, context } => {
-                    // Echo the message back - protocol transparent.
-                    let response = format!("Echo: {}", String::from_utf8_lossy(&context.data));
-                    let _ = server_for_events.send(session_id, response.as_bytes()).await;
-                }
-                ServerEvent::ConnectionClosed { session_id, .. } => {
-                    println!("Connection closed: {session_id}");
-                }
-                _ => {}
-            }
-        }
-    });
-
+    // Runs until the server is stopped.
     server.serve().await?;
     Ok(())
 }
@@ -182,40 +175,54 @@ hides protocol details.
 config passed to `.with_protocol(..)` changes:
 
 ```rust,no_run
-# use msgtrans::{transport::TransportServerBuilder, protocol::{TcpServerConfig, QuicServerConfig}};
+# use msgtrans::{transport::{TransportServerBuilder, SessionHandler, SessionSender}, protocol::{TcpServerConfig, QuicServerConfig}, packet::Packet, SessionId};
+# use std::sync::Arc;
+# struct H;
+# #[async_trait::async_trait]
+# impl SessionHandler for H {
+#     async fn on_message(&self, _s: SessionId, _p: Packet, _tx: SessionSender) {}
+# }
 # async fn f() -> Result<(), Box<dyn std::error::Error>> {
+# let handler = Arc::new(H);
 // TCP server
 let server = TransportServerBuilder::new()
     .with_protocol(TcpServerConfig::new("0.0.0.0:8080")?)
-    .build().await?;
+    .build(handler.clone()).await?;
 
 // QUIC server - identical business logic
 let server = TransportServerBuilder::new()
     .with_protocol(QuicServerConfig::new("0.0.0.0:8080")?)
-    .build().await?;
+    .build(handler).await?;
 # Ok(()) }
 ```
 
-### Event-Driven Model
+### Handler Model
+
+The server delivers each session's traffic to a `SessionHandler`; the client
+still exposes an event stream, since a client has exactly one connection.
 
 ```rust
 use msgtrans::{
-    event::{ServerEvent, ClientEvent},
+    event::ClientEvent,
     command::ConnectionInfo,
     error::{TransportError, CloseReason},
-    SessionId, TransportContext,
+    packet::Packet,
+    transport::{SessionHandler, SessionSender},
+    SessionId,
 };
 
-// Server events
-# fn _server_events(ev: ServerEvent) { match ev {
-ServerEvent::ConnectionEstablished { session_id, info } => { /* ... */ }
-ServerEvent::MessageReceived { session_id, context } => { /* ... */ }
-ServerEvent::MessageSent { session_id, message_id } => { /* ... */ }
-ServerEvent::ConnectionClosed { session_id, reason } => { /* ... */ }
-ServerEvent::TransportError { session_id, error } => { /* ... */ }
-# _ => {} } }
+// Server side: implement the handler. Only `on_message` is required.
+struct MyHandler;
 
-// Client events
+#[async_trait::async_trait]
+impl SessionHandler for MyHandler {
+    async fn on_message(&self, session_id: SessionId, packet: Packet, sender: SessionSender) { /* ... */ }
+    async fn on_connected(&self, session_id: SessionId, info: ConnectionInfo) { /* ... */ }
+    async fn on_disconnected(&self, session_id: SessionId, reason: CloseReason) { /* ... */ }
+    async fn on_error(&self, session_id: SessionId, error: TransportError) { /* ... */ }
+}
+
+// Client side: events
 # fn _client_events(ev: ClientEvent) { match ev {
 ClientEvent::Connected { info } => { /* ... */ }
 ClientEvent::MessageReceived(context) => { /* ... */ }
@@ -233,19 +240,22 @@ ClientEvent::Error { error } => { /* ... */ }
 moved into spawned tasks for concurrent, lock-free session access:
 
 ```rust,no_run
-# use msgtrans::{transport::TransportServer, event::ServerEvent};
-# async fn f(server: TransportServer) -> Result<(), Box<dyn std::error::Error>> {
-let mut events = server.subscribe_events();
-while let Ok(event) = events.recv().await {
-    if let ServerEvent::MessageReceived { session_id, context } = event {
-        let server = server.clone();
+# use msgtrans::{transport::{TransportServer, SessionHandler, SessionSender}, packet::Packet, SessionId};
+# use std::sync::Arc;
+struct Echo { server: TransportServer }
+
+#[async_trait::async_trait]
+impl SessionHandler for Echo {
+    async fn on_message(&self, session_id: SessionId, packet: Packet, _tx: SessionSender) {
+        // Handing work to a spawned task keeps this session's actor free to
+        // pick up the next message.
+        let server = self.server.clone();
         tokio::spawn(async move {
-            let response = format!("Echo: {}", String::from_utf8_lossy(&context.data));
+            let response = format!("Echo: {}", String::from_utf8_lossy(&packet.payload));
             let _ = server.send(session_id, response.as_bytes()).await;
         });
     }
 }
-# Ok(()) }
 ```
 
 ### Request / Response
@@ -285,11 +295,24 @@ impl Connection for MyAdapter {
 ### WebSocket Server
 
 ```rust,no_run
+use async_trait::async_trait;
 use msgtrans::{
-    transport::TransportServerBuilder,
+    transport::{SessionHandler, SessionSender, TransportServerBuilder},
     protocol::WebSocketServerConfig,
-    event::ServerEvent,
+    packet::Packet,
+    SessionId,
 };
+use std::sync::Arc;
+
+struct Chat;
+
+#[async_trait]
+impl SessionHandler for Chat {
+    async fn on_message(&self, _session: SessionId, packet: Packet, sender: SessionSender) {
+        let msg = String::from_utf8_lossy(&packet.payload);
+        let _ = sender.send_data(format!("You said: {msg}").into_bytes()).await;
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -298,21 +321,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server = TransportServerBuilder::new()
         .with_protocol(config)
         .max_connections(1000)
-        .build()
+        .build(Arc::new(Chat))
         .await?;
-
-    let mut events = server.subscribe_events();
-    let server_for_events = server.clone();
-    tokio::spawn(async move {
-        while let Ok(event) = events.recv().await {
-            if let ServerEvent::MessageReceived { session_id, context } = event {
-                let msg = String::from_utf8_lossy(&context.data);
-                let _ = server_for_events
-                    .send(session_id, format!("You said: {msg}").as_bytes())
-                    .await;
-            }
-        }
-    });
 
     server.serve().await?;
     Ok(())
@@ -412,14 +422,19 @@ match client.send("Hello, World!".as_bytes()).await {
 ### Graceful Shutdown
 
 ```rust,no_run
-use msgtrans::{transport::TransportServerBuilder, protocol::TcpServerConfig};
-use std::time::Duration;
+use msgtrans::{transport::{TransportServerBuilder, SessionHandler, SessionSender}, protocol::TcpServerConfig, packet::Packet, SessionId};
+use std::{sync::Arc, time::Duration};
 
+# struct H;
+# #[async_trait::async_trait]
+# impl SessionHandler for H {
+#     async fn on_message(&self, _s: SessionId, _p: Packet, _tx: SessionSender) {}
+# }
 # async fn f() -> Result<(), Box<dyn std::error::Error>> {
 let server = TransportServerBuilder::new()
     .with_protocol(TcpServerConfig::new("0.0.0.0:8001")?)
     .graceful_shutdown(Some(Duration::from_secs(30)))
-    .build().await?;
+    .build(Arc::new(H)).await?;
 
 // ... later, drain active sessions using the configured timeout:
 server.stop().await;

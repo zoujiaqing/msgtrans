@@ -12,7 +12,10 @@
 
 use crate::adapters::outbound::SEND_QUEUE_WAIT;
 use crate::transport::request_registry::{MarkResult, RequestRegistry};
-use crate::{event::TransportEvent, packet::Packet, transport::transport::Transport, SessionId};
+use crate::{
+    command::ConnectionInfo, event::TransportEvent, packet::Packet,
+    transport::transport::Transport, SessionId,
+};
 use async_trait::async_trait;
 use flume::{bounded, Receiver, Sender};
 use std::sync::Arc;
@@ -52,8 +55,12 @@ pub trait SessionHandler: Send + Sync + 'static {
     async fn on_message(&self, session_id: SessionId, packet: Packet, sender: SessionSender);
 
     /// Called when a session is established
-    async fn on_connected(&self, session_id: SessionId) {
-        let _ = session_id; // Default: no-op
+    ///
+    /// Runs before any `on_message` for this session, so the handler can set up
+    /// per-session state (and reject the peer via `info.peer_addr`) without
+    /// racing the first inbound packet.
+    async fn on_connected(&self, session_id: SessionId, info: ConnectionInfo) {
+        let _ = (session_id, info); // Default: no-op
     }
 
     /// Called when a session is closed
@@ -324,6 +331,7 @@ pub struct SessionActor {
     transport: Arc<Transport>,
     rx: Receiver<ActorMessage>,
     handler: Arc<dyn SessionHandler>,
+    connection_info: ConnectionInfo,
     inbound_registry: Option<Arc<RequestRegistry>>,
 }
 
@@ -334,12 +342,14 @@ impl SessionActor {
         transport: Arc<Transport>,
         rx: Receiver<ActorMessage>,
         handler: Arc<dyn SessionHandler>,
+        connection_info: ConnectionInfo,
     ) -> Self {
         Self {
             session_id,
             transport,
             rx,
             handler,
+            connection_info,
             inbound_registry: None,
         }
     }
@@ -367,7 +377,9 @@ impl SessionActor {
         );
 
         // Notify handler that session is connected
-        self.handler.on_connected(self.session_id).await;
+        self.handler
+            .on_connected(self.session_id, self.connection_info.clone())
+            .await;
 
         // Pre-allocate batch buffer to avoid repeated allocations
         let mut batch: Vec<ActorMessage> = Vec::with_capacity(BATCH_SIZE);
@@ -492,6 +504,7 @@ pub fn create_session_actor(
     session_id: SessionId,
     transport: Arc<Transport>,
     handler: Arc<dyn SessionHandler>,
+    connection_info: ConnectionInfo,
     buffer_size: usize,
 ) -> (SessionHandle, SessionActor) {
     let (tx, rx) = bounded(buffer_size);
@@ -501,7 +514,7 @@ pub fn create_session_actor(
         transport: transport.clone(),
     };
 
-    let actor = SessionActor::new(session_id, transport, rx, handler);
+    let actor = SessionActor::new(session_id, transport, rx, handler, connection_info);
 
     (handle, actor)
 }

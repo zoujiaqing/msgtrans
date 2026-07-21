@@ -1,11 +1,72 @@
+use async_trait::async_trait;
 use msgtrans::{
-    event::ClientEvent, event::ServerEvent, protocol::TcpClientConfig, protocol::TcpServerConfig,
-    transport::TransportClientBuilder, transport::TransportServerBuilder,
+    command::ConnectionInfo,
+    event::ClientEvent,
+    packet::{Packet, PacketType},
+    protocol::{TcpClientConfig, TcpServerConfig},
+    transport::{
+        SessionHandler, SessionSender, TransportClientBuilder, TransportServer,
+        TransportServerBuilder,
+    },
+    SessionId,
 };
 /// Specialized program for debugging transport event streams
 ///
-/// Used to diagnose event bridging and server-side event handling for lock-free connections
+/// Used to diagnose event bridging and server-side session handling
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+
+struct DebugHandler {
+    /// Filled in after the server is built, so the handler can push a message
+    /// as soon as a session connects.
+    server: OnceLock<TransportServer>,
+}
+
+#[async_trait]
+impl SessionHandler for DebugHandler {
+    async fn on_connected(&self, session_id: SessionId, _info: ConnectionInfo) {
+        println!("[CONNECT] New connection established: {}", session_id);
+
+        let Some(server) = self.server.get().cloned() else {
+            return;
+        };
+        tokio::spawn(async move {
+            if let Err(e) = server.send(session_id, b"Hello from server!").await {
+                println!("[ERROR] Server send failed: {:?}", e);
+            } else {
+                println!("[SUCCESS] Server send successful");
+            }
+        });
+    }
+
+    async fn on_message(&self, session_id: SessionId, packet: Packet, sender: SessionSender) {
+        let text = String::from_utf8_lossy(&packet.payload).to_string();
+        let is_request = packet.header.packet_type == PacketType::Request;
+        println!(
+            "[RECV] Message received (session: {}, ID: {}, request: {}): {}",
+            session_id, packet.header.message_id, is_request, text
+        );
+
+        if is_request {
+            println!("[SEND] Responding to request...");
+            let _ = sender
+                .respond(
+                    packet.header.message_id,
+                    packet.header.biz_type,
+                    format!("Echo: {}", text).into_bytes(),
+                )
+                .await;
+            println!("[SUCCESS] Request responded");
+        }
+    }
+
+    async fn on_disconnected(&self, session_id: SessionId, reason: msgtrans::CloseReason) {
+        println!(
+            "[CLOSE] Connection closed: session {}, reason: {:?}",
+            session_id, reason
+        );
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -22,90 +83,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Start server - simplified API
     let tcp_config = TcpServerConfig::new("127.0.0.1:9001")?;
 
+    let handler = Arc::new(DebugHandler {
+        server: OnceLock::new(),
+    });
+
     let server = TransportServerBuilder::new()
         .with_protocol(tcp_config)
-        .build()
+        .build(handler.clone())
         .await?;
 
     println!("[SUCCESS] Server created: 127.0.0.1:9001");
 
-    // Subscribe to server events
-    let mut server_events = server.subscribe_events();
-    let server_clone = server.clone();
-
-    // Server event handling
-    let server_task = tokio::spawn(async move {
-        println!("[START] Server event handling started");
-        let mut event_count = 0;
-
-        while let Ok(event) = server_events.recv().await {
-            event_count += 1;
-            println!("[RECV] Server event #{}: {:?}", event_count, event);
-
-            match event {
-                ServerEvent::ConnectionEstablished { session_id, .. } => {
-                    println!("[CONNECT] New connection established: {}", session_id);
-
-                    // [ASYNC] Fix: move send operation to separate async task to avoid blocking event loop
-                    let server_for_send = server_clone.clone();
-                    tokio::spawn(async move {
-                        // Send a test message immediately
-                        if let Err(e) = server_for_send
-                            .send(session_id, b"Hello from server!")
-                            .await
-                        {
-                            println!("[ERROR] Server send failed: {:?}", e);
-                        } else {
-                            println!("[SUCCESS] Server send successful");
-                        }
-                    });
-                }
-                ServerEvent::MessageReceived {
-                    session_id,
-                    context,
-                } => {
-                    println!(
-                        "[RECV] Message received (session: {}, ID: {}, request: {}): {}",
-                        session_id,
-                        context.message_id,
-                        context.is_request(),
-                        context.as_text_lossy()
-                    );
-
-                    if context.is_request() {
-                        let response = format!("Echo: {}", context.as_text_lossy());
-                        println!("[SEND] Responding to request...");
-                        context.respond(response.into_bytes());
-                        println!("[SUCCESS] Request responded");
-                    }
-                }
-                ServerEvent::MessageSent {
-                    session_id,
-                    message_id,
-                } => {
-                    println!(
-                        "[SEND] Message send confirmation: session {}, ID {}",
-                        session_id, message_id
-                    );
-                }
-                ServerEvent::ConnectionClosed { session_id, reason } => {
-                    println!(
-                        "[CLOSE] Connection closed: session {}, reason: {:?}",
-                        session_id, reason
-                    );
-                    break;
-                }
-                _ => {
-                    println!("[INFO] Other event: {:?}", event);
-                }
-            }
-        }
-
-        println!(
-            "[WARN] Server event handling ended (processed {} events)",
-            event_count
-        );
-    });
+    let _ = handler.server.set(server.clone());
 
     // Start server
     let server_handle = tokio::spawn(async move {
@@ -212,7 +201,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Cleanup
     server_handle.abort();
-    let _ = tokio::join!(server_task, client_task);
+    let _ = client_task.await;
 
     println!("[STOP] Debug program completed");
     Ok(())

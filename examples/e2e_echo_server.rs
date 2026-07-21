@@ -14,14 +14,42 @@
 //!
 //! Stop: SIGINT / SIGTERM.
 
+use async_trait::async_trait;
 use msgtrans::{
-    event::ServerEvent, packet::Packet, protocol::WebSocketServerConfig,
-    transport::TransportServerBuilder,
+    packet::{Packet, PacketType},
+    protocol::WebSocketServerConfig,
+    transport::{SessionHandler, SessionSender, TransportServerBuilder},
+    SessionId,
 };
-use std::env;
+use std::{env, sync::Arc};
 
 const BIZ_DROP: u8 = 250;
 const DEFAULT_PORT: u16 = 18080;
+
+struct EchoHandler;
+
+#[async_trait]
+impl SessionHandler for EchoHandler {
+    async fn on_message(&self, _session_id: SessionId, packet: Packet, sender: SessionSender) {
+        let biz_type = packet.header.biz_type;
+
+        if biz_type == BIZ_DROP {
+            // Silent drop — used by TS timeout / close-pending tests.
+            return;
+        }
+
+        if packet.header.packet_type == PacketType::Request {
+            let _ = sender
+                .respond(packet.header.message_id, biz_type, packet.payload)
+                .await;
+        } else {
+            // Mirror OneWay back with same biz_type and payload.
+            let mut echo = Packet::one_way(0, packet.payload);
+            echo.set_biz_type(biz_type);
+            let _ = sender.send(echo).await;
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -36,51 +64,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let transport = TransportServerBuilder::new()
         .max_connections(64)
         .with_protocol(ws_config)
-        .build()
+        .build(Arc::new(EchoHandler))
         .await?;
-
-    let mut events = transport.subscribe_events();
-    let transport_for_echo = transport.clone();
-    let transport_for_serve = transport.clone();
-
-    let event_task = tokio::spawn(async move {
-        let transport = transport_for_echo;
-        while let Ok(event) = events.recv().await {
-            if let ServerEvent::MessageReceived {
-                session_id,
-                context,
-            } = event
-            {
-                let biz_type = context.biz_type;
-                let payload = context.data.clone();
-
-                if biz_type == BIZ_DROP {
-                    // Silent drop — used by TS timeout / close-pending tests.
-                    continue;
-                }
-
-                if context.is_request() {
-                    context.respond(payload);
-                } else {
-                    // Mirror OneWay back with same biz_type and payload.
-                    let transport_clone = transport.clone();
-                    tokio::spawn(async move {
-                        let mut packet = Packet::one_way(0, payload);
-                        packet.set_biz_type(biz_type);
-                        let _ = transport_clone.send_to_session(session_id, packet).await;
-                    });
-                }
-            }
-        }
-    });
 
     // Print ready line BEFORE awaiting serve(). The TS test waits for this line
     // and then retries connect with a small backoff to cover the brief window
     // until the WS listener binds.
     println!("MSGTRANS_E2E_READY ws://{}", bind);
 
-    let serve_result = transport_for_serve.serve().await;
-    let _ = event_task.await;
-    serve_result?;
+    transport.serve().await?;
     Ok(())
 }
