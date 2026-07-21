@@ -7,7 +7,7 @@
 use async_trait::async_trait;
 use msgtrans::{
     packet::{Packet, PacketType},
-    protocol::{TcpClientConfig, TcpServerConfig},
+    protocol::{TcpClientConfig, TcpServerConfig, WebSocketClientConfig, WebSocketServerConfig},
     transport::{
         SessionHandler, SessionSender, TransportClient, TransportClientBuilder,
         TransportServerBuilder,
@@ -51,6 +51,82 @@ async fn echo_works(client: &TransportClient) -> bool {
         Ok(Ok(result)) => result.data.as_deref() == Some(b"ping"),
         _ => false,
     }
+}
+
+async fn connect_ws_client(url: &str) -> TransportClient {
+    let cfg = WebSocketClientConfig::new(url)
+        .expect("ws config")
+        .connect_timeout(Duration::from_secs(5));
+    let mut client = TransportClientBuilder::new()
+        .protocol(cfg)
+        .build()
+        .await
+        .expect("build ws client");
+    client.connect().await.expect("ws connect");
+    client
+}
+
+/// The original race was cross-protocol: TCP, WS and QUIC each run their own
+/// accept loop, and a per-loop len() check let simultaneous accepts on
+/// different protocols all pass at N-1. Contend TCP and WebSocket bursts for
+/// one shared cap and assert it still holds.
+#[tokio::test(flavor = "multi_thread")]
+async fn cap_is_shared_across_protocols() {
+    let tcp_addr = "127.0.0.1:28873";
+    let ws_addr = "127.0.0.1:28874";
+    const CAP: usize = 4;
+    let server = TransportServerBuilder::new()
+        .max_connections(CAP)
+        .protocol(TcpServerConfig::new(tcp_addr).expect("tcp server config"))
+        .protocol(WebSocketServerConfig::new(ws_addr).expect("ws server config"))
+        .build(Arc::new(Echo))
+        .await
+        .expect("build server");
+
+    let server_bg = server.clone();
+    tokio::spawn(async move {
+        let _ = server_bg.serve().await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // 8 TCP + 8 WS clients connect simultaneously against a cap of 4.
+    let ws_url = format!("ws://{}", ws_addr);
+    let mut tasks = Vec::new();
+    for i in 0..16 {
+        let ws_url = ws_url.clone();
+        tasks.push(tokio::spawn(async move {
+            let client = if i % 2 == 0 {
+                connect_client(tcp_addr).await
+            } else {
+                connect_ws_client(&ws_url).await
+            };
+            let served = echo_works(&client).await;
+            (client, served)
+        }));
+    }
+    let mut clients = Vec::new();
+    let mut served = 0usize;
+    for t in tasks {
+        let (client, ok) = t.await.expect("join");
+        if ok {
+            served += 1;
+        }
+        clients.push(client); // keep alive so slots stay occupied
+    }
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let sessions = server.session_count().await;
+    assert!(
+        sessions <= CAP,
+        "shared cap must hold across protocols: {} sessions > cap {}",
+        sessions,
+        CAP
+    );
+    assert_eq!(
+        served, CAP,
+        "exactly cap clients should be served across both protocols (got {})",
+        served
+    );
 }
 
 /// The cap must hold under a concurrent connect burst: the permit acquisition

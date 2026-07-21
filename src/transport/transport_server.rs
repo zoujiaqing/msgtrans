@@ -114,8 +114,8 @@ impl TransportServer {
     /// Set the concurrent-session cap. Internal; set via
     /// `TransportServerBuilder::max_connections`.
     pub(crate) fn with_max_connections(mut self, max: usize) -> Self {
-        let permits = max.min(tokio::sync::Semaphore::MAX_PERMITS);
-        self.connection_permits = Arc::new(tokio::sync::Semaphore::new(permits));
+        // Range-validated by TransportServerBuilder::build before we get here.
+        self.connection_permits = Arc::new(tokio::sync::Semaphore::new(max));
         self.max_connections = max;
         self
     }
@@ -387,15 +387,14 @@ impl TransportServer {
         }
     }
 
-    /// [ABSTRACT] Add session - using Transport abstraction
-    pub async fn add_session(&self, connection: Box<dyn crate::Connection>) -> SessionId {
-        self.add_session_with_permit(connection, None).await
-    }
-
     /// Add a session carrying its connection-cap permit. The permit is moved
     /// into the session's actor so capacity is released exactly when the actor
     /// ends — whichever side closed and however teardown was reached.
-    pub(crate) async fn add_session_with_permit(
+    ///
+    /// Internal: every real session must come through the accept path, which is
+    /// where the permit is acquired — a public entry point taking no permit
+    /// would be a hole in the connection cap.
+    async fn add_session_with_permit(
         &self,
         connection: Box<dyn crate::Connection>,
         permit: Option<tokio::sync::OwnedSemaphorePermit>,

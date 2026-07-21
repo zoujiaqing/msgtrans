@@ -164,6 +164,11 @@ pub struct RequestRegistry {
     /// lifecycle-tracked requests (e.g. inbound server requests) have no waiter.
     waiters: DashMap<RequestKey, oneshot::Sender<Packet>>,
     session_index: DashMap<SessionId, DashSet<RequestKey>>,
+    /// Sessions whose close has begun. Registration re-checks this after
+    /// inserting into `session_index`, closing the window where a register
+    /// in flight during `close_session_pending` slips past the drain and
+    /// leaks a Pending entry. Markers are aged out by the timeout scanner.
+    closing_sessions: DashMap<SessionId, Instant>,
     counters: RequestCounters,
     buckets: Vec<std::sync::Mutex<Vec<RequestKey>>>,
     bucket_count: usize,
@@ -217,6 +222,7 @@ impl RequestRegistry {
             entries: DashMap::new(),
             waiters: DashMap::new(),
             session_index: DashMap::new(),
+            closing_sessions: DashMap::new(),
             counters: RequestCounters::default(),
             buckets,
             bucket_count: safe_bucket_count,
@@ -251,6 +257,13 @@ impl RequestRegistry {
         timeout: Duration,
         schedule: bool,
     ) -> bool {
+        // Refuse new requests for a session that is already closing.
+        if let Some(sid) = key.session_id {
+            if self.closing_sessions.contains_key(&sid) {
+                return false;
+            }
+        }
+
         let now = Instant::now();
         let entry = Arc::new(RequestEntry {
             key,
@@ -260,9 +273,21 @@ impl RequestRegistry {
             state: AtomicU8::new(RequestState::Pending as u8),
         });
 
+        // Counter goes up BEFORE the entry becomes visible, so a concurrent
+        // close that transitions the entry and decrements can never drive the
+        // counter below zero.
+        self.counters
+            .pending_requests
+            .fetch_add(1, Ordering::Relaxed);
+
         use dashmap::mapref::entry::Entry;
         match self.entries.entry(key) {
-            Entry::Occupied(_) => return false, // duplicate: refuse, do not replace
+            Entry::Occupied(_) => {
+                self.counters
+                    .pending_requests
+                    .fetch_sub(1, Ordering::Relaxed);
+                return false; // duplicate: refuse, do not replace
+            }
             Entry::Vacant(vacant) => {
                 vacant.insert(entry);
             }
@@ -271,11 +296,27 @@ impl RequestRegistry {
         if let Some(sid) = key.session_id {
             let set = self.session_index.entry(sid).or_default();
             set.insert(key);
+            drop(set);
+            // Re-check: if the session started closing between our first check
+            // and the index insert, its drain may have run before it could see
+            // this key. Undo, so no Pending entry outlives its session.
+            if self.closing_sessions.contains_key(&sid) {
+                if let Some(entry) = self.entries.get(&key) {
+                    if entry
+                        .try_transition(RequestState::Pending, RequestState::SessionClosed)
+                        .is_ok()
+                    {
+                        self.counters
+                            .pending_requests
+                            .fetch_sub(1, Ordering::Relaxed);
+                        drop(entry);
+                        self.remove_terminal_entry(key);
+                    }
+                }
+                return false;
+            }
         }
 
-        self.counters
-            .pending_requests
-            .fetch_add(1, Ordering::Relaxed);
         if schedule {
             self.schedule_for_deadline(key, now + timeout);
         }
@@ -310,6 +351,16 @@ impl RequestRegistry {
         }
         let (tx, rx) = oneshot::channel();
         self.waiters.insert(key, tx);
+        // If the session closed between register_impl and the waiter insert,
+        // the drain removed the entry but could not see this waiter — it would
+        // sit orphaned until the caller's own timeout. Detect and undo.
+        if self.entries.get(&key).is_none() {
+            self.waiters.remove(&key); // drops tx -> rx observes closure
+            return Err(DuplicateRequest {
+                session_id,
+                request_id,
+            });
+        }
         Ok(rx)
     }
 
@@ -449,6 +500,10 @@ impl RequestRegistry {
     }
 
     pub fn close_session_pending(&self, session_id: SessionId) -> usize {
+        // Mark first: registrations racing this drain either see the marker and
+        // refuse, or land in the index before the remove below and get drained.
+        self.closing_sessions.insert(session_id, Instant::now());
+
         let Some((_, ids)) = self.session_index.remove(&session_id) else {
             return 0;
         };
@@ -500,7 +555,17 @@ impl RequestRegistry {
         self.tick_duration
     }
 
+    /// How long a closing marker must outlive the close. Any registration
+    /// racing the close is an in-flight call, not minutes old, so this only
+    /// needs to be generous, not permanent — session ids are never reused.
+    const CLOSING_MARKER_TTL: Duration = Duration::from_secs(60);
+
     pub fn scan_timeout_bucket(&self) -> usize {
+        // Age out old closing markers so the map stays bounded.
+        let now = Instant::now();
+        self.closing_sessions
+            .retain(|_, closed_at| now.duration_since(*closed_at) < Self::CLOSING_MARKER_TTL);
+
         let next_tick = self.current_tick.fetch_add(1, Ordering::SeqCst) + 1;
         let bucket_idx = (next_tick as usize) % self.bucket_count;
         let mut drained = Vec::new();
@@ -848,6 +913,31 @@ mod tests {
         // The peer's response then completes the outbound normally.
         assert!(registry.complete_waiter(sid, 500, Packet::response(500, b"ok".to_vec())));
         assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn closing_session_refuses_new_registrations() {
+        // A register racing close_session_pending must not leak a Pending
+        // entry past the drain: once the closing marker is up, both the
+        // inbound and the waiter paths refuse.
+        let registry = RequestRegistry::new();
+        let sid = SessionId(300);
+
+        assert!(registry.register(1, Some(sid), 0, Duration::from_secs(5)));
+        assert_eq!(registry.close_session_pending(sid), 1);
+
+        assert!(
+            !registry.register(2, Some(sid), 0, Duration::from_secs(5)),
+            "inbound register on a closing session must be refused"
+        );
+        assert!(
+            registry
+                .try_register_waiter(3, Some(sid), 0, Duration::from_secs(5))
+                .is_err(),
+            "waiter register on a closing session must be refused"
+        );
+        assert_eq!(registry.pending_count(), 0);
+        assert_eq!(registry.active_len(), 0);
     }
 
     #[test]

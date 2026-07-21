@@ -79,6 +79,26 @@ impl TransportServerBuilder {
         self,
         handler: std::sync::Arc<dyn super::session_actor::SessionHandler>,
     ) -> Result<TransportServer, TransportError> {
+        // Validate the cap up front: 0 would mean "reject every connection"
+        // (surely a config mistake), and values above Semaphore::MAX_PERMITS
+        // would otherwise be silently truncated so logs and behaviour disagree.
+        if let Some(max) = self.max_connections {
+            if max == 0 {
+                return Err(TransportError::config_error(
+                    "max_connections",
+                    "must be at least 1 (0 would reject every connection)",
+                ));
+            }
+            if max > tokio::sync::Semaphore::MAX_PERMITS {
+                return Err(TransportError::config_error(
+                    "max_connections",
+                    format!(
+                        "exceeds the maximum supported value {}",
+                        tokio::sync::Semaphore::MAX_PERMITS
+                    ),
+                ));
+            }
+        }
         let transport_server = super::transport_server::TransportServer::new(
             self.transport_config.clone(),
             self.protocol_configs,
