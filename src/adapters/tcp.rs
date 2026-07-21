@@ -331,8 +331,8 @@ impl OptimizedReadBuffer {
 
 /// TCP protocol adapter - event-driven version
 pub struct TcpAdapter<C> {
-    /// Session ID (using atomic type for event loop access)
-    session_id: Arc<std::sync::atomic::AtomicU64>,
+    /// Connection liveness + session id, shared with the event loop.
+    state: crate::adapters::core::ConnState,
     /// Configuration
     config: C,
     /// Statistics
@@ -367,7 +367,9 @@ impl<C> TcpAdapter<C> {
         connection_info.state = ConnectionState::Connected;
         connection_info.established_at = std::time::SystemTime::now();
 
-        let session_id = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // The stream is already established when this adapter is created.
+        let state =
+            crate::adapters::core::ConnState::new(crate::adapters::core::ConnStatus::Connected);
 
         let (send_queue_tx, send_queue_rx) = mpsc::channel(SEND_QUEUE_CAPACITY);
         let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel();
@@ -376,7 +378,7 @@ impl<C> TcpAdapter<C> {
 
         let event_loop_handle = Self::start_event_loop(
             stream,
-            session_id.clone(),
+            state.clone(),
             send_queue_rx,
             shutdown_rx,
             event_sender.clone(),
@@ -385,7 +387,7 @@ impl<C> TcpAdapter<C> {
         .await;
 
         Ok(Self {
-            session_id,
+            state,
             config,
             stats: AdapterStats::new(),
             connection_info,
@@ -405,15 +407,14 @@ impl<C> TcpAdapter<C> {
 
     async fn start_event_loop(
         stream: TcpStream,
-        session_id: Arc<std::sync::atomic::AtomicU64>,
+        state: crate::adapters::core::ConnState,
         mut send_queue: mpsc::Receiver<Packet>,
         mut shutdown_signal: mpsc::UnboundedReceiver<()>,
         event_sender: broadcast::Sender<TransportEvent>,
         memory_pool: Arc<OptimizedMemoryPool>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            let current_session_id =
-                SessionId(session_id.load(std::sync::atomic::Ordering::SeqCst));
+            let current_session_id = state.session_id();
             tracing::debug!(
                 "[START] TCP event loop started (session: {})",
                 current_session_id
@@ -424,8 +425,7 @@ impl<C> TcpAdapter<C> {
 
             'event_loop: loop {
                 // Get current session ID
-                let current_session_id =
-                    SessionId(session_id.load(std::sync::atomic::Ordering::SeqCst));
+                let current_session_id = state.session_id();
 
                 tokio::select! {
                     // [RECV] Handle receive data - using optimized buffer method
@@ -526,6 +526,10 @@ impl<C> TcpAdapter<C> {
                 }
             }
 
+            // The loop has ended (peer close, error, or shutdown): mark closed so
+            // is_connected() reflects reality, not just what close() sets.
+            state.set_status(crate::adapters::core::ConnStatus::Closed);
+
             tracing::debug!(
                 "[SUCCESS] TCP event loop ended (session: {})",
                 current_session_id
@@ -594,18 +598,19 @@ impl<C: Send + Sync + 'static> Connection for TcpAdapter<C> {
         if let Some(handle) = self.event_loop_handle.take() {
             let _ = handle.await;
         }
+        self.state
+            .set_status(crate::adapters::core::ConnStatus::Closed);
         self.connection_info.state = ConnectionState::Closed;
         self.connection_info.closed_at = Some(std::time::SystemTime::now());
         Ok(())
     }
 
     fn session_id(&self) -> SessionId {
-        SessionId(self.session_id.load(std::sync::atomic::Ordering::SeqCst))
+        self.state.session_id()
     }
 
     fn set_session_id(&mut self, session_id: SessionId) {
-        self.session_id
-            .store(session_id.0, std::sync::atomic::Ordering::SeqCst);
+        self.state.set_session_id(session_id);
         self.connection_info.session_id = session_id;
     }
 
@@ -614,7 +619,7 @@ impl<C: Send + Sync + 'static> Connection for TcpAdapter<C> {
     }
 
     fn is_connected(&self) -> bool {
-        self.connection_info.state == ConnectionState::Connected
+        self.state.is_connected()
     }
 
     async fn flush(&mut self) -> Result<(), TransportError> {

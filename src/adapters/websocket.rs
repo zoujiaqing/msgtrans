@@ -68,8 +68,8 @@ impl From<WebSocketError> for TransportError {
 
 /// WebSocket protocol adapter - event-driven version
 pub struct WebSocketAdapter<C> {
-    /// Session ID (using atomic type for event loop access)
-    session_id: Arc<std::sync::atomic::AtomicU64>,
+    /// Connection liveness + session id, shared with the event loop.
+    state: crate::adapters::core::ConnState,
     /// Configuration
     config: C,
     /// Statistics information
@@ -84,8 +84,6 @@ pub struct WebSocketAdapter<C> {
     shutdown_sender: mpsc::UnboundedSender<()>,
     /// Event loop handle
     event_loop_handle: Option<tokio::task::JoinHandle<()>>,
-    /// Connection status
-    is_connected: Arc<std::sync::atomic::AtomicBool>,
     /// Frame decode policy (0=Lenient, 1=Strict), shared with the event loop.
     frame_policy: Arc<std::sync::atomic::AtomicU8>,
 }
@@ -97,7 +95,9 @@ impl<C> WebSocketAdapter<C> {
         let (shutdown_tx, _) = mpsc::unbounded_channel();
 
         Self {
-            session_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            state: crate::adapters::core::ConnState::new(
+                crate::adapters::core::ConnStatus::Connecting,
+            ),
             config,
             stats: AdapterStats::new(),
             connection_info: ConnectionInfo::default(),
@@ -105,7 +105,6 @@ impl<C> WebSocketAdapter<C> {
             event_sender,
             shutdown_sender: shutdown_tx,
             event_loop_handle: None,
-            is_connected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             frame_policy: Arc::new(std::sync::atomic::AtomicU8::new(
                 crate::packet::FramePolicy::Lenient as u8,
             )),
@@ -123,8 +122,9 @@ impl<C> WebSocketAdapter<C> {
         connection_info.state = ConnectionState::Connected;
         connection_info.established_at = std::time::SystemTime::now();
 
-        let session_id = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let is_connected = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        // The stream is already established when this adapter is created.
+        let state =
+            crate::adapters::core::ConnState::new(crate::adapters::core::ConnStatus::Connected);
         let frame_policy = Arc::new(std::sync::atomic::AtomicU8::new(
             crate::packet::FramePolicy::Lenient as u8,
         ));
@@ -136,8 +136,7 @@ impl<C> WebSocketAdapter<C> {
         // Start event loop
         let event_loop_handle = Self::start_event_loop(
             stream,
-            session_id.clone(),
-            is_connected.clone(),
+            state.clone(),
             send_queue_rx,
             shutdown_rx,
             event_sender.clone(),
@@ -146,7 +145,7 @@ impl<C> WebSocketAdapter<C> {
         .await;
 
         Ok(Self {
-            session_id,
+            state,
             config,
             stats: AdapterStats::new(),
             connection_info,
@@ -154,7 +153,6 @@ impl<C> WebSocketAdapter<C> {
             event_sender,
             shutdown_sender: shutdown_tx,
             event_loop_handle: Some(event_loop_handle),
-            is_connected,
             frame_policy,
         })
     }
@@ -167,16 +165,14 @@ impl<C> WebSocketAdapter<C> {
     /// Start event loop based on tokio::select!
     async fn start_event_loop(
         mut stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
-        session_id: Arc<std::sync::atomic::AtomicU64>,
-        is_connected: Arc<std::sync::atomic::AtomicBool>,
+        state: crate::adapters::core::ConnState,
         mut send_queue: mpsc::Receiver<Packet>,
         mut shutdown_signal: mpsc::UnboundedReceiver<()>,
         event_sender: broadcast::Sender<TransportEvent>,
         frame_policy: Arc<std::sync::atomic::AtomicU8>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            let current_session_id =
-                SessionId(session_id.load(std::sync::atomic::Ordering::SeqCst));
+            let current_session_id = state.session_id();
             tracing::debug!(
                 "[START] WebSocket event loop started (session: {})",
                 current_session_id
@@ -184,8 +180,7 @@ impl<C> WebSocketAdapter<C> {
 
             loop {
                 // Get current session ID
-                let current_session_id =
-                    SessionId(session_id.load(std::sync::atomic::Ordering::SeqCst));
+                let current_session_id = state.session_id();
 
                 tokio::select! {
                     // [RECV] Handle incoming data
@@ -219,7 +214,7 @@ impl<C> WebSocketAdapter<C> {
                                         } else {
                                             tracing::debug!("[CLOSE] Notified upper layer connection closed: session {}", current_session_id);
                                         }
-                                        is_connected.store(false, std::sync::atomic::Ordering::SeqCst);
+                                        state.set_status(crate::adapters::core::ConnStatus::Closed);
                                         break;
                                     }
                                     MessageProcessResult::Error(e) => {
@@ -232,7 +227,7 @@ impl<C> WebSocketAdapter<C> {
                                         } else {
                                             tracing::debug!("[ERROR] Notified upper layer message processing error: session {}", current_session_id);
                                         }
-                                        is_connected.store(false, std::sync::atomic::Ordering::SeqCst);
+                                        state.set_status(crate::adapters::core::ConnStatus::Closed);
                                         break;
                                     }
                                 }
@@ -262,7 +257,7 @@ impl<C> WebSocketAdapter<C> {
                                 } else {
                                     tracing::debug!("[CLOSE] Notified upper layer connection closed: session {}", current_session_id);
                                 }
-                                is_connected.store(false, std::sync::atomic::Ordering::SeqCst);
+                                state.set_status(crate::adapters::core::ConnStatus::Closed);
                                 break;
                             }
                             None => {
@@ -275,7 +270,7 @@ impl<C> WebSocketAdapter<C> {
                                 } else {
                                     tracing::debug!("[CLOSE] Notified upper layer connection closed: session {}", current_session_id);
                                 }
-                                is_connected.store(false, std::sync::atomic::Ordering::SeqCst);
+                                state.set_status(crate::adapters::core::ConnStatus::Closed);
                                 break;
                             }
                         }
@@ -309,7 +304,7 @@ impl<C> WebSocketAdapter<C> {
                                     } else {
                                         tracing::debug!("[ERROR] Notified upper layer send error: session {}", current_session_id);
                                     }
-                                    is_connected.store(false, std::sync::atomic::Ordering::SeqCst);
+                                    state.set_status(crate::adapters::core::ConnStatus::Closed);
                                     break;
                                 }
                             }
@@ -423,8 +418,7 @@ impl<C: Send + Sync + 'static> Connection for WebSocketAdapter<C> {
     }
 
     async fn close(&mut self) -> Result<(), TransportError> {
-        let current_session_id =
-            SessionId(self.session_id.load(std::sync::atomic::Ordering::SeqCst));
+        let current_session_id = self.state.session_id();
         tracing::debug!(
             "[CLOSE] Close WebSocket connection (session: {})",
             current_session_id
@@ -436,18 +430,17 @@ impl<C: Send + Sync + 'static> Connection for WebSocketAdapter<C> {
             let _ = handle.await;
         }
 
-        self.is_connected
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.state
+            .set_status(crate::adapters::core::ConnStatus::Closed);
         Ok(())
     }
 
     fn session_id(&self) -> SessionId {
-        SessionId(self.session_id.load(std::sync::atomic::Ordering::SeqCst))
+        self.state.session_id()
     }
 
     fn set_session_id(&mut self, session_id: SessionId) {
-        self.session_id
-            .store(session_id.0, std::sync::atomic::Ordering::SeqCst);
+        self.state.set_session_id(session_id);
     }
 
     fn connection_info(&self) -> ConnectionInfo {
@@ -455,7 +448,7 @@ impl<C: Send + Sync + 'static> Connection for WebSocketAdapter<C> {
     }
 
     fn is_connected(&self) -> bool {
-        self.is_connected.load(std::sync::atomic::Ordering::SeqCst)
+        self.state.is_connected()
     }
 
     async fn flush(&mut self) -> Result<(), TransportError> {
