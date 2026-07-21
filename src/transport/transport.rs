@@ -107,7 +107,7 @@ impl Transport {
         }
 
         tracing::info!("[CONN] Starting graceful session shutdown: {}", session_id);
-        let failed_pending = self.request_registry.abort_all();
+        let failed_pending = self.request_registry.close_session_pending(session_id);
         if failed_pending > 0 {
             tracing::debug!(
                 "[REQUEST] Failed {} pending requests during session {} shutdown",
@@ -141,7 +141,7 @@ impl Transport {
         }
 
         tracing::info!("[CONN] Force closing session: {}", session_id);
-        let failed_pending = self.request_registry.abort_all();
+        let failed_pending = self.request_registry.close_session_pending(session_id);
         if failed_pending > 0 {
             tracing::debug!(
                 "[REQUEST] Failed {} pending requests during session {} force close",
@@ -245,6 +245,12 @@ impl Transport {
             .connection_epoch
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             + 1;
+        // Generation-scoped identity: protocol configs pass a fixed session id
+        // (SessionId(1)), which would collide across reconnects and let a stale
+        // generation's teardown touch the new generation's requests. The epoch
+        // IS the session id, so every effect keyed by session is generation-
+        // scoped by construction.
+        let session_id = SessionId::new(epoch);
         if let Some(mut pipe) = event_pipe_opt {
             // Bounded backbone: single-consumer queue with backpressure; the
             // pipe ends with exactly one ConnectionClosed.
@@ -274,14 +280,10 @@ impl Transport {
                     strong.on_event(event).await;
                 }
                 let Some(strong) = this.upgrade() else { return };
-                if strong
-                    .connection_epoch
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                    != epoch
-                {
-                    return; // stale teardown must not abort the new connection
-                }
-                let failed_pending = strong.request_registry.abort_all();
+                // Generation-scoped teardown: closes only THIS connection's
+                // session, so even a late-running stale task cannot cancel the
+                // replacement generation's requests (its session id differs).
+                let failed_pending = strong.request_registry.close_session_pending(session_id);
                 if failed_pending > 0 {
                     tracing::debug!(
                         "[REQUEST] Failed {} pending requests after event pipe ended (session: {})",
@@ -493,14 +495,10 @@ impl Transport {
                 }
             }
             crate::event::TransportEvent::ConnectionClosed { reason } => {
-                let failed_pending = self.request_registry.abort_all();
-                if failed_pending > 0 {
-                    tracing::debug!(
-                        "[REQUEST] Failed {} pending requests after connection closed: {:?}",
-                        failed_pending,
-                        reason
-                    );
-                }
+                // Request cleanup is generation-scoped and owned by the pipe
+                // consumer's teardown (close_session_pending on its own
+                // session); a global abort here could cancel a newer
+                // generation's requests.
                 self.forward_client_event(crate::event::TransportEvent::ConnectionClosed {
                     reason,
                 })

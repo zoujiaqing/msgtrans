@@ -220,8 +220,18 @@ async fn same_client_reconnects_and_still_delivers() {
 
     client.connect().await.expect("first connect");
     client.send(b"one".as_slice()).await.expect("send 1");
+    // Wait for the server to confirm delivery before disconnecting, so this
+    // test isolates the reconnect regression from graceful-flush timing
+    // (which deserves its own test).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while seen.load(Ordering::Relaxed) < 1 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "first message never reached the server"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     client.disconnect().await.expect("disconnect");
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     client.connect().await.expect("second connect must succeed");
     client
