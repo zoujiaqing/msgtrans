@@ -48,11 +48,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     tracing::info!("[START] Starting to listen for events...");
-    let mut events = transport.subscribe_events();
+    let mut events = transport.events().await?;
 
     // [TARGET] Process events in parallel to avoid blocking
     let event_task = tokio::spawn(async move {
-        while let Ok(event) = events.recv().await {
+        while let Some(event) = events.next().await {
             match event {
                 ClientEvent::Connected { info } => {
                     tracing::info!(

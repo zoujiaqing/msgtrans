@@ -523,7 +523,9 @@ async fn run_client(
     tracing::debug!("[Client {}] Connected", client_id);
 
     // Subscribe to events
-    let mut events = transport.subscribe_events();
+    let Ok(mut events) = transport.events().await else {
+        return;
+    };
     let stats_clone = stats.clone();
     let running_clone = running.clone();
 
@@ -535,19 +537,17 @@ async fn run_client(
             }
 
             // Use select! to handle events without timeout blocking
-            match events.recv().await {
-                Ok(event) => match event {
-                    ClientEvent::MessageReceived(context) => {
-                        stats_clone.record_receive(context.data.len() as u64);
-                    }
-                    ClientEvent::Disconnected { .. } => break,
-                    ClientEvent::Error { .. } => {
-                        stats_clone.record_error();
-                        break;
-                    }
-                    _ => {}
-                },
-                Err(_) => break,
+            match events.next().await {
+                Some(ClientEvent::MessageReceived(context)) => {
+                    stats_clone.record_receive(context.data.len() as u64);
+                }
+                Some(ClientEvent::Disconnected { .. }) => break,
+                Some(ClientEvent::Error { .. }) => {
+                    stats_clone.record_error();
+                    break;
+                }
+                Some(_) => {}
+                None => break,
             }
         }
     });

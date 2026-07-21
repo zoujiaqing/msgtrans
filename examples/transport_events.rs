@@ -114,14 +114,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()
         .await?;
 
-    let mut client_events = client.subscribe_events();
+    let mut client_events = client.events().await?;
 
     // Client event handling
     let client_task = tokio::spawn(async move {
         println!("[START] Client event handling started");
         let mut event_count = 0;
 
-        while let Ok(event) = client_events.recv().await {
+        while let Some(event) = client_events.next().await {
             event_count += 1;
             println!("[RECV] Client event #{}: {:?}", event_count, event);
 

@@ -373,13 +373,6 @@ impl StreamFactory {
     ) -> PacketStream {
         PacketStream::with_session_filter(receiver, session_id)
     }
-
-    /// Create client event stream (hide session ID)
-    pub fn client_event_stream(
-        receiver: tokio::sync::broadcast::Receiver<crate::event::TransportEvent>,
-    ) -> ClientEventStream {
-        ClientEventStream::new(receiver)
-    }
 }
 
 /// Stream combinator
@@ -445,81 +438,28 @@ impl ReceiverExt for broadcast::Receiver<TransportEvent> {
     }
 }
 
-/// Client event stream - hides session ID concept
-pub struct ClientEventStream {
-    inner: tokio::sync::broadcast::Receiver<crate::event::TransportEvent>,
+/// Client event stream — the single consumer of a client's events.
+///
+/// Backed by a bounded queue rather than a broadcast channel: a client has one
+/// connection and one consumer, so there is nothing to fan out to, and a
+/// bounded queue backpressures a slow consumer instead of silently skipping
+/// events the way a lagging broadcast receiver would.
+pub struct ClientEvents {
+    inner: tokio::sync::mpsc::Receiver<crate::event::ClientEvent>,
 }
 
-impl ClientEventStream {
-    /// Create new client event stream
-    pub fn new(receiver: tokio::sync::broadcast::Receiver<crate::event::TransportEvent>) -> Self {
+impl ClientEvents {
+    pub(crate) fn new(receiver: tokio::sync::mpsc::Receiver<crate::event::ClientEvent>) -> Self {
         Self { inner: receiver }
     }
 
-    /// Receive next client event
-    pub async fn next(
-        &mut self,
-    ) -> Result<crate::event::ClientEvent, crate::error::TransportError> {
-        loop {
-            match self.inner.recv().await {
-                Ok(transport_event) => {
-                    // Convert to client event, filter out irrelevant events
-                    if let Some(client_event) =
-                        crate::event::ClientEvent::from_transport_event(transport_event)
-                    {
-                        return Ok(client_event);
-                    }
-                    // If it's an irrelevant event, continue looping to wait for next event
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    return Err(crate::error::TransportError::connection_error(
-                        "Event stream closed",
-                        false,
-                    ));
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    tracing::warn!(
-                        "[STREAM] ClientEventStream lagged, skipped {} transport events",
-                        skipped
-                    );
-                    continue;
-                }
-            }
-        }
+    /// Receive the next event, or `None` once the client has shut down.
+    pub async fn next(&mut self) -> Option<crate::event::ClientEvent> {
+        self.inner.recv().await
     }
 
-    /// Try to receive event (non-blocking)
-    pub fn try_next(
-        &mut self,
-    ) -> Result<Option<crate::event::ClientEvent>, crate::error::TransportError> {
-        loop {
-            match self.inner.try_recv() {
-                Ok(transport_event) => {
-                    // Convert to client event, filter out irrelevant events
-                    if let Some(client_event) =
-                        crate::event::ClientEvent::from_transport_event(transport_event)
-                    {
-                        return Ok(Some(client_event));
-                    }
-                    // If it's an irrelevant event, continue looping
-                }
-                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
-                    return Ok(None);
-                }
-                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
-                    return Err(crate::error::TransportError::connection_error(
-                        "Event stream closed",
-                        false,
-                    ));
-                }
-                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
-                    tracing::warn!(
-                        "[STREAM] ClientEventStream lagged, skipped {} transport events",
-                        skipped
-                    );
-                    continue;
-                }
-            }
-        }
+    /// Receive an event if one is already queued, without waiting.
+    pub fn try_next(&mut self) -> Option<crate::event::ClientEvent> {
+        self.inner.try_recv().ok()
     }
 }

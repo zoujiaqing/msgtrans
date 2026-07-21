@@ -261,10 +261,18 @@ pub struct TransportClient {
     frame_policy: crate::packet::FramePolicy,
     // [TARGET] Current connection session ID - Uses Arc<RwLock> for modification
     current_session_id: Arc<RwLock<Option<SessionId>>>,
-    event_sender: tokio::sync::broadcast::Sender<crate::event::ClientEvent>,
+    /// Client events go to a single consumer over a bounded channel: a client
+    /// has exactly one connection, so there is nothing to fan out to, and a
+    /// bounded queue means a slow consumer is throttled rather than silently
+    /// skipped the way a broadcast lag would skip it.
+    event_sender: tokio::sync::mpsc::Sender<crate::event::ClientEvent>,
+    event_receiver: Arc<RwLock<Option<tokio::sync::mpsc::Receiver<crate::event::ClientEvent>>>>,
     event_forwarding_running: Arc<AtomicBool>,
     event_forwarding_task: Arc<RwLock<Option<JoinHandle<()>>>>,
 }
+
+/// Capacity of the client event queue.
+const CLIENT_EVENT_QUEUE: usize = 8192;
 
 impl TransportClient {
     pub(crate) fn new(
@@ -273,13 +281,15 @@ impl TransportClient {
         protocol_config: Option<Box<dyn DynClientConfig>>,
         frame_policy: crate::packet::FramePolicy,
     ) -> Self {
+        let (event_sender, event_receiver) = tokio::sync::mpsc::channel(CLIENT_EVENT_QUEUE);
         Self {
             inner: Arc::new(transport),
             retry_config,
             protocol_config,
             frame_policy,
             current_session_id: Arc::new(RwLock::new(None)),
-            event_sender: tokio::sync::broadcast::channel(8192).0,
+            event_sender,
+            event_receiver: Arc::new(RwLock::new(Some(event_receiver))),
             event_forwarding_running: Arc::new(AtomicBool::new(false)),
             event_forwarding_task: Arc::new(RwLock::new(None)),
         }
@@ -557,29 +567,20 @@ impl TransportClient {
         self.inner.current_session_id().await
     }
 
-    /// Get client event stream - Returns event stream for current connection (hides session ID)
-    pub async fn events(&self) -> Result<crate::stream::ClientEventStream, TransportError> {
-        use crate::stream::StreamFactory;
-
-        // Check if connected
-        if !self.is_connected().await {
-            return Err(TransportError::connection_error(
-                "Not connected - call connect() first",
+    /// Take this client's event stream.
+    ///
+    /// A client owns a single connection, so the stream has a single consumer
+    /// and can only be taken once; a second call returns an error. Take it
+    /// *before* `connect()` so no event is missed, and keep consuming it —
+    /// the queue is bounded, so a stalled consumer backpressures the
+    /// connection instead of losing events.
+    pub async fn events(&self) -> Result<crate::stream::ClientEvents, TransportError> {
+        match self.event_receiver.write().await.take() {
+            Some(rx) => Ok(crate::stream::ClientEvents::new(rx)),
+            None => Err(TransportError::connection_error(
+                "Client event stream already taken - it has a single consumer",
                 false,
-            ));
-        }
-
-        // [FIX] Fix: Use Transport's event stream directly, no longer depends on session ID
-        if let Some(event_receiver) = self.inner.get_event_stream().await {
-            tracing::debug!("[SUCCESS] TransportClient got connection adapter event stream");
-            tracing::debug!("[STREAM] TransportClient client event stream created");
-            return Ok(StreamFactory::client_event_stream(event_receiver));
-        } else {
-            // If event stream cannot be obtained, return error
-            return Err(TransportError::connection_error(
-                "Connection does not support event streams",
-                false,
-            ));
+            )),
         }
     }
 
@@ -596,11 +597,6 @@ impl TransportClient {
             "Stats not implemented for Transport yet",
             false,
         ))
-    }
-
-    /// Business layer subscribe to ClientEvent
-    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<crate::event::ClientEvent> {
-        self.event_sender.subscribe()
     }
 
     /// [START] Start event forwarding task
@@ -682,11 +678,11 @@ impl TransportClient {
                                 client_event
                             );
 
-                            if let Err(e) = client_event_sender.send(client_event) {
-                                tracing::warn!(
-                                    "[WARNING] TransportClient event forwarding failed: {:?}",
-                                    e
+                            if client_event_sender.send(client_event).await.is_err() {
+                                tracing::debug!(
+                                    "[END] Client event consumer dropped, stopping forwarding"
                                 );
+                                break;
                             }
                         }
                         _ => {
@@ -699,11 +695,11 @@ impl TransportClient {
                                     client_event
                                 );
 
-                                if let Err(e) = client_event_sender.send(client_event) {
-                                    tracing::warn!(
-                                        "[WARNING] TransportClient event forwarding failed: {:?}",
-                                        e
+                                if client_event_sender.send(client_event).await.is_err() {
+                                    tracing::debug!(
+                                        "[END] Client event consumer dropped, stopping forwarding"
                                     );
+                                    break;
                                 }
                             } else {
                                 tracing::debug!(

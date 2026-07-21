@@ -41,7 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Get event stream
-    let mut event_stream = transport.subscribe_events();
+    let mut event_stream = transport.events().await?;
 
     // [ASYNC] Critical fix: start event handling task to run in parallel with sending
     let event_handle = tokio::spawn(async move {
@@ -49,7 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("[START] Starting to listen for events...");
         let mut event_count = 0;
 
-        while let Ok(event) = event_stream.recv().await {
+        while let Some(event) = event_stream.next().await {
             event_count += 1;
 
             match event {

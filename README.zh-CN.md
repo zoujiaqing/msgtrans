@@ -128,9 +128,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 消费事件
-    let mut events = client.subscribe_events();
+    let mut events = client.events().await?;
     tokio::spawn(async move {
-        while let Ok(event) = events.recv().await {
+        while let Some(event) = events.next().await {
             match event {
                 ClientEvent::MessageReceived(context) => {
                     println!("收到: {}", String::from_utf8_lossy(&context.data));

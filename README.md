@@ -128,10 +128,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Request timed out");
     }
 
-    // Consume events.
-    let mut events = client.subscribe_events();
+    // Consume events. The stream has a single consumer and is taken once.
+    let mut events = client.events().await?;
     tokio::spawn(async move {
-        while let Ok(event) = events.recv().await {
+        while let Some(event) = events.next().await {
             match event {
                 ClientEvent::MessageReceived(context) => {
                     println!("Received: {}", String::from_utf8_lossy(&context.data));
