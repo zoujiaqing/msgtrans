@@ -63,6 +63,11 @@ pub trait SessionHandler: Send + Sync + 'static {
         let _ = (session_id, info); // Default: no-op
     }
 
+    /// Called once a packet has been handed to the connection for sending
+    async fn on_message_sent(&self, session_id: SessionId, message_id: u32) {
+        let _ = (session_id, message_id); // Default: no-op
+    }
+
     /// Called when a session is closed
     async fn on_disconnected(&self, session_id: SessionId, reason: crate::error::CloseReason) {
         let _ = (session_id, reason); // Default: no-op
@@ -420,11 +425,9 @@ impl SessionActor {
                                     .await;
                             }
                             TransportEvent::MessageSent { packet_id } => {
-                                tracing::trace!(
-                                    "[ACTOR] Message {} sent for session {}",
-                                    packet_id,
-                                    self.session_id
-                                );
+                                self.handler
+                                    .on_message_sent(self.session_id, packet_id)
+                                    .await;
                             }
                             TransportEvent::ConnectionClosed { reason } => {
                                 tracing::debug!(
