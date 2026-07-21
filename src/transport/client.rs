@@ -484,7 +484,9 @@ impl TransportClient {
         // Get Transport's event stream
         if let Some(mut transport_events) = self.inner.get_event_stream().await {
             let client_event_sender = self.event_sender.clone();
-            let transport_for_response = self.inner.clone();
+            // Weak: the forwarding task must not keep the Transport (and thus
+            // the socket/session) alive after the client is dropped.
+            let transport_for_response = Arc::downgrade(&self.inner);
             let forwarding_running = self.event_forwarding_running.clone();
 
             // Start forwarding task
@@ -520,6 +522,17 @@ impl TransportClient {
                                     > {
                                         let transport = transport.clone();
                                         Box::pin(async move {
+                                            // Upgrade only for the send: the
+                                            // responder must not keep the
+                                            // Transport alive either.
+                                            let Some(transport) = transport.upgrade() else {
+                                                return Err(
+                                                    crate::error::TransportError::connection_error(
+                                                        "Client dropped before response",
+                                                        false,
+                                                    ),
+                                                );
+                                            };
                                             let response_packet = crate::packet::Packet {
                                                 header: crate::packet::FixedHeader {
                                                     version: 1,

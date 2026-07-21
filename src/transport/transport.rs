@@ -29,6 +29,11 @@ pub struct Transport {
     client_events_tx: mpsc::Sender<TransportEvent>,
     client_events_rx: Arc<Mutex<Option<mpsc::Receiver<TransportEvent>>>>,
     request_registry: Arc<crate::transport::request_registry::RequestRegistry>,
+    /// Monotonic connection generation. Each set_connection bumps it; the
+    /// per-connection pipe consumer only acts while its epoch is current, so
+    /// a stale connection's delayed events (in particular ConnectionClosed ->
+    /// abort_all) cannot cancel the replacement connection's requests.
+    connection_epoch: Arc<std::sync::atomic::AtomicU64>,
 }
 /// Fallback lifecycle deadline for waiter-based requests. The real timeout is
 /// enforced by the caller (tokio::time::timeout); this only bounds the entry if
@@ -48,6 +53,7 @@ impl Transport {
             client_events_tx,
             client_events_rx: Arc::new(Mutex::new(Some(client_events_rx))),
             request_registry: Arc::new(crate::transport::request_registry::RequestRegistry::new()),
+            connection_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -235,19 +241,47 @@ impl Transport {
         self.request_registry.open_session(session_id);
         tracing::debug!("[SUCCESS] Transport connection set: {}", session_id);
 
+        let epoch = self
+            .connection_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
         if let Some(mut pipe) = event_pipe_opt {
             // Bounded backbone: single-consumer queue with backpressure; the
             // pipe ends with exactly one ConnectionClosed.
-            let this = Arc::clone(self);
+            //
+            // Weak, not Arc: a strong reference here would cycle (task ->
+            // Transport -> sender feeding this task), so dropping the client
+            // would leak the task, socket, server session and permit forever.
+            let this = Arc::downgrade(self);
             tokio::spawn(async move {
                 tracing::debug!(
-                    "[LISTEN] Transport event consumer started (pipe, session: {})",
-                    session_id
+                    "[LISTEN] Transport event consumer started (pipe, session: {}, epoch: {})",
+                    session_id,
+                    epoch
                 );
                 while let Some(event) = pipe.next().await {
-                    this.on_event(event).await;
+                    let Some(strong) = this.upgrade() else { break };
+                    // Stale-generation guard: after a reconnect installed a new
+                    // connection, this task's remaining events (including its
+                    // ConnectionClosed) must not touch shared state.
+                    if strong
+                        .connection_epoch
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                        != epoch
+                    {
+                        break;
+                    }
+                    strong.on_event(event).await;
                 }
-                let failed_pending = this.request_registry.abort_all();
+                let Some(strong) = this.upgrade() else { return };
+                if strong
+                    .connection_epoch
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    != epoch
+                {
+                    return; // stale teardown must not abort the new connection
+                }
+                let failed_pending = strong.request_registry.abort_all();
                 if failed_pending > 0 {
                     tracing::debug!(
                         "[REQUEST] Failed {} pending requests after event pipe ended (session: {})",
@@ -256,8 +290,9 @@ impl Transport {
                     );
                 }
                 tracing::debug!(
-                    "[LISTEN] Transport event consumer ended (pipe, session: {})",
-                    session_id
+                    "[LISTEN] Transport event consumer ended (pipe, session: {}, epoch: {})",
+                    session_id,
+                    epoch
                 );
             });
         }
@@ -651,6 +686,7 @@ impl Clone for Transport {
             client_events_tx: self.client_events_tx.clone(),
             client_events_rx: self.client_events_rx.clone(),
             request_registry: self.request_registry.clone(),
+            connection_epoch: self.connection_epoch.clone(),
         }
     }
 }
