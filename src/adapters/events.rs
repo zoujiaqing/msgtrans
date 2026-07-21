@@ -68,9 +68,16 @@ impl EventPipe {
     /// and immune to data-queue pressure. The adapter should drop the pipe
     /// (or let its tasks end) afterwards so the consumer sees end-of-data.
     pub fn close(&self, reason: CloseReason) {
-        // send_replace, not send: the watch must update even if the consumer
-        // has not subscribed yet or has already dropped.
-        let _ = self.close_tx.send_replace(Some(reason));
+        // First-wins: an Error reason must not be overwritten by a later
+        // Normal from another task's teardown path.
+        self.close_tx.send_if_modified(|cur| {
+            if cur.is_none() {
+                *cur = Some(reason);
+                true
+            } else {
+                false
+            }
+        });
     }
 }
 
@@ -79,18 +86,36 @@ impl EventPipeRx {
     /// `ConnectionClosed` (reason from the control plane, or an abnormal-end
     /// reason if the adapter died without closing), then `None` forever.
     pub async fn next(&mut self) -> Option<TransportEvent> {
-        if let Some(event) = self.data_rx.recv().await {
-            return Some(event);
+        loop {
+            tokio::select! {
+                biased;
+                event = self.data_rx.recv() => {
+                    if let Some(event) = event {
+                        return Some(event);
+                    }
+                    // Data channel done (senders gone, or close() below shut
+                    // intake and the queue is drained): terminal close, once.
+                    if self.close_emitted {
+                        return None;
+                    }
+                    self.close_emitted = true;
+                    let reason = self.close_rx.borrow().clone().unwrap_or_else(|| {
+                        CloseReason::Error("connection ended without close".to_string())
+                    });
+                    return Some(TransportEvent::ConnectionClosed { reason });
+                }
+                _ = self.close_rx.changed(), if !self.close_emitted => {
+                    if self.close_rx.borrow().is_some() {
+                        // Control plane fired: this is what makes close() an
+                        // actual wakeup and not just a note read at end-of-data.
+                        // Refuse new intake, drain what is queued (recv keeps
+                        // yielding buffered items after close()), then the recv
+                        // arm above emits the terminal close.
+                        self.data_rx.close();
+                    }
+                }
+            }
         }
-        if self.close_emitted {
-            return None;
-        }
-        self.close_emitted = true;
-        let reason =
-            self.close_rx.borrow().clone().unwrap_or_else(|| {
-                CloseReason::Error("connection ended without close".to_string())
-            });
-        Some(TransportEvent::ConnectionClosed { reason })
     }
 }
 
@@ -143,6 +168,48 @@ mod tests {
             rx.next().await,
             Some(TransportEvent::ConnectionClosed {
                 reason: CloseReason::Timeout
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn close_alone_wakes_an_idle_consumer_without_dropping_the_sender() {
+        let (tx, mut rx) = event_pipe(4);
+        assert!(tx.deliver(msg(1)).await);
+        let handle = tokio::spawn(async move {
+            let mut got = Vec::new();
+            while let Some(ev) = rx.next().await {
+                got.push(ev);
+            }
+            got
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Sender stays alive: only the control plane ends the stream.
+        tx.close(CloseReason::Normal);
+        let got = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("close alone must wake the consumer")
+            .unwrap();
+        assert_eq!(got.len(), 2, "queued data then exactly one close");
+        assert!(matches!(
+            got[1],
+            TransportEvent::ConnectionClosed {
+                reason: CloseReason::Normal
+            }
+        ));
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn close_reason_is_first_wins() {
+        let (tx, mut rx) = event_pipe(4);
+        tx.close(CloseReason::Error("boom".into()));
+        tx.close(CloseReason::Normal); // must not overwrite
+        drop(tx);
+        assert!(matches!(
+            rx.next().await,
+            Some(TransportEvent::ConnectionClosed {
+                reason: CloseReason::Error(_)
             })
         ));
     }

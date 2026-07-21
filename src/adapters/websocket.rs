@@ -279,6 +279,8 @@ impl<C> WebSocketAdapter<C> {
                     // [STOP] Handle shutdown signal
                     _ = shutdown_signal.recv() => {
                         tracing::info!("[STOP] Received shutdown signal, stopping WebSocket event loop (session: {})", current_session_id);
+                        // Locally initiated close is Normal, not an abnormal end.
+                        event_pipe.close(crate::error::CloseReason::Normal);
                         // Active close: first send WebSocket Close frame, then close connection
                         tracing::debug!("[CLOSE] Send WebSocket Close frame for graceful shutdown");
 

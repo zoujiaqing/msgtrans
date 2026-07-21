@@ -678,25 +678,37 @@ impl<C> QuicAdapter<C> {
 
             // Borrow the handles in select! so the losing task is not orphaned
             // (dropping a JoinHandle by value does not cancel its task).
-            tokio::select! {
+            // Record which handle select! consumed: a JoinHandle polled after
+            // completion panics, so the grace window below must only re-await
+            // the tasks that have NOT finished yet.
+            let (read_done, write_done) = tokio::select! {
                 _ = shutdown_signal.recv() => {
                     tracing::info!("[STOP] Received shutdown signal (session: {})", current_session_id);
+                    // Locally initiated close is Normal, not an abnormal end.
+                    event_pipe.close(crate::error::CloseReason::Normal);
+                    (false, false)
                 }
                 _ = &mut read_task => {
                     tracing::debug!("[CLOSE] Read task ended (session: {})", current_session_id);
+                    (true, false)
                 }
                 _ = &mut write_task => {
                     tracing::debug!("[CLOSE] Write task ended (session: {})", current_session_id);
+                    (false, true)
                 }
-            }
+            };
             // Signal cooperative shutdown, then give the tasks a brief window to
             // observe it and exit cleanly (the write task flushes via finish()
             // before returning). Force-cancel only whatever overruns the window,
             // via TaskGroup, so no task is ever orphaned.
             shutdown_flag.store(true, std::sync::atomic::Ordering::Relaxed);
             let _ = tokio::time::timeout(std::time::Duration::from_millis(200), async {
-                let _ = (&mut read_task).await;
-                let _ = (&mut write_task).await;
+                if !read_done {
+                    let _ = (&mut read_task).await;
+                }
+                if !write_done {
+                    let _ = (&mut write_task).await;
+                }
             })
             .await;
             let mut tasks = crate::adapters::core::TaskGroup::new();
