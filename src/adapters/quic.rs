@@ -16,7 +16,7 @@ use rustls::{
     DigitallySignedStruct, SignatureScheme,
 };
 use std::{convert::TryInto, net::SocketAddr, sync::Arc, time::Duration};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 
 use crate::{
     command::ConnectionInfo,
@@ -329,7 +329,7 @@ pub struct QuicAdapter<C> {
     /// Send queue
     send_queue: mpsc::Sender<Packet>,
     /// Event sender
-    event_sender: broadcast::Sender<TransportEvent>,
+    event_pipe_rx: Option<crate::adapters::events::EventPipeRx>,
     /// Shutdown signal sender
     shutdown_sender: mpsc::UnboundedSender<()>,
     /// Event loop handle
@@ -342,7 +342,6 @@ impl<C> QuicAdapter<C> {
     pub async fn new_with_connection(
         connection: QuinnConnection,
         config: C,
-        event_sender: broadcast::Sender<TransportEvent>,
         is_server: bool,
     ) -> Result<Self, QuicError> {
         let state =
@@ -368,12 +367,17 @@ impl<C> QuicAdapter<C> {
         ));
 
         // Start event loop
+        // Bounded event backbone shared by the supervisor/read/write tasks;
+        // whichever ends first publishes the close, and when all clones drop
+        // the consumer sees end-of-data.
+        let (event_pipe, event_pipe_rx) = crate::adapters::events::event_pipe(8192);
+        let event_pipe = std::sync::Arc::new(event_pipe);
         let event_loop_handle = Self::start_event_loop(
             connection,
             state.clone(),
             send_queue_rx,
             shutdown_rx,
-            event_sender.clone(),
+            event_pipe,
             is_server,
             frame_policy.clone(),
         )
@@ -385,7 +389,7 @@ impl<C> QuicAdapter<C> {
             stats: AdapterStats::new(),
             connection_info,
             send_queue: send_queue_tx,
-            event_sender,
+            event_pipe_rx: Some(event_pipe_rx),
             shutdown_sender: shutdown_tx,
             event_loop_handle: Some(event_loop_handle),
             frame_policy,
@@ -394,10 +398,6 @@ impl<C> QuicAdapter<C> {
 
     /// Get event stream receiver
     ///
-    /// This allows clients to subscribe to events sent by QUIC adapter's internal event loop
-    pub fn subscribe_events(&self) -> broadcast::Receiver<TransportEvent> {
-        self.event_sender.subscribe()
-    }
 
     /// Start event loop with single bidirectional stream multiplexing
     ///
@@ -418,7 +418,7 @@ impl<C> QuicAdapter<C> {
         state: crate::adapters::core::ConnState,
         mut send_queue: mpsc::Receiver<Packet>,
         mut shutdown_signal: mpsc::UnboundedReceiver<()>,
-        event_sender: broadcast::Sender<TransportEvent>,
+        event_pipe: std::sync::Arc<crate::adapters::events::EventPipe>,
         is_server: bool,
         frame_policy: Arc<std::sync::atomic::AtomicU8>,
     ) -> tokio::task::JoinHandle<()> {
@@ -442,13 +442,10 @@ impl<C> QuicAdapter<C> {
                             e,
                             current_session_id
                         );
-                        let close_event = TransportEvent::ConnectionClosed {
-                            reason: crate::error::CloseReason::Error(format!(
-                                "Failed to accept stream: {:?}",
-                                e
-                            )),
-                        };
-                        let _ = event_sender.send(close_event);
+                        event_pipe.close(crate::error::CloseReason::Error(format!(
+                            "Failed to accept stream: {:?}",
+                            e
+                        )));
                         return;
                     }
                 }
@@ -461,13 +458,10 @@ impl<C> QuicAdapter<C> {
                             e,
                             current_session_id
                         );
-                        let close_event = TransportEvent::ConnectionClosed {
-                            reason: crate::error::CloseReason::Error(format!(
-                                "Failed to open stream: {:?}",
-                                e
-                            )),
-                        };
-                        let _ = event_sender.send(close_event);
+                        event_pipe.close(crate::error::CloseReason::Error(format!(
+                            "Failed to open stream: {:?}",
+                            e
+                        )));
                         return;
                     }
                 }
@@ -486,7 +480,7 @@ impl<C> QuicAdapter<C> {
 
             // Spawn dedicated READ task
             let read_state = state.clone();
-            let read_event_sender = event_sender.clone();
+            let read_event_pipe = event_pipe.clone();
             let read_shutdown_flag = shutdown_flag.clone();
             let read_frame_policy = frame_policy.clone();
             let mut read_task = tokio::spawn(async move {
@@ -512,12 +506,9 @@ impl<C> QuicAdapter<C> {
                                     frame_len,
                                     current_session_id
                                 );
-                                let close_event = TransportEvent::ConnectionClosed {
-                                    reason: crate::error::CloseReason::Error(
-                                        "Frame too large".to_string(),
-                                    ),
-                                };
-                                let _ = read_event_sender.send(close_event);
+                                read_event_pipe.close(crate::error::CloseReason::Error(
+                                    "Frame too large".to_string(),
+                                ));
                                 break;
                             }
 
@@ -545,13 +536,10 @@ impl<C> QuicAdapter<C> {
                                     ) == crate::packet::FramePolicy::Strict;
                                     let packet = if payload_buf.len() < 16 {
                                         if strict {
-                                            let _ = read_event_sender.send(
-                                                TransportEvent::ConnectionClosed {
-                                                    reason: crate::error::CloseReason::Error(
-                                                        "Undecodable frame (strict policy)"
-                                                            .to_string(),
-                                                    ),
-                                                },
+                                            read_event_pipe.close(
+                                                crate::error::CloseReason::Error(
+                                                    "Undecodable frame (strict policy)".to_string(),
+                                                ),
                                             );
                                             break;
                                         }
@@ -560,26 +548,24 @@ impl<C> QuicAdapter<C> {
                                         match Packet::from_bytes(&payload_buf) {
                                             Ok(packet) => packet,
                                             Err(_) if strict => {
-                                                let _ =
-                                                    read_event_sender
-                                                        .send(TransportEvent::ConnectionClosed {
-                                                        reason: crate::error::CloseReason::Error(
-                                                            "Undecodable frame (strict policy)"
-                                                                .to_string(),
-                                                        ),
-                                                    });
+                                                read_event_pipe.close(
+                                                    crate::error::CloseReason::Error(
+                                                        "Undecodable frame (strict policy)"
+                                                            .to_string(),
+                                                    ),
+                                                );
                                                 break;
                                             }
                                             Err(_) => Packet::one_way(0, payload_buf),
                                         }
                                     };
 
-                                    let event = TransportEvent::MessageReceived(packet);
-                                    if let Err(e) = read_event_sender.send(event) {
-                                        tracing::warn!(
-                                            "[RECV] Failed to send receive event: {:?}",
-                                            e
-                                        );
+                                    // Data plane: backpressure, no loss.
+                                    if !read_event_pipe
+                                        .deliver(TransportEvent::MessageReceived(packet))
+                                        .await
+                                    {
+                                        break;
                                     }
                                 }
                                 Err(e) => {
@@ -588,10 +574,7 @@ impl<C> QuicAdapter<C> {
                                         e,
                                         current_session_id
                                     );
-                                    let close_event = TransportEvent::ConnectionClosed {
-                                        reason: crate::error::CloseReason::Normal,
-                                    };
-                                    let _ = read_event_sender.send(close_event);
+                                    read_event_pipe.close(crate::error::CloseReason::Normal);
                                     break;
                                 }
                             }
@@ -604,10 +587,7 @@ impl<C> QuicAdapter<C> {
                                 current_session_id
                             );
 
-                            let close_event = TransportEvent::ConnectionClosed {
-                                reason: crate::error::CloseReason::Normal,
-                            };
-                            let _ = read_event_sender.send(close_event);
+                            read_event_pipe.close(crate::error::CloseReason::Normal);
                             break;
                         }
                     }
@@ -616,7 +596,7 @@ impl<C> QuicAdapter<C> {
 
             // Spawn dedicated WRITE task with batching optimization
             let write_state = state.clone();
-            let write_event_sender = event_sender.clone();
+            let write_event_pipe = event_pipe.clone();
             let write_shutdown_flag = shutdown_flag.clone();
             let mut write_task = tokio::spawn(async move {
                 let mut send_stream = send_stream;
@@ -672,13 +652,10 @@ impl<C> QuicAdapter<C> {
                             e,
                             current_session_id
                         );
-                        let close_event = TransportEvent::ConnectionClosed {
-                            reason: crate::error::CloseReason::Error(format!(
-                                "Write error: {:?}",
-                                e
-                            )),
-                        };
-                        let _ = write_event_sender.send(close_event);
+                        write_event_pipe.close(crate::error::CloseReason::Error(format!(
+                            "Write error: {:?}",
+                            e
+                        )));
                         break;
                     }
 
@@ -691,10 +668,7 @@ impl<C> QuicAdapter<C> {
 
                     // Send confirmation events for all packets in batch
                     for packet_id in packet_ids {
-                        let event = TransportEvent::MessageSent { packet_id };
-                        if let Err(e) = write_event_sender.send(event) {
-                            tracing::warn!("[SEND] Failed to send sent event: {:?}", e);
-                        }
+                        write_event_pipe.diagnostic(TransportEvent::MessageSent { packet_id });
                     }
                 }
 
@@ -775,7 +749,7 @@ impl QuicAdapter<QuicClientConfig> {
             config.connect_timeout
         );
 
-        Self::new_with_connection(connection, config, broadcast::channel(8192).0, false).await
+        Self::new_with_connection(connection, config, false).await
     }
 }
 
@@ -833,7 +807,11 @@ impl<C: Send + Sync + 'static> Connection for QuicAdapter<C> {
     fn event_stream(
         &self,
     ) -> Option<tokio::sync::broadcast::Receiver<crate::event::TransportEvent>> {
-        Some(self.event_sender.subscribe())
+        None
+    }
+
+    fn take_event_pipe(&mut self) -> Option<crate::adapters::events::EventPipeRx> {
+        self.event_pipe_rx.take()
     }
 
     fn set_frame_policy(&self, policy: crate::packet::FramePolicy) {
@@ -931,7 +909,6 @@ impl QuicServer {
         QuicAdapter::new_with_connection(
             connection,
             self.config.clone(),
-            broadcast::channel(8192).0,
             true, // is_server = true
         )
         .await
