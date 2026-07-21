@@ -116,17 +116,56 @@ impl Transport {
             );
         }
 
-        // 2. Execute actual close logic (underlying adapter will automatically send close event)
-        self.do_close_session(session_id).await?;
-
-        // 3. Mark as closed
-        self.state_manager.mark_closed(session_id).await;
-
-        if self.session_id.lock().await.as_ref() == Some(&session_id) {
-            *self.session_id.lock().await = None;
-            *self.connection.lock().await = None;
+        // 2. Close the connection ONLY if it still belongs to this session.
+        // Both locks are held across the check and the close, so a concurrent
+        // set_connection (which takes the connection lock) cannot install a
+        // replacement between them — a stale generation's close can never
+        // reach the new generation's socket.
+        {
+            let mut conn_guard = self.connection.lock().await;
+            let mut sid_guard = self.session_id.lock().await;
+            if sid_guard.as_ref() == Some(&session_id) {
+                if let Some(conn) = conn_guard.as_mut() {
+                    match tokio::time::timeout(
+                        self.config.graceful_timeout,
+                        self.try_graceful_close(&mut **conn),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => {
+                            tracing::debug!(
+                                "[SUCCESS] Session {} graceful close successful",
+                                session_id
+                            );
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!(
+                                "[WARN] Session {} graceful close failed, forcing: {:?}",
+                                session_id,
+                                e
+                            );
+                            let _ = conn.close().await;
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                "[WARN] Session {} graceful close timeout, forcing",
+                                session_id
+                            );
+                            let _ = conn.close().await;
+                        }
+                    }
+                }
+                *sid_guard = None;
+                *conn_guard = None;
+            } else {
+                tracing::debug!(
+                    "[SKIP] Stale close for session {}: connection now belongs to a newer generation",
+                    session_id
+                );
+            }
         }
 
+        self.state_manager.mark_closed(session_id).await;
         tracing::info!("[SUCCESS] Session {} shutdown complete", session_id);
         Ok(())
     }
@@ -150,54 +189,28 @@ impl Transport {
             );
         }
 
-        if let Some(conn) = self.connection.lock().await.as_mut() {
-            let _ = conn.close().await;
+        {
+            let mut conn_guard = self.connection.lock().await;
+            let mut sid_guard = self.session_id.lock().await;
+            if sid_guard.as_ref() == Some(&session_id) {
+                if let Some(conn) = conn_guard.as_mut() {
+                    let _ = conn.close().await;
+                }
+                *sid_guard = None;
+                *conn_guard = None;
+            } else {
+                tracing::debug!(
+                    "[SKIP] Stale force-close for session {}: connection now belongs to a newer generation",
+                    session_id
+                );
+            }
         }
 
         self.state_manager.mark_closed(session_id).await;
 
-        if self.session_id.lock().await.as_ref() == Some(&session_id) {
-            *self.session_id.lock().await = None;
-            *self.connection.lock().await = None;
-        }
-
         tracing::info!("[SUCCESS] Session {} force close complete", session_id);
         Ok(())
     }
-
-    async fn do_close_session(&self, session_id: SessionId) -> Result<(), TransportError> {
-        let mut guard = self.connection.lock().await;
-        if let Some(conn) = guard.as_mut() {
-            match tokio::time::timeout(
-                self.config.graceful_timeout,
-                self.try_graceful_close(&mut **conn),
-            )
-            .await
-            {
-                Ok(Ok(_)) => {
-                    tracing::debug!("[SUCCESS] Session {} graceful close successful", session_id);
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!(
-                        "[WARN] Session {} graceful close failed, executing force close: {:?}",
-                        session_id,
-                        e
-                    );
-                    let _ = conn.close().await;
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        "[WARN] Session {} graceful close timeout, executing force close",
-                        session_id
-                    );
-                    let _ = conn.close().await;
-                }
-            }
-        }
-
-        Ok(())
-    }
-
     /// Try graceful close with timeout
     async fn try_graceful_close(&self, conn: &mut dyn Connection) -> Result<(), TransportError> {
         // Directly use underlying protocol close mechanism
@@ -225,11 +238,23 @@ impl Transport {
     }
 
     /// Set connection and start internal event consumer (used by TransportClient).
+    ///
+    /// Generates and returns the connection's SessionId: the id IS the
+    /// monotonically increasing connection epoch, so every session-keyed
+    /// effect (request registration, teardown, close) is generation-scoped by
+    /// construction — a stale generation's cleanup can never touch its
+    /// replacement, because they never share an id. Callers must use the
+    /// returned id; nothing else may invent one.
     pub async fn set_connection(
         self: &Arc<Self>,
         mut connection: Box<dyn Connection>,
-        session_id: SessionId,
-    ) {
+    ) -> SessionId {
+        let epoch = self
+            .connection_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        let session_id = SessionId::new(epoch);
+
         connection.set_session_id(session_id);
         let event_pipe_opt = connection.take_event_pipe();
 
@@ -240,17 +265,6 @@ impl Transport {
         // registrations for sessions that were never opened or already closed.
         self.request_registry.open_session(session_id);
         tracing::debug!("[SUCCESS] Transport connection set: {}", session_id);
-
-        let epoch = self
-            .connection_epoch
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            + 1;
-        // Generation-scoped identity: protocol configs pass a fixed session id
-        // (SessionId(1)), which would collide across reconnects and let a stale
-        // generation's teardown touch the new generation's requests. The epoch
-        // IS the session id, so every effect keyed by session is generation-
-        // scoped by construction.
-        let session_id = SessionId::new(epoch);
         if let Some(mut pipe) = event_pipe_opt {
             // Bounded backbone: single-consumer queue with backpressure; the
             // pipe ends with exactly one ConnectionClosed.
@@ -267,9 +281,10 @@ impl Transport {
                 );
                 while let Some(event) = pipe.next().await {
                     let Some(strong) = this.upgrade() else { break };
-                    // Stale-generation guard: after a reconnect installed a new
-                    // connection, this task's remaining events (including its
-                    // ConnectionClosed) must not touch shared state.
+                    // All effects are keyed by this generation's session id, so
+                    // even arbitrarily late execution cannot touch a newer
+                    // generation. The epoch filter below only reduces stale
+                    // data-event noise; correctness does not depend on it.
                     if strong
                         .connection_epoch
                         .load(std::sync::atomic::Ordering::SeqCst)
@@ -277,7 +292,7 @@ impl Transport {
                     {
                         break;
                     }
-                    strong.on_event(event).await;
+                    strong.on_event(session_id, event).await;
                 }
                 let Some(strong) = this.upgrade() else { return };
                 // Generation-scoped teardown: closes only THIS connection's
@@ -298,6 +313,7 @@ impl Transport {
                 );
             });
         }
+        session_id
     }
 
     /// Set connection without starting event consumer loop.
@@ -406,7 +422,10 @@ impl Transport {
     }
 
     /// [TARGET] Unified event handling entry point - complete unpacking and send user-friendly events at this layer
-    pub async fn on_event(&self, event: crate::event::TransportEvent) {
+    /// Handle one event from a connection, keyed by the session (generation)
+    /// that produced it — never by "whatever session is current now", which a
+    /// delayed event from an old connection could otherwise poison.
+    pub async fn on_event(&self, source_session: SessionId, event: crate::event::TransportEvent) {
         match event {
             crate::event::TransportEvent::MessageReceived(packet) => {
                 tracing::debug!(
@@ -424,7 +443,7 @@ impl Transport {
                             packet.header.packet_type,
                             packet.header.biz_type
                         );
-                        let session_id = self.current_session_id().await;
+                        let session_id = Some(source_session);
                         let completed =
                             self.request_registry
                                 .complete_waiter(session_id, id, packet.clone());
@@ -468,11 +487,9 @@ impl Transport {
                         // [TARGET] Unpack data
                         match self.decode_payload(&packet) {
                             Ok(data) => {
-                                let session_id = self.session_id.lock().await.as_ref().cloned();
-
                                 // [TARGET] Create user-friendly Message
                                 let _message = crate::event::Message {
-                                    peer: session_id,
+                                    peer: Some(source_session),
                                     data,
                                     message_id: packet.header.message_id,
                                 };
@@ -495,10 +512,18 @@ impl Transport {
                 }
             }
             crate::event::TransportEvent::ConnectionClosed { reason } => {
-                // Request cleanup is generation-scoped and owned by the pipe
-                // consumer's teardown (close_session_pending on its own
-                // session); a global abort here could cancel a newer
-                // generation's requests.
+                // Clean this generation's pending requests FIRST: forwarding
+                // below can park on a saturated client queue, and waiters must
+                // not stay pending behind it. Scoped to the source session, so
+                // a stale close can never cancel a newer generation.
+                let failed = self.request_registry.close_session_pending(source_session);
+                if failed > 0 {
+                    tracing::debug!(
+                        "[REQUEST] Closed {} pending requests for session {} on ConnectionClosed",
+                        failed,
+                        source_session
+                    );
+                }
                 self.forward_client_event(crate::event::TransportEvent::ConnectionClosed {
                     reason,
                 })

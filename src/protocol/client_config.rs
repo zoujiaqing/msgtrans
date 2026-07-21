@@ -754,13 +754,10 @@ impl ConnectableConfig for TcpClientConfig {
     async fn connect(self, transport: Arc<Transport>) -> Result<SessionId, TransportError> {
         tracing::info!("🔌 TCP 客户端开始连接到 {}", self.target_address);
 
-        let session_id = SessionId(1); // 客户端使用固定 session_id
         let connection = crate::protocol::adapter::ClientConfig::build_connection(&self).await?;
 
         // 将连接设置到 Transport 中
-        transport
-            .set_connection(Box::new(connection), session_id)
-            .await;
+        let session_id = transport.set_connection(Box::new(connection)).await;
         tracing::info!(
             "✅ TCP 客户端连接成功: {} -> 会话ID: {}",
             self.target_address,
@@ -775,13 +772,10 @@ impl ConnectableConfig for WebSocketClientConfig {
     async fn connect(self, transport: Arc<Transport>) -> Result<SessionId, TransportError> {
         tracing::info!("🔌 WebSocket 客户端开始连接到 {}", self.target_url);
 
-        let session_id = SessionId(1); // 客户端使用固定 session_id
         let connection = crate::protocol::adapter::ClientConfig::build_connection(&self).await?;
 
         // 将连接设置到 Transport 中
-        transport
-            .set_connection(Box::new(connection), session_id)
-            .await;
+        let session_id = transport.set_connection(Box::new(connection)).await;
         tracing::info!(
             "✅ WebSocket 客户端连接成功: {} -> 会话ID: {}",
             self.target_url,
@@ -796,13 +790,10 @@ impl ConnectableConfig for QuicClientConfig {
     async fn connect(self, transport: Arc<Transport>) -> Result<SessionId, TransportError> {
         tracing::info!("🔌 QUIC 客户端开始连接到 {}", self.target_address);
 
-        let session_id = SessionId(1); // 客户端使用固定 session_id
         let connection = crate::protocol::adapter::ClientConfig::build_connection(&self).await?;
 
         // 将连接设置到 Transport 中
-        transport
-            .set_connection(Box::new(connection), session_id)
-            .await;
+        let session_id = transport.set_connection(Box::new(connection)).await;
         tracing::info!(
             "✅ QUIC 客户端连接成功: {} -> 会话ID: {}",
             self.target_address,
