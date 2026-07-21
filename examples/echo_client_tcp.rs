@@ -19,12 +19,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create TCP configuration - simplified API
     let tcp_config = TcpClientConfig::new("127.0.0.1:8001")?
-        .with_connect_timeout(Duration::from_secs(5))
-        .with_nodelay(true);
+        .connect_timeout(Duration::from_secs(5))
+        .nodelay(true);
 
     // [TARGET] Build client using new TransportClientBuilder
     let mut transport = TransportClientBuilder::new()
-        .with_protocol(tcp_config)
+        .protocol(tcp_config)
         .build()
         .await?;
 

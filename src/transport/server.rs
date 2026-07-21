@@ -1,90 +1,13 @@
 /// Server-side transport layer module
 ///
 /// Provides transport layer API specifically for server-side listening
-use std::time::Duration;
-
-use crate::{error::TransportError, transport::config::TransportConfig, SessionId};
+use crate::{error::TransportError, transport::config::TransportConfig};
 
 // Import new TransportServer
 use super::transport_server::TransportServer;
 
-/// Acceptor configuration
-#[derive(Debug, Clone)]
-pub struct AcceptorConfig {
-    pub threads: usize,
-    pub backpressure: BackpressureStrategy,
-    pub accept_timeout: Duration,
-}
-
-impl Default for AcceptorConfig {
-    fn default() -> Self {
-        Self {
-            threads: 4, // Default 4 threads, avoid num_cpus dependency
-            backpressure: BackpressureStrategy::Block,
-            accept_timeout: Duration::from_secs(1),
-        }
-    }
-}
-
-/// Backpressure strategy
-#[derive(Debug, Clone)]
-pub enum BackpressureStrategy {
-    Block,
-    DropOldest,
-    DropNewest,
-    Reject,
-}
-
-/// Rate limiter configuration
-#[derive(Debug, Clone)]
-pub struct RateLimiterConfig {
-    pub requests_per_second: u32,
-    pub burst_size: u32,
-    pub window_size: Duration,
-}
-
-impl Default for RateLimiterConfig {
-    fn default() -> Self {
-        Self {
-            requests_per_second: 1000,
-            burst_size: 100,
-            window_size: Duration::from_secs(1),
-        }
-    }
-}
-
-/// Server middleware trait
-pub trait ServerMiddleware: Send + Sync {
-    fn name(&self) -> &'static str;
-    fn process(&self, session_id: SessionId) -> Result<(), TransportError>;
-}
-
-/// Server options
-#[derive(Debug, Clone)]
-pub struct ServerOptions {
-    pub name: Option<String>,
-    pub max_connections: Option<usize>,
-    pub idle_timeout: Option<Duration>,
-}
-
-impl Default for ServerOptions {
-    fn default() -> Self {
-        Self {
-            name: None,
-            max_connections: None,
-            idle_timeout: Some(Duration::from_secs(300)),
-        }
-    }
-}
-
 /// Server-side transport builder - focused on server listening related configuration
 pub struct TransportServerBuilder {
-    bind_timeout: Duration,
-    max_connections: usize,
-    acceptor_config: AcceptorConfig,
-    rate_limiter: Option<RateLimiterConfig>,
-    middleware_stack: Vec<Box<dyn ServerMiddleware>>,
-    graceful_shutdown: Option<Duration>,
     transport_config: TransportConfig,
     /// Protocol configuration storage - server supports multi-protocol listening
     protocol_configs:
@@ -98,12 +21,6 @@ pub struct TransportServerBuilder {
 impl TransportServerBuilder {
     pub fn new() -> Self {
         Self {
-            bind_timeout: Duration::from_secs(10),
-            max_connections: 10000,
-            acceptor_config: AcceptorConfig::default(),
-            rate_limiter: None,
-            middleware_stack: Vec::new(),
-            graceful_shutdown: Some(Duration::from_secs(30)),
             transport_config: TransportConfig::default(),
             protocol_configs: std::collections::HashMap::new(),
             actor_buffer_size: None,
@@ -111,54 +28,12 @@ impl TransportServerBuilder {
         }
     }
 
-    /// Server-specific: bind timeout
-    pub fn bind_timeout(mut self, timeout: Duration) -> Self {
-        self.bind_timeout = timeout;
-        self
-    }
-
-    /// Server-specific: maximum connections
-    pub fn max_connections(mut self, max: usize) -> Self {
-        self.max_connections = max;
-        self
-    }
-
     /// Set the frame decode policy applied to accepted connections (default Lenient).
     ///
     /// Under `Strict`, WebSocket/QUIC connections that receive an undecodable
     /// frame are closed instead of downgrading it to a raw one-way message.
-    pub fn with_frame_policy(mut self, policy: crate::packet::FramePolicy) -> Self {
+    pub fn frame_policy(mut self, policy: crate::packet::FramePolicy) -> Self {
         self.frame_policy = policy;
-        self
-    }
-
-    /// Server-specific: acceptor thread count
-    pub fn acceptor_threads(mut self, threads: usize) -> Self {
-        self.acceptor_config.threads = threads;
-        self
-    }
-
-    /// Server-specific: backpressure strategy
-    pub fn backpressure_strategy(mut self, strategy: BackpressureStrategy) -> Self {
-        self.acceptor_config.backpressure = strategy;
-        self
-    }
-
-    /// Server-specific: rate limiter
-    pub fn rate_limiter(mut self, config: RateLimiterConfig) -> Self {
-        self.rate_limiter = Some(config);
-        self
-    }
-
-    /// Server-specific: middleware
-    pub fn with_middleware<M: ServerMiddleware + 'static>(mut self, middleware: M) -> Self {
-        self.middleware_stack.push(Box::new(middleware));
-        self
-    }
-
-    /// Server-specific: graceful shutdown timeout
-    pub fn graceful_shutdown(mut self, timeout: Option<Duration>) -> Self {
-        self.graceful_shutdown = timeout;
         self
     }
 
@@ -169,10 +44,7 @@ impl TransportServerBuilder {
     }
 
     /// Unified protocol configuration interface - server supports multi-protocol
-    pub fn with_protocol<T: crate::protocol::adapter::DynServerConfig>(
-        mut self,
-        config: T,
-    ) -> Self {
+    pub fn protocol<T: crate::protocol::adapter::DynServerConfig>(mut self, config: T) -> Self {
         let protocol_name = config.protocol_name().to_string();
         self.protocol_configs
             .insert(protocol_name, Box::new(config));
@@ -211,71 +83,5 @@ impl TransportServerBuilder {
 impl Default for TransportServerBuilder {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-/// Example middleware implementations
-
-/// Logging middleware
-pub struct LoggingMiddleware {
-    level: tracing::Level,
-}
-
-impl LoggingMiddleware {
-    pub fn new() -> Self {
-        Self {
-            level: tracing::Level::INFO,
-        }
-    }
-
-    pub fn with_level(mut self, level: tracing::Level) -> Self {
-        self.level = level;
-        self
-    }
-}
-
-impl ServerMiddleware for LoggingMiddleware {
-    fn name(&self) -> &'static str {
-        "logging"
-    }
-
-    fn process(&self, session_id: SessionId) -> Result<(), TransportError> {
-        match self.level {
-            tracing::Level::DEBUG => tracing::debug!("Processing session: {:?}", session_id),
-            tracing::Level::INFO => tracing::info!("Processing session: {:?}", session_id),
-            tracing::Level::WARN => tracing::warn!("Processing session: {:?}", session_id),
-            tracing::Level::ERROR => tracing::error!("Processing session: {:?}", session_id),
-            _ => tracing::trace!("Processing session: {:?}", session_id),
-        }
-        Ok(())
-    }
-}
-
-/// Authentication middleware
-pub struct AuthMiddleware {
-    required: bool,
-}
-
-impl AuthMiddleware {
-    pub fn new() -> Self {
-        Self { required: true }
-    }
-
-    pub fn optional() -> Self {
-        Self { required: false }
-    }
-}
-
-impl ServerMiddleware for AuthMiddleware {
-    fn name(&self) -> &'static str {
-        "auth"
-    }
-
-    fn process(&self, session_id: SessionId) -> Result<(), TransportError> {
-        if self.required {
-            tracing::debug!("Authentication check: {:?}", session_id);
-            // Specific authentication logic can be implemented here
-        }
-        Ok(())
     }
 }

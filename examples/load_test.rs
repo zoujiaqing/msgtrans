@@ -443,9 +443,7 @@ async fn run_client(
     let transport_result = match config.protocol {
         Protocol::Tcp => {
             let tcp_config = match TcpClientConfig::new(&addr) {
-                Ok(c) => c
-                    .with_connect_timeout(Duration::from_secs(5))
-                    .with_nodelay(true),
+                Ok(c) => c.connect_timeout(Duration::from_secs(5)).nodelay(true),
                 Err(e) => {
                     tracing::error!(
                         "[Client {}] Failed to create TCP config: {:?}",
@@ -456,16 +454,16 @@ async fn run_client(
                     return;
                 }
             };
-            let tcp_config = tcp_config.with_connect_timeout(Duration::from_secs(10));
+            let tcp_config = tcp_config.connect_timeout(Duration::from_secs(10));
             TransportClientBuilder::new()
-                .with_protocol(tcp_config)
+                .protocol(tcp_config)
                 .build()
                 .await
         }
         Protocol::WebSocket => {
             let ws_addr = format!("ws://{}", addr);
             let ws_config = match WebSocketClientConfig::new(&ws_addr) {
-                Ok(c) => c.with_connect_timeout(Duration::from_secs(5)),
+                Ok(c) => c.connect_timeout(Duration::from_secs(5)),
                 Err(e) => {
                     tracing::error!(
                         "[Client {}] Failed to create WebSocket config: {:?}",
@@ -477,7 +475,7 @@ async fn run_client(
                 }
             };
             TransportClientBuilder::new()
-                .with_protocol(ws_config)
+                .protocol(ws_config)
                 .build()
                 .await
         }
@@ -495,9 +493,9 @@ async fn run_client(
                 }
             }
             .danger_skip_verification()
-            .with_connect_timeout(Duration::from_secs(10));
+            .connect_timeout(Duration::from_secs(10));
             TransportClientBuilder::new()
-                .with_protocol(quic_config)
+                .protocol(quic_config)
                 .build()
                 .await
         }

@@ -25,26 +25,6 @@ pub trait ConnectableConfig {
     fn as_any(&self) -> &dyn std::any::Any;
 }
 
-/// Connection pool configuration
-#[derive(Debug, Clone)]
-pub struct ConnectionPoolConfig {
-    pub max_size: usize,
-    pub idle_timeout: Duration,
-    pub health_check_interval: Duration,
-    pub min_idle: usize,
-}
-
-impl Default for ConnectionPoolConfig {
-    fn default() -> Self {
-        Self {
-            max_size: 100,
-            idle_timeout: Duration::from_secs(300),
-            health_check_interval: Duration::from_secs(30),
-            min_idle: 5,
-        }
-    }
-}
-
 /// Retry configuration
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
@@ -76,68 +56,9 @@ impl Default for RetryConfig {
     }
 }
 
-/// Load balancer configuration
-#[derive(Debug, Clone)]
-pub enum LoadBalancerConfig {
-    RoundRobin,
-    Random,
-    LeastConnections,
-    WeightedRoundRobin(Vec<u32>),
-}
-
-/// Circuit breaker configuration
-#[derive(Debug, Clone)]
-pub struct CircuitBreakerConfig {
-    pub failure_threshold: usize,
-    pub timeout: Duration,
-    pub success_threshold: usize,
-}
-
-impl Default for CircuitBreakerConfig {
-    fn default() -> Self {
-        Self {
-            failure_threshold: 5,
-            timeout: Duration::from_secs(60),
-            success_threshold: 3,
-        }
-    }
-}
-
-/// Connection options
-#[derive(Debug, Clone)]
-pub struct ConnectionOptions {
-    pub timeout: Option<Duration>,
-    pub max_retries: usize,
-    pub priority: ConnectionPriority,
-}
-
-impl Default for ConnectionOptions {
-    fn default() -> Self {
-        Self {
-            timeout: None,
-            max_retries: 0,
-            priority: ConnectionPriority::Normal,
-        }
-    }
-}
-
-/// Connection priority
-#[derive(Debug, Clone)]
-pub enum ConnectionPriority {
-    Low,
-    Normal,
-    High,
-    Critical,
-}
-
 /// Client transport layer builder
 pub struct TransportClientBuilder {
-    connect_timeout: Duration,
-    pool_config: ConnectionPoolConfig,
     retry_config: RetryConfig,
-    load_balancer: Option<LoadBalancerConfig>,
-    circuit_breaker: Option<CircuitBreakerConfig>,
-    connection_monitoring: bool,
     transport_config: TransportConfig,
     /// Protocol configuration storage - Client only supports one protocol connection
     protocol_config: Option<Box<dyn DynClientConfig>>,
@@ -148,12 +69,7 @@ pub struct TransportClientBuilder {
 impl TransportClientBuilder {
     pub fn new() -> Self {
         Self {
-            connect_timeout: Duration::from_secs(30),
-            pool_config: ConnectionPoolConfig::default(),
             retry_config: RetryConfig::default(),
-            load_balancer: None,
-            circuit_breaker: None,
-            connection_monitoring: false,
             transport_config: TransportConfig::default(),
             protocol_config: None,
             frame_policy: crate::packet::FramePolicy::Lenient,
@@ -161,7 +77,7 @@ impl TransportClientBuilder {
     }
 
     /// Set protocol configuration - Client specific
-    pub fn with_protocol<T: DynClientConfig>(mut self, config: T) -> Self {
+    pub fn protocol<T: DynClientConfig>(mut self, config: T) -> Self {
         self.protocol_config = Some(Box::new(config));
         self
     }
@@ -170,59 +86,14 @@ impl TransportClientBuilder {
     ///
     /// Under `Strict`, an undecodable frame from the server closes the connection
     /// instead of being downgraded to a raw one-way message.
-    pub fn with_frame_policy(mut self, policy: crate::packet::FramePolicy) -> Self {
+    pub fn frame_policy(mut self, policy: crate::packet::FramePolicy) -> Self {
         self.frame_policy = policy;
-        self
-    }
-
-    /// Client specific: Connection timeout
-    #[deprecated(
-        since = "1.0.9",
-        note = "no effect; set the connect timeout on the protocol config instead, \
-                e.g. TcpClientConfig::new(addr)?.with_connect_timeout(dur)"
-    )]
-    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
-        self.connect_timeout = timeout;
-        self
-    }
-
-    /// Client specific: Connection pool configuration
-    #[deprecated(
-        since = "1.0.9",
-        note = "no effect; a client manages a single connection, there is no pool"
-    )]
-    pub fn connection_pool(mut self, config: ConnectionPoolConfig) -> Self {
-        self.pool_config = config;
         self
     }
 
     /// Client specific: Retry strategy
     pub fn retry_strategy(mut self, config: RetryConfig) -> Self {
         self.retry_config = config;
-        self
-    }
-
-    /// Client specific: Load balancer
-    #[deprecated(
-        since = "1.0.9",
-        note = "no effect; a client connects to a single endpoint, there is nothing to balance"
-    )]
-    pub fn load_balancer(mut self, config: LoadBalancerConfig) -> Self {
-        self.load_balancer = Some(config);
-        self
-    }
-
-    /// Client specific: Circuit breaker
-    #[deprecated(since = "1.0.9", note = "no effect; not implemented")]
-    pub fn circuit_breaker(mut self, config: CircuitBreakerConfig) -> Self {
-        self.circuit_breaker = Some(config);
-        self
-    }
-
-    /// Client specific: Connection monitoring
-    #[deprecated(since = "1.0.9", note = "no effect; not implemented")]
-    pub fn enable_connection_monitoring(mut self, enabled: bool) -> Self {
-        self.connection_monitoring = enabled;
         self
     }
 

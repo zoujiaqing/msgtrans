@@ -76,14 +76,13 @@ impl SessionHandler for Echo {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 配置多种协议 —— 同一套业务逻辑服务所有协议。
     let tcp_config = TcpServerConfig::new("127.0.0.1:8001")?;
-    let websocket_config = WebSocketServerConfig::new("127.0.0.1:8002")?.with_path("/ws");
+    let websocket_config = WebSocketServerConfig::new("127.0.0.1:8002")?.path("/ws");
     let quic_config = QuicServerConfig::new("127.0.0.1:8003")?;
 
     let server = TransportServerBuilder::new()
-        .max_connections(10000)
-        .with_protocol(tcp_config)
-        .with_protocol(websocket_config)
-        .with_protocol(quic_config)
+        .protocol(tcp_config)
+        .protocol(websocket_config)
+        .protocol(quic_config)
         .build(Arc::new(Echo))
         .await?;
 
@@ -106,10 +105,10 @@ use std::time::Duration;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tcp_config = TcpClientConfig::new("127.0.0.1:8001")?
-        .with_connect_timeout(Duration::from_secs(30));
+        .connect_timeout(Duration::from_secs(30));
 
     let mut client = TransportClientBuilder::new()
-        .with_protocol(tcp_config)
+        .protocol(tcp_config)
         .build()
         .await?;
 
@@ -169,7 +168,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 **统一抽象、协议透明** —— `TransportServer`/`TransportClient` 暴露一套业务接口；
 每个适配器实现 `Connection` trait，隐藏协议细节。
 
-**配置驱动** —— 同一套服务端代码可跑在任意协议上，只需改传给 `.with_protocol(..)` 的配置：
+**配置驱动** —— 同一套服务端代码可跑在任意协议上，只需改传给 `.protocol(..)` 的配置：
 
 ```rust,no_run
 # use msgtrans::{transport::{TransportServerBuilder, SessionHandler, SessionSender}, protocol::{TcpServerConfig, QuicServerConfig}, packet::Packet, SessionId};
@@ -183,12 +182,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 # let handler = Arc::new(H);
 // TCP 服务端
 let server = TransportServerBuilder::new()
-    .with_protocol(TcpServerConfig::new("0.0.0.0:8080")?)
+    .protocol(TcpServerConfig::new("0.0.0.0:8080")?)
     .build(handler.clone()).await?;
 
 // QUIC 服务端 —— 业务逻辑完全相同
 let server = TransportServerBuilder::new()
-    .with_protocol(QuicServerConfig::new("0.0.0.0:8080")?)
+    .protocol(QuicServerConfig::new("0.0.0.0:8080")?)
     .build(handler).await?;
 # Ok(()) }
 ```
@@ -311,11 +310,10 @@ impl SessionHandler for Chat {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = WebSocketServerConfig::new("127.0.0.1:8080")?.with_path("/chat");
+    let config = WebSocketServerConfig::new("127.0.0.1:8080")?.path("/chat");
 
     let server = TransportServerBuilder::new()
-        .with_protocol(config)
-        .max_connections(1000)
+        .protocol(config)
         .build(Arc::new(Chat))
         .await?;
 
@@ -338,11 +336,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 生产环境请去掉 danger_skip_verification()，改为配置真实的
     // server name 和 CA。
     let config = QuicClientConfig::new("127.0.0.1:8003")?
-        .with_server_name("localhost")
+        .server_name("localhost")
         .danger_skip_verification();
 
     let mut client = TransportClientBuilder::new()
-        .with_protocol(config)
+        .protocol(config)
         .build()
         .await?;
 
@@ -366,20 +364,18 @@ use std::time::Duration;
 
 # fn f() -> Result<(), Box<dyn std::error::Error>> {
 let tcp_config = TcpServerConfig::new("0.0.0.0:8001")?
-    .with_max_connections(10000)
-    .with_keepalive(Some(Duration::from_secs(60)))
-    .with_nodelay(true)
-    .with_reuse_addr(true);
+    .keepalive(Some(Duration::from_secs(60)))
+    .nodelay(true)
+    .reuse_addr(true);
 
 let ws_config = WebSocketServerConfig::new("0.0.0.0:8002")?
-    .with_path("/api/ws")
-    .with_max_frame_size(1024 * 1024)
-    .with_max_connections(5000);
+    .path("/api/ws")
+    .max_frame_size(1024 * 1024);
 
 let quic_config = QuicServerConfig::new("0.0.0.0:8003")?
-    .with_cert_pem(std::fs::read_to_string("cert.pem")?)
-    .with_key_pem(std::fs::read_to_string("key.pem")?)
-    .with_max_concurrent_streams(1000);
+    .cert_pem(std::fs::read_to_string("cert.pem")?)
+    .key_pem(std::fs::read_to_string("key.pem")?)
+    .max_concurrent_streams(1000);
 # Ok(()) }
 ```
 
@@ -418,7 +414,7 @@ match client.send("Hello, World!".as_bytes()).await {
 
 ```rust,no_run
 use msgtrans::{transport::{TransportServerBuilder, SessionHandler, SessionSender}, protocol::TcpServerConfig, packet::Packet, SessionId};
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 # struct H;
 # #[async_trait::async_trait]
@@ -427,8 +423,7 @@ use std::{sync::Arc, time::Duration};
 # }
 # async fn f() -> Result<(), Box<dyn std::error::Error>> {
 let server = TransportServerBuilder::new()
-    .with_protocol(TcpServerConfig::new("0.0.0.0:8001")?)
-    .graceful_shutdown(Some(Duration::from_secs(30)))
+    .protocol(TcpServerConfig::new("0.0.0.0:8001")?)
     .build(Arc::new(H)).await?;
 
 // ... 稍后，按配置的超时排空活跃会话：

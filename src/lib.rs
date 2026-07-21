@@ -79,11 +79,9 @@ pub use packet::{FramePolicy, Packet, PacketError, PacketType};
 pub use stream::{ClientEvents, EventStream, PacketStream};
 
 pub use transport::{
-    AcceptorConfig, BackpressureStrategy, CircuitBreakerConfig, ConnectionPoolConfig,
-    LoadBalancerConfig, LockFreeCounter, LockFreeHashMap, LockFreeQueue, MemoryPool, MemoryStats,
-    MemoryStatsSnapshot, ProtocolStats, RateLimiterConfig, RetryConfig, Transport, TransportClient,
-    TransportClientBuilder, TransportConfig, TransportContext, TransportServer,
-    TransportServerBuilder,
+    LockFreeCounter, LockFreeHashMap, LockFreeQueue, MemoryPool, MemoryStats, MemoryStatsSnapshot,
+    ProtocolStats, RetryConfig, Transport, TransportClient, TransportClientBuilder,
+    TransportConfig, TransportContext, TransportServer, TransportServerBuilder,
 };
 
 pub use protocol::{

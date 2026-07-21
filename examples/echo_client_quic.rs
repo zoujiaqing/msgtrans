@@ -19,11 +19,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // [TARGET] Configure QUIC client - simplified API
     let quic_config = QuicClientConfig::new("127.0.0.1:8003")?
         .danger_skip_verification()
-        .with_connect_timeout(Duration::from_secs(10));
+        .connect_timeout(Duration::from_secs(10));
 
     // [TARGET] Build TransportClient
     let mut transport = TransportClientBuilder::new()
-        .with_protocol(quic_config)
+        .protocol(quic_config)
         .build()
         .await?;
 

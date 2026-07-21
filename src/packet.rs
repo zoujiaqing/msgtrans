@@ -102,7 +102,7 @@ impl ReservedFlags {
     }
 
     /// Set fragmentation flag
-    pub fn with_fragmented(mut self, fragmented: bool) -> Self {
+    pub fn fragmented(mut self, fragmented: bool) -> Self {
         if fragmented {
             self.0 |= 0x0001;
         } else {
@@ -117,7 +117,7 @@ impl ReservedFlags {
     }
 
     /// Set priority flag
-    pub fn with_priority(mut self, high_priority: bool) -> Self {
+    pub fn priority(mut self, high_priority: bool) -> Self {
         if high_priority {
             self.0 |= 0x0002;
         } else {
@@ -132,7 +132,7 @@ impl ReservedFlags {
     }
 
     /// Set route tag
-    pub fn with_route_tag(mut self, has_route: bool) -> Self {
+    pub fn route_tag(mut self, has_route: bool) -> Self {
         if has_route {
             self.0 |= 0x0004;
         } else {
@@ -366,12 +366,12 @@ impl Packet {
 
     /// Set fragmentation flag
     pub fn set_fragmented(&mut self, fragmented: bool) {
-        self.header.reserved = self.header.reserved.with_fragmented(fragmented);
+        self.header.reserved = self.header.reserved.fragmented(fragmented);
     }
 
     /// Set priority
     pub fn set_priority(&mut self, high_priority: bool) {
-        self.header.reserved = self.header.reserved.with_priority(high_priority);
+        self.header.reserved = self.header.reserved.priority(high_priority);
     }
 
     /// Set business type
@@ -401,7 +401,7 @@ impl Packet {
 
     /// Set route tag
     pub fn set_route_tag(&mut self, has_route: bool) {
-        self.header.reserved = self.header.reserved.with_route_tag(has_route);
+        self.header.reserved = self.header.reserved.route_tag(has_route);
     }
 
     /// Check if has route tag
@@ -803,13 +803,13 @@ mod tests {
         assert!(!flags.is_high_priority());
         assert!(!flags.has_route_tag());
 
-        flags = flags.with_fragmented(true);
+        flags = flags.fragmented(true);
         assert!(flags.is_fragmented());
 
-        flags = flags.with_priority(true);
+        flags = flags.priority(true);
         assert!(flags.is_high_priority());
 
-        flags = flags.with_route_tag(true);
+        flags = flags.route_tag(true);
         assert!(flags.has_route_tag());
     }
 

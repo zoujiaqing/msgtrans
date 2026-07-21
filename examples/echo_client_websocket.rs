@@ -16,16 +16,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // [TARGET] Configure WebSocket client - simplified API
     let websocket_config = WebSocketClientConfig::new("ws://127.0.0.1:8002")?
-        .with_connect_timeout(Duration::from_secs(10))
-        .with_ping_interval(Some(Duration::from_secs(30)))
-        .with_pong_timeout(Duration::from_secs(10))
-        .with_max_frame_size(8192)
-        .with_max_message_size(65536)
-        .with_verify_tls(false); // Test environment
+        .connect_timeout(Duration::from_secs(10))
+        .ping_interval(Some(Duration::from_secs(30)))
+        .pong_timeout(Duration::from_secs(10))
+        .max_frame_size(8192)
+        .max_message_size(65536)
+        .verify_tls(false); // Test environment
 
     // [TARGET] Build TransportClient
     let mut transport = TransportClientBuilder::new()
-        .with_protocol(websocket_config)
+        .protocol(websocket_config)
         .build()
         .await?;
 

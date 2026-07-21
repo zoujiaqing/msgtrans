@@ -13,25 +13,25 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TcpClientConfig {
     /// 目标服务器地址
-    pub target_address: std::net::SocketAddr,
+    pub(crate) target_address: std::net::SocketAddr,
     /// 连接超时时间
-    pub connect_timeout: Duration,
+    pub(crate) connect_timeout: Duration,
     /// TCP_NODELAY选项
-    pub nodelay: bool,
+    pub(crate) nodelay: bool,
     /// keepalive时间
-    pub keepalive: Option<Duration>,
+    pub(crate) keepalive: Option<Duration>,
     /// 读缓冲区大小
-    pub read_buffer_size: usize,
+    pub(crate) read_buffer_size: usize,
     /// 写缓冲区大小
-    pub write_buffer_size: usize,
+    pub(crate) write_buffer_size: usize,
     /// 读超时时间
-    pub read_timeout: Option<Duration>,
+    pub(crate) read_timeout: Option<Duration>,
     /// 写超时时间
-    pub write_timeout: Option<Duration>,
+    pub(crate) write_timeout: Option<Duration>,
     /// 重连配置
-    pub retry_config: RetryConfig,
+    pub(crate) retry_config: RetryConfig,
     /// 本地绑定地址（可选）
-    pub local_bind_address: Option<std::net::SocketAddr>,
+    pub(crate) local_bind_address: Option<std::net::SocketAddr>,
 }
 
 impl Default for TcpClientConfig {
@@ -55,15 +55,15 @@ impl Default for TcpClientConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetryConfig {
     /// 最大重试次数
-    pub max_retries: u32,
+    pub(crate) max_retries: u32,
     /// 重试间隔
-    pub retry_interval: Duration,
+    pub(crate) retry_interval: Duration,
     /// 指数退避系数
-    pub backoff_multiplier: f64,
+    pub(crate) backoff_multiplier: f64,
     /// 最大重试间隔
-    pub max_retry_interval: Duration,
+    pub(crate) max_retry_interval: Duration,
     /// 是否启用抖动
-    pub jitter: bool,
+    pub(crate) jitter: bool,
 }
 
 impl Default for RetryConfig {
@@ -172,13 +172,13 @@ impl TcpClientConfig {
     }
 
     /// 设置目标服务器地址
-    pub fn with_target_address<A: Into<std::net::SocketAddr>>(mut self, addr: A) -> Self {
+    pub fn target_address<A: Into<std::net::SocketAddr>>(mut self, addr: A) -> Self {
         self.target_address = addr.into();
         self
     }
 
     /// 从字符串设置目标地址
-    pub fn with_target_str(mut self, addr: &str) -> Result<Self, ConfigError> {
+    pub fn target_str(mut self, addr: &str) -> Result<Self, ConfigError> {
         self.target_address = addr.parse().map_err(|e| ConfigError::InvalidAddress {
             address: addr.to_string(),
             reason: format!("Invalid target address: {}", e),
@@ -188,55 +188,55 @@ impl TcpClientConfig {
     }
 
     /// 设置连接超时时间
-    pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = timeout;
         self
     }
 
     /// 设置TCP_NODELAY选项
-    pub fn with_nodelay(mut self, nodelay: bool) -> Self {
+    pub fn nodelay(mut self, nodelay: bool) -> Self {
         self.nodelay = nodelay;
         self
     }
 
     /// 设置keepalive时间
-    pub fn with_keepalive(mut self, keepalive: Option<Duration>) -> Self {
+    pub fn keepalive(mut self, keepalive: Option<Duration>) -> Self {
         self.keepalive = keepalive;
         self
     }
 
     /// 设置读缓冲区大小
-    pub fn with_read_buffer_size(mut self, size: usize) -> Self {
+    pub fn read_buffer_size(mut self, size: usize) -> Self {
         self.read_buffer_size = size;
         self
     }
 
     /// 设置写缓冲区大小
-    pub fn with_write_buffer_size(mut self, size: usize) -> Self {
+    pub fn write_buffer_size(mut self, size: usize) -> Self {
         self.write_buffer_size = size;
         self
     }
 
     /// 设置读超时时间
-    pub fn with_read_timeout(mut self, timeout: Option<Duration>) -> Self {
+    pub fn read_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.read_timeout = timeout;
         self
     }
 
     /// 设置写超时时间
-    pub fn with_write_timeout(mut self, timeout: Option<Duration>) -> Self {
+    pub fn write_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.write_timeout = timeout;
         self
     }
 
     /// 设置重连配置
-    pub fn with_retry_config(mut self, config: RetryConfig) -> Self {
+    pub fn retry_config(mut self, config: RetryConfig) -> Self {
         self.retry_config = config;
         self
     }
 
     /// 设置本地绑定地址
-    pub fn with_local_bind_address(mut self, addr: Option<std::net::SocketAddr>) -> Self {
+    pub fn local_bind_address(mut self, addr: Option<std::net::SocketAddr>) -> Self {
         self.local_bind_address = addr;
         self
     }
@@ -250,34 +250,34 @@ impl TcpClientConfig {
     /// 高性能客户端预设
     pub fn high_performance(target_address: &str) -> Result<Self, ConfigError> {
         Ok(Self::new(target_address)?
-            .with_nodelay(true)
-            .with_read_buffer_size(65536)
-            .with_write_buffer_size(65536)
-            .with_connect_timeout(Duration::from_secs(5))
-            .with_keepalive(Some(Duration::from_secs(30))))
+            .nodelay(true)
+            .read_buffer_size(65536)
+            .write_buffer_size(65536)
+            .connect_timeout(Duration::from_secs(5))
+            .keepalive(Some(Duration::from_secs(30))))
     }
 
     /// 低延迟客户端预设
     pub fn low_latency(target_address: &str) -> Result<Self, ConfigError> {
         Ok(Self::new(target_address)?
-            .with_nodelay(true)
-            .with_read_buffer_size(4096)
-            .with_write_buffer_size(4096)
-            .with_connect_timeout(Duration::from_secs(3)))
+            .nodelay(true)
+            .read_buffer_size(4096)
+            .write_buffer_size(4096)
+            .connect_timeout(Duration::from_secs(3)))
     }
 
     /// 可靠连接客户端预设
     pub fn reliable(target_address: &str) -> Result<Self, ConfigError> {
         Ok(Self::new(target_address)?
-            .with_retry_config(RetryConfig {
+            .retry_config(RetryConfig {
                 max_retries: 10,
                 retry_interval: Duration::from_secs(1),
                 backoff_multiplier: 1.5,
                 max_retry_interval: Duration::from_secs(60),
                 jitter: true,
             })
-            .with_connect_timeout(Duration::from_secs(30))
-            .with_keepalive(Some(Duration::from_secs(120))))
+            .connect_timeout(Duration::from_secs(30))
+            .keepalive(Some(Duration::from_secs(120))))
     }
 }
 
@@ -285,25 +285,25 @@ impl TcpClientConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebSocketClientConfig {
     /// 目标服务器URL
-    pub target_url: String,
+    pub(crate) target_url: String,
     /// 连接超时时间
-    pub connect_timeout: Duration,
+    pub(crate) connect_timeout: Duration,
     /// 请求头
-    pub headers: std::collections::HashMap<String, String>,
+    pub(crate) headers: std::collections::HashMap<String, String>,
     /// 子协议
-    pub subprotocols: Vec<String>,
+    pub(crate) subprotocols: Vec<String>,
     /// 最大帧大小
-    pub max_frame_size: usize,
+    pub(crate) max_frame_size: usize,
     /// 最大消息大小
-    pub max_message_size: usize,
+    pub(crate) max_message_size: usize,
     /// ping间隔
-    pub ping_interval: Option<Duration>,
+    pub(crate) ping_interval: Option<Duration>,
     /// pong超时
-    pub pong_timeout: Duration,
+    pub(crate) pong_timeout: Duration,
     /// 重连配置
-    pub retry_config: RetryConfig,
+    pub(crate) retry_config: RetryConfig,
     /// TLS验证
-    pub verify_tls: bool,
+    pub(crate) verify_tls: bool,
 }
 
 impl Default for WebSocketClientConfig {
@@ -418,67 +418,67 @@ impl WebSocketClientConfig {
     }
 
     /// 设置目标URL
-    pub fn with_target_url<S: Into<String>>(mut self, url: S) -> Self {
+    pub fn target_url<S: Into<String>>(mut self, url: S) -> Self {
         self.target_url = url.into();
         self
     }
 
     /// 设置连接超时时间
-    pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = timeout;
         self
     }
 
     /// 添加请求头
-    pub fn with_header<K: Into<String>, V: Into<String>>(mut self, key: K, value: V) -> Self {
+    pub fn header<K: Into<String>, V: Into<String>>(mut self, key: K, value: V) -> Self {
         self.headers.insert(key.into(), value.into());
         self
     }
 
     /// 设置所有请求头
-    pub fn with_headers(mut self, headers: std::collections::HashMap<String, String>) -> Self {
+    pub fn headers(mut self, headers: std::collections::HashMap<String, String>) -> Self {
         self.headers = headers;
         self
     }
 
     /// 设置子协议
-    pub fn with_subprotocols(mut self, subprotocols: Vec<String>) -> Self {
+    pub fn subprotocols(mut self, subprotocols: Vec<String>) -> Self {
         self.subprotocols = subprotocols;
         self
     }
 
     /// 设置最大帧大小
-    pub fn with_max_frame_size(mut self, size: usize) -> Self {
+    pub fn max_frame_size(mut self, size: usize) -> Self {
         self.max_frame_size = size;
         self
     }
 
     /// 设置最大消息大小
-    pub fn with_max_message_size(mut self, size: usize) -> Self {
+    pub fn max_message_size(mut self, size: usize) -> Self {
         self.max_message_size = size;
         self
     }
 
     /// 设置ping间隔
-    pub fn with_ping_interval(mut self, interval: Option<Duration>) -> Self {
+    pub fn ping_interval(mut self, interval: Option<Duration>) -> Self {
         self.ping_interval = interval;
         self
     }
 
     /// 设置pong超时
-    pub fn with_pong_timeout(mut self, timeout: Duration) -> Self {
+    pub fn pong_timeout(mut self, timeout: Duration) -> Self {
         self.pong_timeout = timeout;
         self
     }
 
     /// 设置重连配置
-    pub fn with_retry_config(mut self, config: RetryConfig) -> Self {
+    pub fn retry_config(mut self, config: RetryConfig) -> Self {
         self.retry_config = config;
         self
     }
 
     /// 设置TLS验证
-    pub fn with_verify_tls(mut self, verify: bool) -> Self {
+    pub fn verify_tls(mut self, verify: bool) -> Self {
         self.verify_tls = verify;
         self
     }
@@ -495,28 +495,28 @@ impl WebSocketClientConfig {
         headers.insert("Content-Type".to_string(), "application/json".to_string());
 
         Ok(Self::new(target_url)?
-            .with_headers(headers)
-            .with_subprotocols(vec!["json".to_string()])
-            .with_max_frame_size(16 * 1024)
-            .with_max_message_size(512 * 1024))
+            .headers(headers)
+            .subprotocols(vec!["json".to_string()])
+            .max_frame_size(16 * 1024)
+            .max_message_size(512 * 1024))
     }
 
     /// 实时通信客户端预设
     pub fn realtime(target_url: &str) -> Result<Self, ConfigError> {
         Ok(Self::new(target_url)?
-            .with_ping_interval(Some(Duration::from_secs(10)))
-            .with_pong_timeout(Duration::from_secs(5))
-            .with_max_frame_size(8 * 1024)
-            .with_connect_timeout(Duration::from_secs(5)))
+            .ping_interval(Some(Duration::from_secs(10)))
+            .pong_timeout(Duration::from_secs(5))
+            .max_frame_size(8 * 1024)
+            .connect_timeout(Duration::from_secs(5)))
     }
 
     /// 文件传输客户端预设
     pub fn file_transfer(target_url: &str) -> Result<Self, ConfigError> {
         Ok(Self::new(target_url)?
-            .with_max_frame_size(1024 * 1024) // 1MB
-            .with_max_message_size(100 * 1024 * 1024) // 100MB
-            .with_ping_interval(None) // 禁用ping以减少干扰
-            .with_connect_timeout(Duration::from_secs(30)))
+            .max_frame_size(1024 * 1024) // 1MB
+            .max_message_size(100 * 1024 * 1024) // 100MB
+            .ping_interval(None) // 禁用ping以减少干扰
+            .connect_timeout(Duration::from_secs(30)))
     }
 }
 
@@ -524,27 +524,27 @@ impl WebSocketClientConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuicClientConfig {
     /// 目标服务器地址
-    pub target_address: std::net::SocketAddr,
+    pub(crate) target_address: std::net::SocketAddr,
     /// 服务器名称（用于TLS验证）
-    pub server_name: Option<String>,
+    pub(crate) server_name: Option<String>,
     /// 连接超时时间
-    pub connect_timeout: Duration,
+    pub(crate) connect_timeout: Duration,
     /// 证书验证
-    pub verify_certificate: bool,
+    pub(crate) verify_certificate: bool,
     /// 自定义CA证书PEM（可选）
-    pub ca_cert_pem: Option<String>,
+    pub(crate) ca_cert_pem: Option<String>,
     /// 最大并发流数
-    pub max_concurrent_streams: u64,
+    pub(crate) max_concurrent_streams: u64,
     /// 最大空闲超时
-    pub max_idle_timeout: Duration,
+    pub(crate) max_idle_timeout: Duration,
     /// keepalive间隔
-    pub keep_alive_interval: Option<Duration>,
+    pub(crate) keep_alive_interval: Option<Duration>,
     /// 初始RTT估值
-    pub initial_rtt: Duration,
+    pub(crate) initial_rtt: Duration,
     /// 重连配置
-    pub retry_config: RetryConfig,
+    pub(crate) retry_config: RetryConfig,
     /// 本地绑定地址（可选）
-    pub local_bind_address: Option<std::net::SocketAddr>,
+    pub(crate) local_bind_address: Option<std::net::SocketAddr>,
 }
 
 impl Default for QuicClientConfig {
@@ -644,13 +644,13 @@ impl QuicClientConfig {
     }
 
     /// 设置目标服务器地址
-    pub fn with_target_address<A: Into<std::net::SocketAddr>>(mut self, addr: A) -> Self {
+    pub fn target_address<A: Into<std::net::SocketAddr>>(mut self, addr: A) -> Self {
         self.target_address = addr.into();
         self
     }
 
     /// 从字符串设置目标地址
-    pub fn with_target_str(mut self, addr: &str) -> Result<Self, ConfigError> {
+    pub fn target_str(mut self, addr: &str) -> Result<Self, ConfigError> {
         self.target_address = addr.parse().map_err(|e| ConfigError::InvalidAddress {
             address: addr.to_string(),
             reason: format!("Invalid target address: {}", e),
@@ -660,19 +660,19 @@ impl QuicClientConfig {
     }
 
     /// 设置服务器名称（用于TLS验证）
-    pub fn with_server_name<S: Into<String>>(mut self, name: S) -> Self {
+    pub fn server_name<S: Into<String>>(mut self, name: S) -> Self {
         self.server_name = Some(name.into());
         self
     }
 
     /// 设置连接超时时间
-    pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = timeout;
         self
     }
 
     /// 设置证书验证
-    pub fn with_verify_certificate(mut self, verify: bool) -> Self {
+    pub fn verify_certificate(mut self, verify: bool) -> Self {
         self.verify_certificate = verify;
         self
     }
@@ -689,43 +689,43 @@ impl QuicClientConfig {
     }
 
     /// 设置自定义CA证书
-    pub fn with_ca_cert_pem<S: Into<String>>(mut self, cert_pem: S) -> Self {
+    pub fn ca_cert_pem<S: Into<String>>(mut self, cert_pem: S) -> Self {
         self.ca_cert_pem = Some(cert_pem.into());
         self
     }
 
     /// 设置最大并发流数
-    pub fn with_max_concurrent_streams(mut self, count: u64) -> Self {
+    pub fn max_concurrent_streams(mut self, count: u64) -> Self {
         self.max_concurrent_streams = count;
         self
     }
 
     /// 设置最大空闲时间
-    pub fn with_max_idle_timeout(mut self, timeout: Duration) -> Self {
+    pub fn max_idle_timeout(mut self, timeout: Duration) -> Self {
         self.max_idle_timeout = timeout;
         self
     }
 
     /// 设置keepalive间隔
-    pub fn with_keep_alive_interval(mut self, interval: Option<Duration>) -> Self {
+    pub fn keep_alive_interval(mut self, interval: Option<Duration>) -> Self {
         self.keep_alive_interval = interval;
         self
     }
 
     /// 设置初始RTT估值
-    pub fn with_initial_rtt(mut self, rtt: Duration) -> Self {
+    pub fn initial_rtt(mut self, rtt: Duration) -> Self {
         self.initial_rtt = rtt;
         self
     }
 
     /// 设置重连配置
-    pub fn with_retry_config(mut self, config: RetryConfig) -> Self {
+    pub fn retry_config(mut self, config: RetryConfig) -> Self {
         self.retry_config = config;
         self
     }
 
     /// 设置本地绑定地址
-    pub fn with_local_bind_address(mut self, addr: Option<std::net::SocketAddr>) -> Self {
+    pub fn local_bind_address(mut self, addr: Option<std::net::SocketAddr>) -> Self {
         self.local_bind_address = addr;
         self
     }
@@ -739,24 +739,24 @@ impl QuicClientConfig {
     /// 高性能客户端预设
     pub fn high_performance(target_address: &str) -> Result<Self, ConfigError> {
         Ok(Self::new(target_address)?
-            .with_max_concurrent_streams(1000)
-            .with_initial_rtt(Duration::from_millis(20))
-            .with_connect_timeout(Duration::from_secs(5)))
+            .max_concurrent_streams(1000)
+            .initial_rtt(Duration::from_millis(20))
+            .connect_timeout(Duration::from_secs(5)))
     }
 
     /// 低延迟客户端预设
     pub fn low_latency(target_address: &str) -> Result<Self, ConfigError> {
         Ok(Self::new(target_address)?
-            .with_initial_rtt(Duration::from_millis(10))
-            .with_keep_alive_interval(Some(Duration::from_secs(5)))
-            .with_max_idle_timeout(Duration::from_secs(10)))
+            .initial_rtt(Duration::from_millis(10))
+            .keep_alive_interval(Some(Duration::from_secs(5)))
+            .max_idle_timeout(Duration::from_secs(10)))
     }
 
     /// 不安全客户端预设（仅用于测试）
     pub fn insecure(target_address: &str) -> Result<Self, ConfigError> {
         Ok(Self::new(target_address)?
             .danger_skip_verification()
-            .with_server_name("localhost"))
+            .server_name("localhost"))
     }
 }
 

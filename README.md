@@ -77,14 +77,13 @@ impl SessionHandler for Echo {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Configure multiple protocols - the same business logic serves all of them.
     let tcp_config = TcpServerConfig::new("127.0.0.1:8001")?;
-    let websocket_config = WebSocketServerConfig::new("127.0.0.1:8002")?.with_path("/ws");
+    let websocket_config = WebSocketServerConfig::new("127.0.0.1:8002")?.path("/ws");
     let quic_config = QuicServerConfig::new("127.0.0.1:8003")?;
 
     let server = TransportServerBuilder::new()
-        .max_connections(10000)
-        .with_protocol(tcp_config)
-        .with_protocol(websocket_config)
-        .with_protocol(quic_config)
+        .protocol(tcp_config)
+        .protocol(websocket_config)
+        .protocol(quic_config)
         .build(Arc::new(Echo))
         .await?;
 
@@ -107,10 +106,10 @@ use std::time::Duration;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tcp_config = TcpClientConfig::new("127.0.0.1:8001")?
-        .with_connect_timeout(Duration::from_secs(30));
+        .connect_timeout(Duration::from_secs(30));
 
     let mut client = TransportClientBuilder::new()
-        .with_protocol(tcp_config)
+        .protocol(tcp_config)
         .build()
         .await?;
 
@@ -172,7 +171,7 @@ expose one business interface; each adapter implements the `Connection` trait an
 hides protocol details.
 
 **Configuration-driven** — the same server code runs on any protocol; only the
-config passed to `.with_protocol(..)` changes:
+config passed to `.protocol(..)` changes:
 
 ```rust,no_run
 # use msgtrans::{transport::{TransportServerBuilder, SessionHandler, SessionSender}, protocol::{TcpServerConfig, QuicServerConfig}, packet::Packet, SessionId};
@@ -186,12 +185,12 @@ config passed to `.with_protocol(..)` changes:
 # let handler = Arc::new(H);
 // TCP server
 let server = TransportServerBuilder::new()
-    .with_protocol(TcpServerConfig::new("0.0.0.0:8080")?)
+    .protocol(TcpServerConfig::new("0.0.0.0:8080")?)
     .build(handler.clone()).await?;
 
 // QUIC server - identical business logic
 let server = TransportServerBuilder::new()
-    .with_protocol(QuicServerConfig::new("0.0.0.0:8080")?)
+    .protocol(QuicServerConfig::new("0.0.0.0:8080")?)
     .build(handler).await?;
 # Ok(()) }
 ```
@@ -316,11 +315,10 @@ impl SessionHandler for Chat {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = WebSocketServerConfig::new("127.0.0.1:8080")?.with_path("/chat");
+    let config = WebSocketServerConfig::new("127.0.0.1:8080")?.path("/chat");
 
     let server = TransportServerBuilder::new()
-        .with_protocol(config)
-        .max_connections(1000)
+        .protocol(config)
         .build(Arc::new(Chat))
         .await?;
 
@@ -343,11 +341,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // In production, drop danger_skip_verification() and configure a real
     // server name and CA instead.
     let config = QuicClientConfig::new("127.0.0.1:8003")?
-        .with_server_name("localhost")
+        .server_name("localhost")
         .danger_skip_verification();
 
     let mut client = TransportClientBuilder::new()
-        .with_protocol(config)
+        .protocol(config)
         .build()
         .await?;
 
@@ -371,20 +369,18 @@ use std::time::Duration;
 
 # fn f() -> Result<(), Box<dyn std::error::Error>> {
 let tcp_config = TcpServerConfig::new("0.0.0.0:8001")?
-    .with_max_connections(10000)
-    .with_keepalive(Some(Duration::from_secs(60)))
-    .with_nodelay(true)
-    .with_reuse_addr(true);
+    .keepalive(Some(Duration::from_secs(60)))
+    .nodelay(true)
+    .reuse_addr(true);
 
 let ws_config = WebSocketServerConfig::new("0.0.0.0:8002")?
-    .with_path("/api/ws")
-    .with_max_frame_size(1024 * 1024)
-    .with_max_connections(5000);
+    .path("/api/ws")
+    .max_frame_size(1024 * 1024);
 
 let quic_config = QuicServerConfig::new("0.0.0.0:8003")?
-    .with_cert_pem(std::fs::read_to_string("cert.pem")?)
-    .with_key_pem(std::fs::read_to_string("key.pem")?)
-    .with_max_concurrent_streams(1000);
+    .cert_pem(std::fs::read_to_string("cert.pem")?)
+    .key_pem(std::fs::read_to_string("key.pem")?)
+    .max_concurrent_streams(1000);
 # Ok(()) }
 ```
 
@@ -423,7 +419,7 @@ match client.send("Hello, World!".as_bytes()).await {
 
 ```rust,no_run
 use msgtrans::{transport::{TransportServerBuilder, SessionHandler, SessionSender}, protocol::TcpServerConfig, packet::Packet, SessionId};
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 # struct H;
 # #[async_trait::async_trait]
@@ -432,11 +428,10 @@ use std::{sync::Arc, time::Duration};
 # }
 # async fn f() -> Result<(), Box<dyn std::error::Error>> {
 let server = TransportServerBuilder::new()
-    .with_protocol(TcpServerConfig::new("0.0.0.0:8001")?)
-    .graceful_shutdown(Some(Duration::from_secs(30)))
+    .protocol(TcpServerConfig::new("0.0.0.0:8001")?)
     .build(Arc::new(H)).await?;
 
-// ... later, drain active sessions using the configured timeout:
+// ... later, drain active sessions (TransportConfig::graceful_timeout):
 server.stop().await;
 # Ok(()) }
 ```

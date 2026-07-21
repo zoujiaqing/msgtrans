@@ -88,7 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let server = TransportServerBuilder::new()
-        .with_protocol(tcp_config)
+        .protocol(tcp_config)
         .build(handler.clone())
         .await?;
 
@@ -110,7 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Start client - simplified API
     let client_config = TcpClientConfig::new("127.0.0.1:9001")?;
     let mut client = TransportClientBuilder::new()
-        .with_protocol(client_config)
+        .protocol(client_config)
         .build()
         .await?;
 

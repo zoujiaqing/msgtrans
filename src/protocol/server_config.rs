@@ -9,25 +9,25 @@ use std::time::Duration;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TcpServerConfig {
     /// Bind address
-    pub bind_address: std::net::SocketAddr,
+    pub(crate) bind_address: std::net::SocketAddr,
     /// Maximum connections
-    pub max_connections: usize,
+    pub(crate) max_connections: usize,
     /// TCP_NODELAY option
-    pub nodelay: bool,
+    pub(crate) nodelay: bool,
     /// Keepalive time
-    pub keepalive: Option<Duration>,
+    pub(crate) keepalive: Option<Duration>,
     /// Read buffer size
-    pub read_buffer_size: usize,
+    pub(crate) read_buffer_size: usize,
     /// Write buffer size
-    pub write_buffer_size: usize,
+    pub(crate) write_buffer_size: usize,
     /// Server accept timeout
-    pub accept_timeout: Duration,
+    pub(crate) accept_timeout: Duration,
     /// Connection idle timeout
-    pub idle_timeout: Option<Duration>,
+    pub(crate) idle_timeout: Option<Duration>,
     /// Whether to allow port reuse
-    pub reuse_port: bool,
+    pub(crate) reuse_port: bool,
     /// Whether to allow address reuse
-    pub reuse_addr: bool,
+    pub(crate) reuse_addr: bool,
 }
 
 impl Default for TcpServerConfig {
@@ -148,61 +148,61 @@ impl TcpServerConfig {
     }
 
     /// Set bind address
-    pub fn with_bind_address<A: Into<std::net::SocketAddr>>(mut self, addr: A) -> Self {
+    pub fn bind_address<A: Into<std::net::SocketAddr>>(mut self, addr: A) -> Self {
         self.bind_address = addr.into();
         self
     }
 
     /// Set maximum connections
-    pub fn with_max_connections(mut self, max: usize) -> Self {
+    pub fn max_connections(mut self, max: usize) -> Self {
         self.max_connections = max;
         self
     }
 
     /// Set TCP_NODELAY option
-    pub fn with_nodelay(mut self, nodelay: bool) -> Self {
+    pub fn nodelay(mut self, nodelay: bool) -> Self {
         self.nodelay = nodelay;
         self
     }
 
     /// Set keepalive time
-    pub fn with_keepalive(mut self, keepalive: Option<Duration>) -> Self {
+    pub fn keepalive(mut self, keepalive: Option<Duration>) -> Self {
         self.keepalive = keepalive;
         self
     }
 
     /// Set read buffer size
-    pub fn with_read_buffer_size(mut self, size: usize) -> Self {
+    pub fn read_buffer_size(mut self, size: usize) -> Self {
         self.read_buffer_size = size;
         self
     }
 
     /// Set write buffer size
-    pub fn with_write_buffer_size(mut self, size: usize) -> Self {
+    pub fn write_buffer_size(mut self, size: usize) -> Self {
         self.write_buffer_size = size;
         self
     }
 
     /// Set accept timeout
-    pub fn with_accept_timeout(mut self, timeout: Duration) -> Self {
+    pub fn accept_timeout(mut self, timeout: Duration) -> Self {
         self.accept_timeout = timeout;
         self
     }
 
     /// Set connection idle timeout
-    pub fn with_idle_timeout(mut self, timeout: Option<Duration>) -> Self {
+    pub fn idle_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.idle_timeout = timeout;
         self
     }
 
     /// Set port reuse
-    pub fn with_reuse_port(mut self, reuse: bool) -> Self {
+    pub fn reuse_port(mut self, reuse: bool) -> Self {
         self.reuse_port = reuse;
         self
     }
 
     /// Set address reuse
-    pub fn with_reuse_addr(mut self, reuse: bool) -> Self {
+    pub fn reuse_addr(mut self, reuse: bool) -> Self {
         self.reuse_addr = reuse;
         self
     }
@@ -218,23 +218,23 @@ impl TcpServerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebSocketServerConfig {
     /// Bind address
-    pub bind_address: std::net::SocketAddr,
+    pub(crate) bind_address: std::net::SocketAddr,
     /// WebSocket path
-    pub path: String,
+    pub(crate) path: String,
     /// Supported sub-protocols
-    pub subprotocols: Vec<String>,
+    pub(crate) subprotocols: Vec<String>,
     /// Maximum frame size
-    pub max_frame_size: usize,
+    pub(crate) max_frame_size: usize,
     /// Maximum message size
-    pub max_message_size: usize,
+    pub(crate) max_message_size: usize,
     /// Ping interval
-    pub ping_interval: Option<Duration>,
+    pub(crate) ping_interval: Option<Duration>,
     /// Pong timeout
-    pub pong_timeout: Duration,
+    pub(crate) pong_timeout: Duration,
     /// Maximum connections
-    pub max_connections: usize,
+    pub(crate) max_connections: usize,
     /// Connection idle timeout
-    pub idle_timeout: Option<Duration>,
+    pub(crate) idle_timeout: Option<Duration>,
 }
 
 impl Default for WebSocketServerConfig {
@@ -352,19 +352,19 @@ impl WebSocketServerConfig {
     }
 
     /// Set bind address
-    pub fn with_bind_address<A: Into<std::net::SocketAddr>>(mut self, addr: A) -> Self {
+    pub fn bind_address<A: Into<std::net::SocketAddr>>(mut self, addr: A) -> Self {
         self.bind_address = addr.into();
         self
     }
 
     /// Set WebSocket path
-    pub fn with_path<S: Into<String>>(mut self, path: S) -> Self {
+    pub fn path<S: Into<String>>(mut self, path: S) -> Self {
         self.path = path.into();
         self
     }
 
     /// Set supported sub-protocols
-    pub fn with_subprotocols(mut self, protocols: Vec<String>) -> Self {
+    pub fn subprotocols(mut self, protocols: Vec<String>) -> Self {
         self.subprotocols = protocols;
         self
     }
@@ -376,37 +376,37 @@ impl WebSocketServerConfig {
     }
 
     /// Set maximum frame size
-    pub fn with_max_frame_size(mut self, size: usize) -> Self {
+    pub fn max_frame_size(mut self, size: usize) -> Self {
         self.max_frame_size = size;
         self
     }
 
     /// Set maximum message size
-    pub fn with_max_message_size(mut self, size: usize) -> Self {
+    pub fn max_message_size(mut self, size: usize) -> Self {
         self.max_message_size = size;
         self
     }
 
     /// Set ping interval
-    pub fn with_ping_interval(mut self, interval: Option<Duration>) -> Self {
+    pub fn ping_interval(mut self, interval: Option<Duration>) -> Self {
         self.ping_interval = interval;
         self
     }
 
     /// Set pong timeout
-    pub fn with_pong_timeout(mut self, timeout: Duration) -> Self {
+    pub fn pong_timeout(mut self, timeout: Duration) -> Self {
         self.pong_timeout = timeout;
         self
     }
 
     /// Set maximum connections
-    pub fn with_max_connections(mut self, max: usize) -> Self {
+    pub fn max_connections(mut self, max: usize) -> Self {
         self.max_connections = max;
         self
     }
 
     /// Set connection idle timeout
-    pub fn with_idle_timeout(mut self, timeout: Option<Duration>) -> Self {
+    pub fn idle_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.idle_timeout = timeout;
         self
     }
@@ -422,25 +422,25 @@ impl WebSocketServerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuicServerConfig {
     /// Bind address
-    pub bind_address: std::net::SocketAddr,
+    pub(crate) bind_address: std::net::SocketAddr,
     /// TLS certificate PEM content (optional, if None, auto-generate self-signed certificate)
-    pub cert_pem: Option<String>,
+    pub(crate) cert_pem: Option<String>,
     /// TLS private key PEM content (optional, if None, auto-generate self-signed certificate)
-    pub key_pem: Option<String>,
+    pub(crate) key_pem: Option<String>,
     /// Maximum concurrent streams
-    pub max_concurrent_streams: u64,
+    pub(crate) max_concurrent_streams: u64,
     /// Maximum idle timeout
-    pub max_idle_timeout: Duration,
+    pub(crate) max_idle_timeout: Duration,
     /// Keep-alive interval
-    pub keep_alive_interval: Option<Duration>,
+    pub(crate) keep_alive_interval: Option<Duration>,
     /// Initial RTT estimate
-    pub initial_rtt: Duration,
+    pub(crate) initial_rtt: Duration,
     /// Maximum connections
-    pub max_connections: usize,
+    pub(crate) max_connections: usize,
     /// Receive window size
-    pub receive_window: u32,
+    pub(crate) receive_window: u32,
     /// Send window size
-    pub send_window: u32,
+    pub(crate) send_window: u32,
 }
 
 impl Default for QuicServerConfig {
@@ -559,61 +559,61 @@ impl QuicServerConfig {
     }
 
     /// Set bind address
-    pub fn with_bind_address<A: Into<std::net::SocketAddr>>(mut self, addr: A) -> Self {
+    pub fn bind_address<A: Into<std::net::SocketAddr>>(mut self, addr: A) -> Self {
         self.bind_address = addr.into();
         self
     }
 
     /// Set TLS certificate PEM
-    pub fn with_cert_pem<S: Into<String>>(mut self, cert_pem: S) -> Self {
+    pub fn cert_pem<S: Into<String>>(mut self, cert_pem: S) -> Self {
         self.cert_pem = Some(cert_pem.into());
         self
     }
 
     /// Set TLS private key PEM
-    pub fn with_key_pem<S: Into<String>>(mut self, key_pem: S) -> Self {
+    pub fn key_pem<S: Into<String>>(mut self, key_pem: S) -> Self {
         self.key_pem = Some(key_pem.into());
         self
     }
 
     /// 设置最大并发流数
-    pub fn with_max_concurrent_streams(mut self, count: u64) -> Self {
+    pub fn max_concurrent_streams(mut self, count: u64) -> Self {
         self.max_concurrent_streams = count;
         self
     }
 
     /// 设置最大空闲超时
-    pub fn with_max_idle_timeout(mut self, timeout: Duration) -> Self {
+    pub fn max_idle_timeout(mut self, timeout: Duration) -> Self {
         self.max_idle_timeout = timeout;
         self
     }
 
     /// 设置keepalive间隔
-    pub fn with_keep_alive_interval(mut self, interval: Option<Duration>) -> Self {
+    pub fn keep_alive_interval(mut self, interval: Option<Duration>) -> Self {
         self.keep_alive_interval = interval;
         self
     }
 
     /// 设置初始RTT估值
-    pub fn with_initial_rtt(mut self, rtt: Duration) -> Self {
+    pub fn initial_rtt(mut self, rtt: Duration) -> Self {
         self.initial_rtt = rtt;
         self
     }
 
     /// 设置最大连接数
-    pub fn with_max_connections(mut self, max: usize) -> Self {
+    pub fn max_connections(mut self, max: usize) -> Self {
         self.max_connections = max;
         self
     }
 
     /// 设置接收窗口大小
-    pub fn with_receive_window(mut self, window: u32) -> Self {
+    pub fn receive_window(mut self, window: u32) -> Self {
         self.receive_window = window;
         self
     }
 
     /// 设置发送窗口大小
-    pub fn with_send_window(mut self, window: u32) -> Self {
+    pub fn send_window(mut self, window: u32) -> Self {
         self.send_window = window;
         self
     }
@@ -627,7 +627,7 @@ impl QuicServerConfig {
     /// 创建测试用的不安全配置
     pub fn insecure(bind_address: &str) -> Result<Self, ConfigError> {
         Ok(Self::new(bind_address)?
-            .with_cert_pem("") // 空证书表示使用自签名
-            .with_key_pem("")) // 空私钥表示使用自签名
+            .cert_pem("") // 空证书表示使用自签名
+            .key_pem("")) // 空私钥表示使用自签名
     }
 }
