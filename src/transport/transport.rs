@@ -12,6 +12,12 @@ use bytes::Bytes;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
+/// A connection bound to its generation. See `Transport::slot`.
+struct ConnectionSlot {
+    session_id: SessionId,
+    connection: Box<dyn Connection>,
+}
+
 /// Single connection transport abstraction — one instance per socket.
 ///
 /// v1.3: Constructor is now synchronous. Heavy resources come from `TransportContext`
@@ -20,8 +26,12 @@ pub struct Transport {
     config: TransportConfig,
     protocol_registry: Arc<ProtocolRegistry>,
     memory_pool: Arc<OptimizedMemoryPool>,
-    connection: Arc<Mutex<Option<Box<dyn Connection>>>>,
-    session_id: Arc<Mutex<Option<SessionId>>>,
+    /// The connection and its generation id live in ONE slot under ONE lock:
+    /// validating the generation and taking/replacing the connection is a
+    /// single atomic operation, so a stale close can never observe the old
+    /// session while the new connection is already installed (the two-lock
+    /// version had exactly that window).
+    slot: Arc<Mutex<Option<ConnectionSlot>>>,
     state_manager: ConnectionStateManager,
     /// Client-facing event queue: bounded, single consumer (the client's
     /// forwarding task). Replaces the broadcast hop, whose one Lagged killed
@@ -47,8 +57,7 @@ impl Transport {
             config,
             protocol_registry: ctx.protocol_registry.clone(),
             memory_pool: ctx.memory_pool.clone(),
-            connection: Arc::new(Mutex::new(None)),
-            session_id: Arc::new(Mutex::new(None)),
+            slot: Arc::new(Mutex::new(None)),
             state_manager: ConnectionStateManager::new(),
             client_events_tx,
             client_events_rx: Arc::new(Mutex::new(Some(client_events_rx))),
@@ -72,17 +81,17 @@ impl Transport {
 
     /// Send data packet through the underlying connection (single-lock hot path).
     pub async fn send(&self, packet: Packet) -> Result<(), TransportError> {
-        let mut guard = self.connection.lock().await;
+        let mut guard = self.slot.lock().await;
         match guard.as_mut() {
-            Some(conn) => conn.send(packet).await,
+            Some(slot) => slot.connection.send(packet).await,
             None => Err(TransportError::connection_error("Not connected", false)),
         }
     }
 
     /// Apply a frame decode policy to the underlying connection (if connected).
     pub(crate) async fn set_frame_policy(&self, policy: crate::packet::FramePolicy) {
-        if let Some(conn) = self.connection.lock().await.as_ref() {
-            conn.set_frame_policy(policy);
+        if let Some(slot) = self.slot.lock().await.as_ref() {
+            slot.connection.set_frame_policy(policy);
         }
     }
 
@@ -121,48 +130,46 @@ impl Transport {
         // set_connection (which takes the connection lock) cannot install a
         // replacement between them — a stale generation's close can never
         // reach the new generation's socket.
-        {
-            let mut conn_guard = self.connection.lock().await;
-            let mut sid_guard = self.session_id.lock().await;
-            if sid_guard.as_ref() == Some(&session_id) {
-                if let Some(conn) = conn_guard.as_mut() {
-                    match tokio::time::timeout(
-                        self.config.graceful_timeout,
-                        self.try_graceful_close(&mut **conn),
-                    )
-                    .await
-                    {
-                        Ok(Ok(_)) => {
-                            tracing::debug!(
-                                "[SUCCESS] Session {} graceful close successful",
-                                session_id
-                            );
-                        }
-                        Ok(Err(e)) => {
-                            tracing::warn!(
-                                "[WARN] Session {} graceful close failed, forcing: {:?}",
-                                session_id,
-                                e
-                            );
-                            let _ = conn.close().await;
-                        }
-                        Err(_) => {
-                            tracing::warn!(
-                                "[WARN] Session {} graceful close timeout, forcing",
-                                session_id
-                            );
-                            let _ = conn.close().await;
-                        }
-                    }
-                }
-                *sid_guard = None;
-                *conn_guard = None;
-            } else {
-                tracing::debug!(
-                    "[SKIP] Stale close for session {}: connection now belongs to a newer generation",
-                    session_id
-                );
+        // Atomically take the slot ONLY if it still belongs to this session;
+        // the network-facing close then runs outside the state lock.
+        let taken = {
+            let mut guard = self.slot.lock().await;
+            match guard.as_ref() {
+                Some(slot) if slot.session_id == session_id => guard.take(),
+                _ => None,
             }
+        };
+        if let Some(mut slot) = taken {
+            match tokio::time::timeout(
+                self.config.graceful_timeout,
+                self.try_graceful_close(&mut *slot.connection),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {
+                    tracing::debug!("[SUCCESS] Session {} graceful close successful", session_id);
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        "[WARN] Session {} graceful close failed, forcing: {:?}",
+                        session_id,
+                        e
+                    );
+                    let _ = slot.connection.close().await;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "[WARN] Session {} graceful close timeout, forcing",
+                        session_id
+                    );
+                    let _ = slot.connection.close().await;
+                }
+            }
+        } else {
+            tracing::debug!(
+                "[SKIP] Stale close for session {}: connection now belongs to a newer generation",
+                session_id
+            );
         }
 
         self.state_manager.mark_closed(session_id).await;
@@ -189,21 +196,20 @@ impl Transport {
             );
         }
 
-        {
-            let mut conn_guard = self.connection.lock().await;
-            let mut sid_guard = self.session_id.lock().await;
-            if sid_guard.as_ref() == Some(&session_id) {
-                if let Some(conn) = conn_guard.as_mut() {
-                    let _ = conn.close().await;
-                }
-                *sid_guard = None;
-                *conn_guard = None;
-            } else {
-                tracing::debug!(
-                    "[SKIP] Stale force-close for session {}: connection now belongs to a newer generation",
-                    session_id
-                );
+        let taken = {
+            let mut guard = self.slot.lock().await;
+            match guard.as_ref() {
+                Some(slot) if slot.session_id == session_id => guard.take(),
+                _ => None,
             }
+        };
+        if let Some(mut slot) = taken {
+            let _ = slot.connection.close().await;
+        } else {
+            tracing::debug!(
+                "[SKIP] Stale force-close for session {}: connection now belongs to a newer generation",
+                session_id
+            );
         }
 
         self.state_manager.mark_closed(session_id).await;
@@ -229,12 +235,12 @@ impl Transport {
 
     /// [TARGET] Core method: check connection status
     pub async fn is_connected(&self) -> bool {
-        self.session_id.lock().await.is_some()
+        self.slot.lock().await.is_some()
     }
 
     /// [TARGET] Core method: get current session ID
     pub async fn current_session_id(&self) -> Option<SessionId> {
-        self.session_id.lock().await.as_ref().cloned()
+        self.slot.lock().await.as_ref().map(|s| s.session_id)
     }
 
     /// Set connection and start internal event consumer (used by TransportClient).
@@ -258,8 +264,10 @@ impl Transport {
         connection.set_session_id(session_id);
         let event_pipe_opt = connection.take_event_pipe();
 
-        *self.connection.lock().await = Some(connection);
-        *self.session_id.lock().await = Some(session_id);
+        *self.slot.lock().await = Some(ConnectionSlot {
+            session_id,
+            connection,
+        });
         self.state_manager.add_connection(session_id);
         // Open request tracking for this session; the registry refuses
         // registrations for sessions that were never opened or already closed.
@@ -326,8 +334,10 @@ impl Transport {
         session_id: SessionId,
     ) {
         connection.set_session_id(session_id);
-        *self.connection.lock().await = Some(connection);
-        *self.session_id.lock().await = Some(session_id);
+        *self.slot.lock().await = Some(ConnectionSlot {
+            session_id,
+            connection,
+        });
         self.state_manager.add_connection(session_id);
         tracing::debug!(
             "[SUCCESS] Transport connection set (no consumer): {}",
@@ -425,7 +435,11 @@ impl Transport {
     /// Handle one event from a connection, keyed by the session (generation)
     /// that produced it — never by "whatever session is current now", which a
     /// delayed event from an old connection could otherwise poison.
-    pub async fn on_event(&self, source_session: SessionId, event: crate::event::TransportEvent) {
+    pub(crate) async fn on_event(
+        &self,
+        source_session: SessionId,
+        event: crate::event::TransportEvent,
+    ) {
         match event {
             crate::event::TransportEvent::MessageReceived(packet) => {
                 tracing::debug!(
@@ -703,8 +717,7 @@ impl Clone for Transport {
             config: self.config.clone(),
             protocol_registry: self.protocol_registry.clone(),
             memory_pool: self.memory_pool.clone(),
-            connection: self.connection.clone(),
-            session_id: self.session_id.clone(),
+            slot: self.slot.clone(),
             state_manager: self.state_manager.clone(),
             client_events_tx: self.client_events_tx.clone(),
             client_events_rx: self.client_events_rx.clone(),
@@ -720,5 +733,131 @@ impl std::fmt::Debug for Transport {
             .field("connected", &"<async>")
             .field("session_id", &"<async>")
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod generation_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct MockConn {
+        closed: Arc<AtomicBool>,
+        session_id: SessionId,
+    }
+
+    #[async_trait::async_trait]
+    impl Connection for MockConn {
+        async fn send(&mut self, _packet: Packet) -> Result<(), TransportError> {
+            Ok(())
+        }
+        async fn close(&mut self) -> Result<(), TransportError> {
+            self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        fn session_id(&self) -> SessionId {
+            self.session_id
+        }
+        fn set_session_id(&mut self, session_id: SessionId) {
+            self.session_id = session_id;
+        }
+        fn connection_info(&self) -> crate::command::ConnectionInfo {
+            crate::command::ConnectionInfo::default()
+        }
+        fn is_connected(&self) -> bool {
+            !self.closed.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        async fn flush(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+        fn take_event_pipe(&mut self) -> Option<crate::adapters::events::EventPipeRx> {
+            None
+        }
+    }
+
+    fn mock(closed: &Arc<AtomicBool>) -> Box<dyn Connection> {
+        Box::new(MockConn {
+            closed: closed.clone(),
+            session_id: SessionId::new(0),
+        })
+    }
+
+    /// The generation invariants the ConnectionSlot exists for: distinct ids
+    /// per generation, a stale close cannot touch the replacement connection
+    /// (validate-and-take is one atomic slot operation), and a current close
+    /// closes exactly its own connection.
+    #[tokio::test]
+    async fn stale_close_cannot_touch_the_replacement_connection() {
+        let ctx = TransportContext::new().await.expect("ctx");
+        let transport = Arc::new(Transport::with_context(TransportConfig::default(), &ctx));
+
+        let closed1 = Arc::new(AtomicBool::new(false));
+        let closed2 = Arc::new(AtomicBool::new(false));
+
+        let id1 = transport.set_connection(mock(&closed1)).await;
+        let id2 = transport.set_connection(mock(&closed2)).await;
+        assert_ne!(id1, id2, "each generation must get a distinct session id");
+        assert_eq!(transport.current_session_id().await, Some(id2));
+
+        // Stale close: generation 1's connection was already replaced (and
+        // dropped); closing id1 must not close generation 2's connection.
+        transport.close_session(id1).await.expect("stale close ok");
+        assert!(
+            !closed2.load(Ordering::SeqCst),
+            "stale close reached the replacement connection"
+        );
+        assert_eq!(
+            transport.current_session_id().await,
+            Some(id2),
+            "replacement must remain installed after a stale close"
+        );
+
+        // Current close: closes exactly its own connection.
+        transport
+            .close_session(id2)
+            .await
+            .expect("current close ok");
+        assert!(
+            closed2.load(Ordering::SeqCst),
+            "current close must close its connection"
+        );
+        assert_eq!(transport.current_session_id().await, None);
+    }
+
+    /// A stale response can only complete its own generation's waiter: request
+    /// ids are keyed by (session, id, direction), and each generation has a
+    /// unique session id.
+    #[tokio::test]
+    async fn stale_response_cannot_complete_the_new_generations_request() {
+        let ctx = TransportContext::new().await.expect("ctx");
+        let transport = Arc::new(Transport::with_context(TransportConfig::default(), &ctx));
+        let closed = Arc::new(AtomicBool::new(false));
+
+        let id1 = transport.set_connection(mock(&closed)).await;
+        let id2 = transport.set_connection(mock(&closed)).await;
+
+        // Generation 2 registers request 42.
+        let mut rx = transport
+            .request_registry
+            .try_register_waiter(42, Some(id2), 0, std::time::Duration::from_secs(5))
+            .expect("registers");
+
+        // A delayed response from generation 1 with the same message id must
+        // not complete it.
+        let stale = Packet::response(42, b"stale".to_vec());
+        assert!(
+            !transport
+                .request_registry
+                .complete_waiter(Some(id1), 42, stale),
+            "stale generation's response completed the new generation's request"
+        );
+        assert!(rx.try_recv().is_err(), "waiter must still be pending");
+
+        // The correct generation's response completes it.
+        let good = Packet::response(42, b"good".to_vec());
+        assert!(transport
+            .request_registry
+            .complete_waiter(Some(id2), 42, good));
+        assert_eq!(rx.try_recv().expect("delivered").payload, b"good"[..]);
     }
 }
