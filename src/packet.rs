@@ -3,7 +3,6 @@ use bytes::{Bytes, BytesMut};
 ///
 /// Simplified, efficient packet format designed for unified architecture
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
 
 const MAX_DECOMPRESSED_PAYLOAD_SIZE: usize = 16 * 1024 * 1024;
 
@@ -298,8 +297,13 @@ pub struct Packet {
     pub header: FixedHeader,
     /// Extended header (optional)
     pub ext_header: Vec<u8>,
-    /// Payload data
-    pub payload: Vec<u8>,
+    /// Payload data.
+    ///
+    /// Backed by [`Bytes`] so decoding can slice the read buffer instead of
+    /// copying, and encoding can hand the buffer over without another copy.
+    /// The wire format is unchanged. `Bytes` derefs to `&[u8]`, so read-only
+    /// use (`&packet.payload`, `.len()`, indexing) is identical to a `Vec<u8>`.
+    pub payload: Bytes,
 }
 
 impl Packet {
@@ -308,33 +312,33 @@ impl Packet {
         Self {
             header: FixedHeader::new(packet_type, message_id),
             ext_header: Vec::new(),
-            payload: Vec::new(),
+            payload: Bytes::new(),
         }
     }
 
     /// Create one-way message
-    pub fn one_way(message_id: u32, payload: impl Into<Vec<u8>>) -> Self {
+    pub fn one_way(message_id: u32, payload: impl Into<Bytes>) -> Self {
         let mut packet = Self::new(PacketType::OneWay, message_id);
         packet.set_payload(payload);
         packet
     }
 
     /// Create request message
-    pub fn request(message_id: u32, payload: impl Into<Vec<u8>>) -> Self {
+    pub fn request(message_id: u32, payload: impl Into<Bytes>) -> Self {
         let mut packet = Self::new(PacketType::Request, message_id);
         packet.set_payload(payload);
         packet
     }
 
     /// Create response message
-    pub fn response(message_id: u32, payload: impl Into<Vec<u8>>) -> Self {
+    pub fn response(message_id: u32, payload: impl Into<Bytes>) -> Self {
         let mut packet = Self::new(PacketType::Response, message_id);
         packet.set_payload(payload);
         packet
     }
 
     /// Set payload
-    pub fn set_payload(&mut self, payload: impl Into<Vec<u8>>) {
+    pub fn set_payload(&mut self, payload: impl Into<Bytes>) {
         self.payload = payload.into();
         self.header.payload_len = self.payload.len() as u32;
     }
@@ -412,7 +416,7 @@ impl Packet {
             return Ok(());
         }
 
-        self.payload = Self::compress_data(&self.payload, compression)?;
+        self.payload = Bytes::from(Self::compress_data(&self.payload, compression)?);
         self.header.payload_len = self.payload.len() as u32;
         Ok(())
     }
@@ -424,7 +428,7 @@ impl Packet {
             return Ok(());
         }
 
-        self.payload = Self::decompress_data(&self.payload, compression)?;
+        self.payload = Bytes::from(Self::decompress_data(&self.payload, compression)?);
         self.header.payload_len = self.payload.len() as u32;
         Ok(())
     }
@@ -495,9 +499,9 @@ impl Packet {
             if bytes.len() < end {
                 return Err(PacketError::InvalidPacket("Payload incomplete".to_string()));
             }
-            bytes[offset..end].to_vec()
+            Bytes::copy_from_slice(&bytes[offset..end])
         } else {
-            Vec::new()
+            Bytes::new()
         };
 
         Ok(Self {
@@ -529,7 +533,7 @@ impl Packet {
 
     /// Get string representation of payload (if valid UTF-8)
     pub fn payload_as_string(&self) -> Option<String> {
-        String::from_utf8(self.payload.clone()).ok()
+        String::from_utf8(self.payload.to_vec()).ok()
     }
 
     /// Compress data
@@ -635,251 +639,6 @@ pub enum PacketError {
     #[error("Serialization error: {0}")]
     SerializationError(String),
 }
-
-/// [ZEROCOPY] Zero-copy optimization: shared packet
-///
-/// Features:
-/// 1. Zero-copy implementation using Bytes
-/// 2. Arc sharing support, avoiding clones
-/// 3. Protocol format fully compatible with Packet
-/// 4. Mutual conversion with existing Packet
-#[derive(Debug, Clone)]
-pub struct SharedPacket {
-    /// Fixed header (still using original structure, protocol compatible)
-    pub header: FixedHeader,
-    /// Extended header (zero-copy)
-    pub ext_header: Bytes,
-    /// Payload data (zero-copy)
-    pub payload: Bytes,
-}
-
-impl SharedPacket {
-    /// Create new shared packet
-    pub fn new(packet_type: PacketType, message_id: u32) -> Self {
-        Self {
-            header: FixedHeader::new(packet_type, message_id),
-            ext_header: Bytes::new(),
-            payload: Bytes::new(),
-        }
-    }
-
-    /// Create one-way message (zero-copy)
-    pub fn one_way(message_id: u32, payload: impl Into<Bytes>) -> Self {
-        let mut packet = Self::new(PacketType::OneWay, message_id);
-        packet.set_payload_zerocopy(payload);
-        packet
-    }
-
-    /// Create request message (zero-copy)
-    pub fn request(message_id: u32, payload: impl Into<Bytes>) -> Self {
-        let mut packet = Self::new(PacketType::Request, message_id);
-        packet.set_payload_zerocopy(payload);
-        packet
-    }
-
-    /// Create response message (zero-copy)
-    pub fn response(message_id: u32, payload: impl Into<Bytes>) -> Self {
-        let mut packet = Self::new(PacketType::Response, message_id);
-        packet.set_payload_zerocopy(payload);
-        packet
-    }
-
-    /// Set payload (zero-copy)
-    pub fn set_payload_zerocopy(&mut self, payload: impl Into<Bytes>) {
-        self.payload = payload.into();
-        self.header.payload_len = self.payload.len() as u32;
-    }
-
-    /// Set extended header (zero-copy)
-    pub fn set_ext_header_zerocopy(&mut self, ext_header: impl Into<Bytes>) {
-        self.ext_header = ext_header.into();
-        self.header.ext_header_len = self.ext_header.len() as u16;
-    }
-
-    /// Serialize to Bytes (zero-copy optimized)
-    pub fn to_bytes(&self) -> Bytes {
-        let total_len = 16 + self.ext_header.len() + self.payload.len();
-        let mut buf = BytesMut::with_capacity(total_len);
-
-        // Fixed header (protocol compatible)
-        buf.extend_from_slice(&self.header.to_bytes());
-
-        // Extended header (zero-copy)
-        if !self.ext_header.is_empty() {
-            buf.extend_from_slice(&self.ext_header);
-        }
-
-        // Payload (zero-copy)
-        buf.extend_from_slice(&self.payload);
-
-        buf.freeze()
-    }
-
-    /// Deserialize from Bytes (zero-copy)
-    pub fn from_bytes(bytes: Bytes) -> Result<Self, PacketError> {
-        if bytes.len() < 16 {
-            return Err(PacketError::InvalidPacket("Packet too short".to_string()));
-        }
-
-        // Parse fixed header (reuse existing logic)
-        let header = FixedHeader::from_bytes(&bytes[0..16])?;
-
-        let mut offset = 16;
-
-        // Parse extended header (zero-copy slice)
-        let ext_header = if header.ext_header_len > 0 {
-            let end = offset + header.ext_header_len as usize;
-            if bytes.len() < end {
-                return Err(PacketError::InvalidPacket(
-                    "Extended header incomplete".to_string(),
-                ));
-            }
-            let ext_header = bytes.slice(offset..end);
-            offset = end;
-            ext_header
-        } else {
-            Bytes::new()
-        };
-
-        // Parse payload (zero-copy slice)
-        let payload = if header.payload_len > 0 {
-            let end = offset + header.payload_len as usize;
-            if bytes.len() < end {
-                return Err(PacketError::InvalidPacket("Payload incomplete".to_string()));
-            }
-            bytes.slice(offset..end)
-        } else {
-            Bytes::new()
-        };
-
-        Ok(Self {
-            header,
-            ext_header,
-            payload,
-        })
-    }
-
-    /// Get packet type
-    pub fn packet_type(&self) -> PacketType {
-        self.header.packet_type
-    }
-
-    /// Get message ID
-    pub fn message_id(&self) -> u32 {
-        self.header.message_id
-    }
-
-    /// Get payload size
-    pub fn payload_len(&self) -> usize {
-        self.payload.len()
-    }
-
-    /// Get total size
-    pub fn total_len(&self) -> usize {
-        16 + self.ext_header.len() + self.payload.len()
-    }
-
-    /// Get payload as string (if valid UTF-8)
-    pub fn payload_as_string(&self) -> Option<String> {
-        String::from_utf8(self.payload.to_vec()).ok()
-    }
-
-    /// Set message ID
-    pub fn set_message_id(&mut self, message_id: u32) {
-        self.header.message_id = message_id;
-    }
-
-    /// Set packet type
-    pub fn set_packet_type(&mut self, packet_type: PacketType) {
-        self.header.packet_type = packet_type;
-    }
-
-    /// Set compression type
-    pub fn set_compression(&mut self, compression: CompressionType) {
-        self.header.compression = compression;
-    }
-
-    /// Set business type
-    pub fn set_biz_type(&mut self, biz_type: u8) {
-        self.header.biz_type = biz_type;
-    }
-
-    /// Get business type
-    pub fn biz_type(&self) -> u8 {
-        self.header.biz_type
-    }
-
-    /// Get compression type
-    pub fn compression(&self) -> CompressionType {
-        self.header.compression
-    }
-}
-
-/// Packet conversion helpers
-impl Packet {
-    /// Convert to shared packet (zero-copy)
-    pub fn to_shared(&self) -> SharedPacket {
-        SharedPacket {
-            header: self.header.clone(),
-            ext_header: Bytes::copy_from_slice(&self.ext_header),
-            payload: Bytes::copy_from_slice(&self.payload),
-        }
-    }
-
-    /// Convert from shared packet
-    pub fn from_shared(shared: &SharedPacket) -> Self {
-        Self {
-            header: shared.header.clone(),
-            ext_header: shared.ext_header.to_vec(),
-            payload: shared.payload.to_vec(),
-        }
-    }
-}
-
-/// [ZEROCOPY] Mutual conversion implementation
-impl From<Packet> for SharedPacket {
-    fn from(packet: Packet) -> Self {
-        Self {
-            header: packet.header,
-            ext_header: Bytes::from(packet.ext_header),
-            payload: Bytes::from(packet.payload),
-        }
-    }
-}
-
-impl From<SharedPacket> for Packet {
-    fn from(shared: SharedPacket) -> Self {
-        Self {
-            header: shared.header,
-            ext_header: shared.ext_header.to_vec(),
-            payload: shared.payload.to_vec(),
-        }
-    }
-}
-
-/// [ZEROCOPY] Arc-wrapped shared packet for multi-threaded zero-copy
-pub type ArcPacket = Arc<SharedPacket>;
-
-/// [ZEROCOPY] Arc shared packet helper functions
-pub mod arc_packet {
-    use super::*;
-
-    /// Create new shared packet
-    pub fn new(_packet_type: PacketType, message_id: u32, payload: impl Into<Bytes>) -> ArcPacket {
-        Arc::new(SharedPacket::one_way(message_id, payload))
-    }
-
-    /// Create shared version from existing packet
-    pub fn from_packet(packet: Packet) -> ArcPacket {
-        Arc::new(packet.into())
-    }
-
-    /// Create from byte data (zero-copy)
-    pub fn from_bytes(bytes: Bytes) -> Result<ArcPacket, PacketError> {
-        Ok(Arc::new(SharedPacket::from_bytes(bytes)?))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -940,7 +699,7 @@ mod tests {
 
     #[test]
     fn test_packet_creation() {
-        let mut packet = Packet::one_way(123, b"hello world");
+        let mut packet = Packet::one_way(123, b"hello world".to_vec());
         packet.set_compression(CompressionType::Zstd);
         packet.set_fragmented(true);
 
@@ -1056,7 +815,7 @@ mod tests {
 
     #[test]
     fn test_packet_creation_with_new_fields() {
-        let mut packet = Packet::one_way(123, b"hello world");
+        let mut packet = Packet::one_way(123, b"hello world".to_vec());
         packet.set_compression(CompressionType::Zstd);
         packet.set_biz_type(42); // Custom business layer type
         packet.set_fragmented(true);
@@ -1132,67 +891,6 @@ mod tests {
     }
 
     #[test]
-    fn test_shared_packet_compatibility() {
-        // SharedPacket compatibility test
-        let original = Packet::one_way(9999, b"shared test");
-        let shared = SharedPacket::one_way(9999, Bytes::from("shared test"));
-
-        // Serialization format must be consistent
-        let original_bytes = original.to_bytes();
-        let shared_bytes = shared.to_bytes();
-
-        assert_eq!(original_bytes.as_ref(), shared_bytes.as_ref());
-
-        // Conversion test
-        let shared_from_original = original.to_shared();
-        let original_from_shared = Packet::from_shared(&shared);
-
-        assert_eq!(shared_from_original.payload, shared.payload);
-        assert_eq!(original_from_shared, original);
-    }
-
-    #[test]
-    fn test_arc_packet_creation() {
-        // Arc shared packet test
-        use crate::packet::arc_packet;
-
-        let arc_pkt = arc_packet::new(PacketType::Request, 789, Bytes::from("arc test"));
-        assert_eq!(arc_pkt.message_id(), 789);
-        assert_eq!(arc_pkt.payload_as_string().unwrap(), "arc test");
-
-        // Create from traditional packet
-        let traditional = Packet::response(456, b"traditional");
-        let arc_from_traditional = arc_packet::from_packet(traditional.clone());
-
-        assert_eq!(arc_from_traditional.message_id(), 456);
-        assert_eq!(
-            arc_from_traditional.payload_as_string().unwrap(),
-            "traditional"
-        );
-    }
-
-    #[test]
-    fn test_zerocopy_performance_no_clone() {
-        // Verify zero-copy actually avoids data copying
-        let large_data = vec![0u8; 1024 * 1024]; // 1MB
-        let bytes_data = Bytes::from(large_data);
-
-        // Create shared packet (should be zero-copy)
-        let shared = SharedPacket::one_way(123, bytes_data.clone());
-
-        // Verify same memory address (zero-copy proof)
-        assert_eq!(shared.payload.as_ptr(), bytes_data.as_ptr());
-        assert_eq!(shared.payload.len(), bytes_data.len());
-
-        // Slicing should also be zero-copy
-        let serialized = shared.to_bytes();
-        let recovered = SharedPacket::from_bytes(serialized).unwrap();
-
-        // Payload part should share memory
-        assert_eq!(recovered.payload.len(), 1024 * 1024);
-    }
-
-    #[test]
     fn test_protocol_format_stability() {
         // Protocol format stability test - ensure cross-version compatibility
 
@@ -1204,25 +902,13 @@ mod tests {
         packet.set_priority(true);
         packet.set_route_tag(true);
         packet.set_ext_header(b"complex_ext_header");
-        packet.set_payload(b"complex_payload_data_for_testing");
+        packet.set_payload(b"complex_payload_data_for_testing".to_vec());
 
         // Packet serialization
         let packet_bytes = packet.to_bytes();
 
-        // SharedPacket serialization
-        let shared = packet.to_shared();
-        let shared_bytes = shared.to_bytes();
-
-        // All serialization methods must have completely identical byte formats
-        assert_eq!(packet_bytes.as_ref(), shared_bytes.as_ref());
-
-        // All deserialization methods must have consistent results
-        let recovered1 = Packet::from_bytes(&packet_bytes).unwrap();
-        let recovered2 = SharedPacket::from_bytes(shared_bytes).unwrap();
-
-        assert_eq!(recovered1, packet);
-        assert_eq!(recovered2.header, packet.header);
-        assert_eq!(recovered2.ext_header.as_ref(), packet.ext_header.as_slice());
-        assert_eq!(recovered2.payload.as_ref(), packet.payload.as_slice());
+        // Round-trip must reproduce the packet exactly.
+        let recovered = Packet::from_bytes(&packet_bytes).unwrap();
+        assert_eq!(recovered, packet);
     }
 }

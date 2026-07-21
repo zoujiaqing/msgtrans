@@ -3,6 +3,7 @@ use crate::error::TransportError;
 use crate::packet::Packet;
 use crate::transport::request_registry::{MarkResult, RequestRegistry};
 use crate::{CloseReason, PacketId, SessionId};
+use bytes::Bytes;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -144,10 +145,7 @@ impl ProtocolEvent for TcpEvent {
             TcpEvent::ListenerBound { addr } => TransportEvent::ServerStarted { address: addr },
             TcpEvent::AcceptError { error } => TransportEvent::TransportError {
                 error: TransportError::connection_error(
-                    format!(
-                        "IO error: {:?}",
-                        std::io::Error::new(std::io::ErrorKind::Other, error)
-                    ),
+                    format!("IO error: {:?}", std::io::Error::other(error)),
                     true,
                 ),
             },
@@ -304,7 +302,7 @@ pub struct Message {
     /// Message source session (None for client, Some for server)
     pub peer: Option<SessionId>,
     /// Decompressed and unpacked raw data
-    pub data: Vec<u8>,
+    pub data: Bytes,
     /// Message ID (for debugging and logging)
     pub message_id: u32,
 }
@@ -312,7 +310,7 @@ pub struct Message {
 impl Message {
     /// Try to convert message data to UTF-8 string
     pub fn as_text(&self) -> Result<String, std::string::FromUtf8Error> {
-        String::from_utf8(self.data.clone())
+        String::from_utf8(self.data.to_vec())
     }
 
     /// Convert message data to UTF-8 string (lossy)
@@ -331,13 +329,13 @@ pub struct RequestContext {
     /// Request source session (None for client, Some for server)
     pub peer: Option<SessionId>,
     /// Decompressed and unpacked request data
-    pub data: Vec<u8>,
+    pub data: Bytes,
     /// Request ID (for debugging and logging)
     pub request_id: u32,
     /// Business type from packet header
     pub biz_type: u8,
     /// Response callback (handles all protocol details internally)
-    responder: Arc<dyn Fn(Vec<u8>) + Send + Sync + 'static>,
+    responder: Arc<dyn Fn(Bytes) + Send + Sync + 'static>,
     /// Ensure response only once (using Arc shared state)
     responded: Arc<std::sync::atomic::AtomicBool>,
     /// [FLAG] Mark: whether it's the primary instance responsible for checking response (prevents clone instances from triggering warnings)
@@ -348,14 +346,14 @@ impl RequestContext {
     /// Create new request context
     pub fn new(
         peer: Option<SessionId>,
-        data: Vec<u8>,
+        data: impl Into<Bytes>,
         request_id: u32,
         biz_type: u8,
-        responder: Arc<dyn Fn(Vec<u8>) + Send + Sync + 'static>,
+        responder: Arc<dyn Fn(Bytes) + Send + Sync + 'static>,
     ) -> Self {
         Self {
             peer,
-            data,
+            data: data.into(),
             request_id,
             biz_type,
             responder,
@@ -366,7 +364,7 @@ impl RequestContext {
 
     /// Try to convert request data to UTF-8 string
     pub fn as_text(&self) -> Result<String, std::string::FromUtf8Error> {
-        String::from_utf8(self.data.clone())
+        String::from_utf8(self.data.to_vec())
     }
 
     /// Convert request data to UTF-8 string (lossy)
@@ -396,7 +394,7 @@ impl RequestContext {
             )
             .is_ok()
         {
-            (self.responder)(response.to_vec());
+            (self.responder)(Bytes::copy_from_slice(response));
         } else {
             tracing::warn!(
                 "[WARN] RequestContext already responded (ID: {})",
@@ -661,7 +659,7 @@ pub struct TransportContext {
     /// Extension header content
     pub ext_header: Option<Vec<u8>>,
     /// Decompressed raw data
-    pub data: Vec<u8>,
+    pub data: Bytes,
     /// Reception timestamp
     pub timestamp: Instant,
     /// Message type (internal use)
@@ -672,7 +670,7 @@ pub struct TransportContext {
 /// future so `respond` can spawn it fire-and-forget while `respond_checked` can
 /// await the outcome.
 type ResponderFn = Arc<
-    dyn Fn(Vec<u8>) -> futures::future::BoxFuture<'static, Result<(), crate::error::TransportError>>
+    dyn Fn(Bytes) -> futures::future::BoxFuture<'static, Result<(), crate::error::TransportError>>
         + Send
         + Sync,
 >;
@@ -697,14 +695,14 @@ impl TransportContext {
         message_id: u32,
         biz_type: u8,
         ext_header: Option<Vec<u8>>,
-        data: Vec<u8>,
+        data: impl Into<Bytes>,
     ) -> Self {
         Self {
             peer,
             message_id,
             biz_type,
             ext_header,
-            data,
+            data: data.into(),
             timestamp: Instant::now(),
             kind: TransportContextKind::OneWay,
         }
@@ -716,13 +714,13 @@ impl TransportContext {
         message_id: u32,
         biz_type: u8,
         ext_header: Option<Vec<u8>>,
-        data: Vec<u8>,
-        responder: Arc<dyn Fn(Vec<u8>) + Send + Sync + 'static>,
+        data: impl Into<Bytes>,
+        responder: Arc<dyn Fn(Bytes) + Send + Sync + 'static>,
     ) -> Self {
         // Adapt the legacy fire-and-forget responder to the checked shape. The old
         // Fn returns (), so the boxed future always reports success.
         let responder: ResponderFn = Arc::new(
-            move |data: Vec<u8>| -> futures::future::BoxFuture<
+            move |data: Bytes| -> futures::future::BoxFuture<
                 'static,
                 Result<(), crate::error::TransportError>,
             > {
@@ -740,7 +738,7 @@ impl TransportContext {
         message_id: u32,
         biz_type: u8,
         ext_header: Option<Vec<u8>>,
-        data: Vec<u8>,
+        data: impl Into<Bytes>,
         responder: ResponderFn,
         request_registry: Option<Arc<RequestRegistry>>,
     ) -> Self {
@@ -749,7 +747,7 @@ impl TransportContext {
             message_id,
             biz_type,
             ext_header,
-            data,
+            data: data.into(),
             timestamp: Instant::now(),
             kind: TransportContextKind::Request {
                 responder,
@@ -778,7 +776,8 @@ impl TransportContext {
     }
 
     /// Respond to request (only available for request type)
-    pub fn respond(mut self, response: Vec<u8>) {
+    pub fn respond(mut self, response: impl Into<Bytes>) {
+        let response: Bytes = response.into();
         match &mut self.kind {
             TransportContextKind::Request {
                 responder,
@@ -839,7 +838,7 @@ impl TransportContext {
 
     /// Convenience method: respond with byte data
     pub fn respond_bytes(self, response: &[u8]) {
-        self.respond(response.to_vec());
+        self.respond(Bytes::copy_from_slice(response));
     }
 
     /// Respond and await the send result, so the caller can observe delivery
@@ -849,8 +848,9 @@ impl TransportContext {
     /// one-way messages return a protocol error.
     pub async fn respond_checked(
         mut self,
-        response: Vec<u8>,
+        response: impl Into<Bytes>,
     ) -> Result<(), crate::error::TransportError> {
+        let response: Bytes = response.into();
         let fut = match &mut self.kind {
             TransportContextKind::Request {
                 responder,
@@ -959,7 +959,7 @@ pub struct TransportResult {
     /// Send timestamp
     pub timestamp: Instant,
     /// Response data (only for requests, None for sends)
-    pub data: Option<Vec<u8>>,
+    pub data: Option<Bytes>,
     /// Transport status
     pub status: TransportStatus,
 }
@@ -990,12 +990,12 @@ impl TransportResult {
     }
 
     /// Create request completion result
-    pub fn new_completed(peer: Option<SessionId>, message_id: u32, data: Vec<u8>) -> Self {
+    pub fn new_completed(peer: Option<SessionId>, message_id: u32, data: impl Into<Bytes>) -> Self {
         Self {
             peer,
             message_id,
             timestamp: Instant::now(),
-            data: Some(data),
+            data: Some(data.into()),
             status: TransportStatus::Completed,
         }
     }

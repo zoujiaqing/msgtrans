@@ -647,7 +647,7 @@ impl TransportClient {
                                 },
                                 packet.payload.clone(),
                                 Arc::new(
-                                    move |response_data: Vec<u8>| -> futures::future::BoxFuture<
+                                    move |response_data: bytes::Bytes| -> futures::future::BoxFuture<
                                         'static,
                                         Result<(), crate::error::TransportError>,
                                     > {

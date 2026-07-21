@@ -98,7 +98,10 @@ impl SessionSender {
     }
 
     /// Send raw data to this session (one-way message)
-    pub async fn send_data(&self, data: Vec<u8>) -> Result<(), crate::TransportError> {
+    pub async fn send_data(
+        &self,
+        data: impl Into<bytes::Bytes>,
+    ) -> Result<(), crate::TransportError> {
         let packet = Packet::one_way(0, data);
         self.transport.send(packet).await
     }
@@ -108,8 +111,9 @@ impl SessionSender {
         &self,
         message_id: u32,
         biz_type: u8,
-        data: Vec<u8>,
+        data: impl Into<bytes::Bytes>,
     ) -> Result<(), crate::TransportError> {
+        let data: bytes::Bytes = data.into();
         // Idempotent response: mark the inbound request Responded so the registry
         // stops tracking it and duplicate/late responses are dropped — giving the
         // actor path the same response semantics as the legacy path.
@@ -182,7 +186,8 @@ impl Responder {
     }
 
     /// Send response data back to the client
-    pub async fn respond(self, data: Vec<u8>) -> Result<(), crate::TransportError> {
+    pub async fn respond(self, data: impl Into<bytes::Bytes>) -> Result<(), crate::TransportError> {
+        let data: bytes::Bytes = data.into();
         if self
             .responded
             .swap(true, std::sync::atomic::Ordering::SeqCst)

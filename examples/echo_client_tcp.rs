@@ -144,7 +144,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     result.message_id,
                     response.len()
                 );
-                if let Ok(text) = String::from_utf8(response.clone()) {
+                if let Ok(text) = String::from_utf8(response.to_vec()) {
                     info!("   Content: {}", text);
                 }
             } else {

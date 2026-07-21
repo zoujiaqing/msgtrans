@@ -470,7 +470,7 @@ impl Transport {
     }
 
     /// [TARGET] Decompress and unpack Packet payload, hiding protocol complexity
-    fn decode_payload(&self, packet: &Packet) -> Result<Vec<u8>, TransportError> {
+    fn decode_payload(&self, packet: &Packet) -> Result<Bytes, TransportError> {
         // [FIX] If packet is compressed, decompress it
         if packet.header.compression != crate::packet::CompressionType::None {
             let mut packet_copy = packet.clone();
@@ -627,7 +627,7 @@ impl Transport {
                 reserved: crate::packet::ReservedFlags::new(),
             },
             ext_header: options.ext_header.unwrap_or_default().to_vec(),
-            payload: data.to_vec(),
+            payload: data.clone(),
         };
 
         // [FIX] If compression is needed, compress the packet
@@ -729,7 +729,7 @@ impl Transport {
                 reserved: crate::packet::ReservedFlags::new(),
             },
             ext_header: options.ext_header.unwrap_or_default().to_vec(),
-            payload: data.to_vec(),
+            payload: data.clone(),
         };
 
         // [FIX] If compression is needed, compress the packet

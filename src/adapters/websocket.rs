@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
@@ -385,7 +386,7 @@ impl<C> WebSocketAdapter<C> {
                     "[RECV] WebSocket received text message: {} bytes",
                     text.len()
                 );
-                let packet = Packet::one_way(0, text.as_bytes());
+                let packet = Packet::one_way(0, Bytes::copy_from_slice(text.as_bytes()));
                 MessageProcessResult::Packet(packet)
             }
             Message::Close(_) => {

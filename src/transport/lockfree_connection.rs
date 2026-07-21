@@ -536,7 +536,7 @@ mod tests {
                 payload_len: 4,
                 reserved: crate::packet::ReservedFlags::new(),
             },
-            payload: b"test".to_vec(),
+            payload: bytes::Bytes::from_static(b"test"),
             ext_header: vec![],
         };
 
@@ -577,7 +577,7 @@ mod tests {
                         payload_len: 4,
                         reserved: crate::packet::ReservedFlags::new(),
                     },
-                    payload: b"test".to_vec(),
+                    payload: bytes::Bytes::from_static(b"test"),
                     ext_header: vec![],
                 };
 
