@@ -14,7 +14,7 @@ pub use protocol::{
 };
 
 // Re-export configuration types
-pub use client_config::{QuicClientConfig, RetryConfig, TcpClientConfig, WebSocketClientConfig};
+pub use client_config::{QuicClientConfig, TcpClientConfig, WebSocketClientConfig};
 pub use server_config::{QuicServerConfig, TcpServerConfig, WebSocketServerConfig};
 
 // Re-export adapter configuration

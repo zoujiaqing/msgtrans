@@ -20,16 +20,6 @@ pub struct TcpClientConfig {
     pub(crate) nodelay: bool,
     /// keepalive时间
     pub(crate) keepalive: Option<Duration>,
-    /// 读缓冲区大小
-    pub(crate) read_buffer_size: usize,
-    /// 写缓冲区大小
-    pub(crate) write_buffer_size: usize,
-    /// 读超时时间
-    pub(crate) read_timeout: Option<Duration>,
-    /// 写超时时间
-    pub(crate) write_timeout: Option<Duration>,
-    /// 重连配置
-    pub(crate) retry_config: RetryConfig,
     /// 本地绑定地址（可选）
     pub(crate) local_bind_address: Option<std::net::SocketAddr>,
 }
@@ -41,72 +31,12 @@ impl Default for TcpClientConfig {
             connect_timeout: Duration::from_secs(10),
             nodelay: true,
             keepalive: Some(Duration::from_secs(60)),
-            read_buffer_size: 8192,
-            write_buffer_size: 8192,
-            read_timeout: Some(Duration::from_secs(30)),
-            write_timeout: Some(Duration::from_secs(30)),
-            retry_config: RetryConfig::default(),
             local_bind_address: None,
         }
     }
 }
-
-/// 重连配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RetryConfig {
-    /// 最大重试次数
-    pub(crate) max_retries: u32,
-    /// 重试间隔
-    pub(crate) retry_interval: Duration,
-    /// 指数退避系数
-    pub(crate) backoff_multiplier: f64,
-    /// 最大重试间隔
-    pub(crate) max_retry_interval: Duration,
-    /// 是否启用抖动
-    pub(crate) jitter: bool,
-}
-
-impl Default for RetryConfig {
-    fn default() -> Self {
-        Self {
-            max_retries: 3,
-            retry_interval: Duration::from_millis(500),
-            backoff_multiplier: 2.0,
-            max_retry_interval: Duration::from_secs(30),
-            jitter: true,
-        }
-    }
-}
-
 impl ProtocolConfig for TcpClientConfig {
     fn validate(&self) -> Result<(), ConfigError> {
-        if self.read_buffer_size == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "read_buffer_size".to_string(),
-                value: "0".to_string(),
-                reason: "must be > 0".to_string(),
-                suggestion: "set a positive value".to_string(),
-            });
-        }
-
-        if self.write_buffer_size == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "write_buffer_size".to_string(),
-                value: "0".to_string(),
-                reason: "must be > 0".to_string(),
-                suggestion: "set a positive value".to_string(),
-            });
-        }
-
-        if self.retry_config.max_retries > 100 {
-            return Err(ConfigError::InvalidValue {
-                field: "max_retries".to_string(),
-                value: self.retry_config.max_retries.to_string(),
-                reason: "excessive retry count may cause resource exhaustion".to_string(),
-                suggestion: "use a reasonable value (< 100)".to_string(),
-            });
-        }
-
         Ok(())
     }
 
@@ -126,21 +56,6 @@ impl ProtocolConfig for TcpClientConfig {
         }
         if other.keepalive.is_some() {
             self.keepalive = other.keepalive;
-        }
-        if other.read_buffer_size != 8192 {
-            self.read_buffer_size = other.read_buffer_size;
-        }
-        if other.write_buffer_size != 8192 {
-            self.write_buffer_size = other.write_buffer_size;
-        }
-        if other.read_timeout.is_some() {
-            self.read_timeout = other.read_timeout;
-        }
-        if other.write_timeout.is_some() {
-            self.write_timeout = other.write_timeout;
-        }
-        if other.retry_config.max_retries != 3 {
-            self.retry_config = other.retry_config;
         }
         if other.local_bind_address.is_some() {
             self.local_bind_address = other.local_bind_address;
@@ -205,36 +120,6 @@ impl TcpClientConfig {
         self
     }
 
-    /// 设置读缓冲区大小
-    pub fn read_buffer_size(mut self, size: usize) -> Self {
-        self.read_buffer_size = size;
-        self
-    }
-
-    /// 设置写缓冲区大小
-    pub fn write_buffer_size(mut self, size: usize) -> Self {
-        self.write_buffer_size = size;
-        self
-    }
-
-    /// 设置读超时时间
-    pub fn read_timeout(mut self, timeout: Option<Duration>) -> Self {
-        self.read_timeout = timeout;
-        self
-    }
-
-    /// 设置写超时时间
-    pub fn write_timeout(mut self, timeout: Option<Duration>) -> Self {
-        self.write_timeout = timeout;
-        self
-    }
-
-    /// 设置重连配置
-    pub fn retry_config(mut self, config: RetryConfig) -> Self {
-        self.retry_config = config;
-        self
-    }
-
     /// 设置本地绑定地址
     pub fn local_bind_address(mut self, addr: Option<std::net::SocketAddr>) -> Self {
         self.local_bind_address = addr;
@@ -251,8 +136,6 @@ impl TcpClientConfig {
     pub fn high_performance(target_address: &str) -> Result<Self, ConfigError> {
         Ok(Self::new(target_address)?
             .nodelay(true)
-            .read_buffer_size(65536)
-            .write_buffer_size(65536)
             .connect_timeout(Duration::from_secs(5))
             .keepalive(Some(Duration::from_secs(30))))
     }
@@ -261,21 +144,12 @@ impl TcpClientConfig {
     pub fn low_latency(target_address: &str) -> Result<Self, ConfigError> {
         Ok(Self::new(target_address)?
             .nodelay(true)
-            .read_buffer_size(4096)
-            .write_buffer_size(4096)
             .connect_timeout(Duration::from_secs(3)))
     }
 
     /// 可靠连接客户端预设
     pub fn reliable(target_address: &str) -> Result<Self, ConfigError> {
         Ok(Self::new(target_address)?
-            .retry_config(RetryConfig {
-                max_retries: 10,
-                retry_interval: Duration::from_secs(1),
-                backoff_multiplier: 1.5,
-                max_retry_interval: Duration::from_secs(60),
-                jitter: true,
-            })
             .connect_timeout(Duration::from_secs(30))
             .keepalive(Some(Duration::from_secs(120))))
     }
@@ -300,8 +174,6 @@ pub struct WebSocketClientConfig {
     pub(crate) ping_interval: Option<Duration>,
     /// pong超时
     pub(crate) pong_timeout: Duration,
-    /// 重连配置
-    pub(crate) retry_config: RetryConfig,
     /// TLS验证
     pub(crate) verify_tls: bool,
 }
@@ -317,7 +189,6 @@ impl Default for WebSocketClientConfig {
             max_message_size: 1024 * 1024,
             ping_interval: Some(Duration::from_secs(30)),
             pong_timeout: Duration::from_secs(10),
-            retry_config: RetryConfig::default(),
             verify_tls: true,
         }
     }
@@ -383,9 +254,6 @@ impl ProtocolConfig for WebSocketClientConfig {
         }
         if other.pong_timeout != Duration::from_secs(10) {
             self.pong_timeout = other.pong_timeout;
-        }
-        if other.retry_config.max_retries != 3 {
-            self.retry_config = other.retry_config;
         }
         if !other.verify_tls {
             self.verify_tls = other.verify_tls;
@@ -471,12 +339,6 @@ impl WebSocketClientConfig {
         self
     }
 
-    /// 设置重连配置
-    pub fn retry_config(mut self, config: RetryConfig) -> Self {
-        self.retry_config = config;
-        self
-    }
-
     /// 设置TLS验证
     pub fn verify_tls(mut self, verify: bool) -> Self {
         self.verify_tls = verify;
@@ -541,8 +403,6 @@ pub struct QuicClientConfig {
     pub(crate) keep_alive_interval: Option<Duration>,
     /// 初始RTT估值
     pub(crate) initial_rtt: Duration,
-    /// 重连配置
-    pub(crate) retry_config: RetryConfig,
     /// 本地绑定地址（可选）
     pub(crate) local_bind_address: Option<std::net::SocketAddr>,
 }
@@ -559,7 +419,6 @@ impl Default for QuicClientConfig {
             max_idle_timeout: Duration::from_secs(30),
             keep_alive_interval: Some(Duration::from_secs(15)),
             initial_rtt: Duration::from_millis(100),
-            retry_config: RetryConfig::default(),
             local_bind_address: None,
         }
     }
@@ -610,9 +469,6 @@ impl ProtocolConfig for QuicClientConfig {
         }
         if other.initial_rtt != Duration::from_millis(100) {
             self.initial_rtt = other.initial_rtt;
-        }
-        if other.retry_config.max_retries != 3 {
-            self.retry_config = other.retry_config;
         }
         if other.local_bind_address.is_some() {
             self.local_bind_address = other.local_bind_address;
@@ -715,12 +571,6 @@ impl QuicClientConfig {
     /// 设置初始RTT估值
     pub fn initial_rtt(mut self, rtt: Duration) -> Self {
         self.initial_rtt = rtt;
-        self
-    }
-
-    /// 设置重连配置
-    pub fn retry_config(mut self, config: RetryConfig) -> Self {
-        self.retry_config = config;
         self
     }
 

@@ -14,16 +14,10 @@ pub struct TcpServerConfig {
     pub(crate) nodelay: bool,
     /// Keepalive time
     pub(crate) keepalive: Option<Duration>,
-    /// Read buffer size
-    pub(crate) read_buffer_size: usize,
-    /// Write buffer size
-    pub(crate) write_buffer_size: usize,
     /// Server accept timeout
     pub(crate) accept_timeout: Duration,
     /// Connection idle timeout
     pub(crate) idle_timeout: Option<Duration>,
-    /// Whether to allow port reuse
-    pub(crate) reuse_port: bool,
     /// Whether to allow address reuse
     pub(crate) reuse_addr: bool,
 }
@@ -34,11 +28,8 @@ impl Default for TcpServerConfig {
             bind_address: "127.0.0.1:8080".parse().unwrap(),
             nodelay: true,
             keepalive: Some(Duration::from_secs(60)),
-            read_buffer_size: 8192,
-            write_buffer_size: 8192,
             accept_timeout: Duration::from_secs(30),
             idle_timeout: Some(Duration::from_secs(300)),
-            reuse_port: false,
             reuse_addr: true,
         }
     }
@@ -151,18 +142,6 @@ impl TcpServerConfig {
         self
     }
 
-    /// Set read buffer size
-    pub fn read_buffer_size(mut self, size: usize) -> Self {
-        self.read_buffer_size = size;
-        self
-    }
-
-    /// Set write buffer size
-    pub fn write_buffer_size(mut self, size: usize) -> Self {
-        self.write_buffer_size = size;
-        self
-    }
-
     /// Set accept timeout
     pub fn accept_timeout(mut self, timeout: Duration) -> Self {
         self.accept_timeout = timeout;
@@ -172,12 +151,6 @@ impl TcpServerConfig {
     /// Set connection idle timeout
     pub fn idle_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.idle_timeout = timeout;
-        self
-    }
-
-    /// Set port reuse
-    pub fn reuse_port(mut self, reuse: bool) -> Self {
-        self.reuse_port = reuse;
         self
     }
 
