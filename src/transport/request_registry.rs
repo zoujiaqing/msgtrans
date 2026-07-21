@@ -941,40 +941,45 @@ mod tests {
     }
 
     /// Hammer register/close from many threads and assert the invariants the
-    /// interleave windows protect. Not a deterministic interleave proof (that
-    /// needs test hooks or Loom, tracked for the backbone round) — but it does
-    /// catch gross violations: Pending entries outliving their session, a
-    /// transiently negative pending counter, or leaked waiters.
+    /// interleave windows protect. Sessions enter through a sliding window that
+    /// the closing threads chase, so register/close contention is sustained for
+    /// the whole run instead of dying after the first close sweep. This is a
+    /// violation detector, not an interleave proof (deterministic hooks / Loom
+    /// are the backbone round's job): it catches Pending entries outliving
+    /// their session, counter underflow, and leaked waiters or index sets.
     #[test]
     fn concurrent_register_close_holds_invariants() {
         use std::sync::atomic::AtomicBool;
         let registry = Arc::new(RequestRegistry::new());
         let stop = Arc::new(AtomicBool::new(false));
+        let cursor = Arc::new(AtomicU64::new(1000)); // close frontier
+        const WINDOW: u64 = 8;
         let mut handles = Vec::new();
 
-        // 4 registering threads x 2 closing threads over a rotating session set.
         for t in 0..4u64 {
             let reg = registry.clone();
             let stop = stop.clone();
+            let cursor = cursor.clone();
             handles.push(std::thread::spawn(move || {
                 let mut id = 0u32;
                 while !stop.load(Ordering::Relaxed) {
-                    let sid = SessionId(1000 + (id as u64 + t) % 8);
+                    // Register inside the live window [cursor, cursor+WINDOW).
+                    // The tail is being closed concurrently, so registers race
+                    // the drain at the frontier for the whole run.
+                    let base = cursor.load(Ordering::Relaxed);
+                    let sid = SessionId(base + (id as u64 + t) % WINDOW);
                     id = id.wrapping_add(1);
-                    // Alternate inbound registers and outbound waiters.
                     if id % 2 == 0 {
                         let _ = reg.register(id, Some(sid), 0, Duration::from_secs(5));
                     } else if let Ok(_rx) =
                         reg.try_register_waiter(id, Some(sid), 0, Duration::from_secs(5))
                     {
-                        // Half complete, half abort — both must stay in-session.
                         if id % 4 == 1 {
                             reg.complete_waiter(Some(sid), id, Packet::response(id, Vec::new()));
                         } else {
                             reg.abort_waiter(Some(sid), id);
                         }
                     }
-                    // The counter must never be observed underflowed (huge value).
                     assert!(
                         reg.pending_count() < u64::MAX / 2,
                         "pending counter underflowed"
@@ -985,11 +990,12 @@ mod tests {
         for _ in 0..2 {
             let reg = registry.clone();
             let stop = stop.clone();
+            let cursor = cursor.clone();
             handles.push(std::thread::spawn(move || {
-                let mut n = 0u64;
                 while !stop.load(Ordering::Relaxed) {
-                    reg.close_session_pending(SessionId(1000 + n % 8));
-                    n += 1;
+                    // Advance the frontier: close the oldest live session.
+                    let sid = cursor.fetch_add(1, Ordering::Relaxed);
+                    reg.close_session_pending(SessionId(sid));
                     std::thread::yield_now();
                 }
             }));
@@ -1001,10 +1007,10 @@ mod tests {
             h.join().expect("no thread may panic");
         }
 
-        // Quiesce: close every session once more; no Pending entry may survive
-        // its session, so the registry must drain to empty.
-        for sid in 0..8u64 {
-            registry.close_session_pending(SessionId(1000 + sid));
+        // Quiesce: close every session that was ever in the window.
+        let final_cursor = cursor.load(Ordering::Relaxed);
+        for sid in 1000..final_cursor + WINDOW {
+            registry.close_session_pending(SessionId(sid));
         }
         assert_eq!(
             registry.active_len(),
@@ -1012,6 +1018,12 @@ mod tests {
             "entries leaked past session close"
         );
         assert_eq!(registry.pending_count(), 0, "pending counter out of sync");
+        // Same-module access: check the maps the public counters cannot see.
+        assert!(registry.waiters.is_empty(), "orphaned waiters leaked");
+        assert!(
+            registry.session_index.is_empty(),
+            "session index sets leaked"
+        );
     }
 
     #[test]
