@@ -36,10 +36,8 @@ pub mod server;
 pub mod transport;
 pub mod transport_server;
 
-pub mod connection_factory;
 pub mod context;
 pub mod lockfree;
-pub mod lockfree_connection;
 pub mod memory_pool;
 pub mod protocol_adapter;
 pub mod session_actor;
@@ -70,9 +68,6 @@ pub use lockfree::{
 };
 
 // [CONNECTION] Lock-free connection exports
-pub use lockfree_connection::{
-    LockFreeConnection, LockFreeConnectionCommand, LockFreeConnectionStats,
-};
 
 // [STATE] Connection state management exports
 pub use connection_state::{ConnectionState, ConnectionStateManager};
@@ -136,10 +131,6 @@ impl TransportOptions {
         self
     }
 }
-
-pub use connection_factory::{
-    ConnectionConfig, ConnectionFactory, ConnectionMetrics, ConnectionResult,
-};
 
 // [ACTOR] Session actor model exports
 pub use session_actor::{

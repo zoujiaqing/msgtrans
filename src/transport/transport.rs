@@ -10,7 +10,7 @@ use crate::{
 };
 use bytes::Bytes;
 use std::sync::Arc;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{mpsc, Mutex};
 
 /// Single connection transport abstraction — one instance per socket.
 ///
@@ -23,7 +23,11 @@ pub struct Transport {
     connection: Arc<Mutex<Option<Box<dyn Connection>>>>,
     session_id: Arc<Mutex<Option<SessionId>>>,
     state_manager: ConnectionStateManager,
-    event_sender: broadcast::Sender<TransportEvent>,
+    /// Client-facing event queue: bounded, single consumer (the client's
+    /// forwarding task). Replaces the broadcast hop, whose one Lagged killed
+    /// the forwarding task and silently ended all client event delivery.
+    client_events_tx: mpsc::Sender<TransportEvent>,
+    client_events_rx: Arc<Mutex<Option<mpsc::Receiver<TransportEvent>>>>,
     request_registry: Arc<crate::transport::request_registry::RequestRegistry>,
 }
 /// Fallback lifecycle deadline for waiter-based requests. The real timeout is
@@ -33,7 +37,7 @@ const REQUEST_WAITER_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 impl Transport {
     /// Create Transport from a shared context (synchronous — no global singletons).
     pub fn with_context(config: TransportConfig, ctx: &TransportContext) -> Self {
-        let (event_sender, _) = broadcast::channel(8192);
+        let (client_events_tx, client_events_rx) = mpsc::channel(8192);
         Self {
             config,
             protocol_registry: ctx.protocol_registry.clone(),
@@ -41,7 +45,8 @@ impl Transport {
             connection: Arc::new(Mutex::new(None)),
             session_id: Arc::new(Mutex::new(None)),
             state_manager: ConnectionStateManager::new(),
-            event_sender,
+            client_events_tx,
+            client_events_rx: Arc::new(Mutex::new(Some(client_events_rx))),
             request_registry: Arc::new(crate::transport::request_registry::RequestRegistry::new()),
         }
     }
@@ -291,14 +296,12 @@ impl Transport {
         self.memory_pool.get_stats()
     }
 
+    /// Take the client event queue (single consumer, once). The queue spans
+    /// reconnects: new connections' pipe consumers feed the same sender.
     pub async fn get_event_stream(
         &self,
-    ) -> Option<tokio::sync::broadcast::Receiver<crate::event::TransportEvent>> {
-        if self.connection.lock().await.is_some() {
-            Some(self.event_sender.subscribe())
-        } else {
-            None
-        }
+    ) -> Option<tokio::sync::mpsc::Receiver<crate::event::TransportEvent>> {
+        self.client_events_rx.lock().await.take()
     }
 
     /// Send data packet and wait for response
@@ -396,9 +399,10 @@ impl Transport {
                         if !completed {
                             tracing::warn!("[WARN] Response packet ID={} not found in request tracker, may be timeout or duplicate", id);
                             // Forward unmatched responses so higher layers can handle them.
-                            let _ = self
-                                .event_sender
-                                .send(crate::event::TransportEvent::MessageReceived(packet));
+                            self.forward_client_event(
+                                crate::event::TransportEvent::MessageReceived(packet),
+                            )
+                            .await;
                         }
                     }
 
@@ -411,9 +415,10 @@ impl Transport {
                             "[SEND] Sending unified MessageReceived event (Request): ID={}",
                             id
                         );
-                        let _ = self
-                            .event_sender
-                            .send(crate::event::TransportEvent::MessageReceived(packet));
+                        self.forward_client_event(crate::event::TransportEvent::MessageReceived(
+                            packet,
+                        ))
+                        .await;
                     }
 
                     crate::packet::PacketType::OneWay => {
@@ -436,15 +441,17 @@ impl Transport {
                                 };
 
                                 // [TARGET] Send user-friendly message event (maintain backward compatibility)
-                                let _ = self
-                                    .event_sender
-                                    .send(crate::event::TransportEvent::MessageReceived(packet));
+                                self.forward_client_event(
+                                    crate::event::TransportEvent::MessageReceived(packet),
+                                )
+                                .await;
                             }
                             Err(e) => {
                                 tracing::error!("[ERROR] Failed to unpack message data: {}", e);
-                                let _ = self.event_sender.send(
+                                self.forward_client_event(
                                     crate::event::TransportEvent::TransportError { error: e },
-                                );
+                                )
+                                .await;
                             }
                         }
                     }
@@ -459,20 +466,24 @@ impl Transport {
                         reason
                     );
                 }
-                let _ = self
-                    .event_sender
-                    .send(crate::event::TransportEvent::ConnectionClosed { reason });
+                self.forward_client_event(crate::event::TransportEvent::ConnectionClosed {
+                    reason,
+                })
+                .await;
             }
             // Forward other events directly
             _ => {
                 tracing::trace!("[SEND] Forwarding other event: {:?}", event);
-                let _ = self.event_sender.send(event);
+                self.forward_client_event(event).await;
             }
         }
     }
 
-    pub fn subscribe_events(&self) -> broadcast::Receiver<TransportEvent> {
-        self.event_sender.subscribe()
+    /// Forward an event to the client's bounded queue. Backpressures the pipe
+    /// consumer (and through it the adapter and socket); if the client dropped
+    /// its receiver, events are discarded — there is no consumer to lose them.
+    async fn forward_client_event(&self, event: TransportEvent) {
+        let _ = self.client_events_tx.send(event).await;
     }
 
     /// Send data packet and wait for response (with options)
@@ -637,7 +648,8 @@ impl Clone for Transport {
             connection: self.connection.clone(),
             session_id: self.session_id.clone(),
             state_manager: self.state_manager.clone(),
-            event_sender: self.event_sender.clone(),
+            client_events_tx: self.client_events_tx.clone(),
+            client_events_rx: self.client_events_rx.clone(),
             request_registry: self.request_registry.clone(),
         }
     }

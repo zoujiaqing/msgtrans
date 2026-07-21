@@ -37,6 +37,17 @@ pub struct EventPipeRx {
     close_emitted: bool,
 }
 
+/// Default data-plane capacity, overridable via MSGTRANS_EVENT_PIPE_CAPACITY.
+/// The override exists so saturation tests can shrink the queue to a size a
+/// test burst can actually fill; production leaves it unset.
+pub fn default_pipe_capacity() -> usize {
+    std::env::var("MSGTRANS_EVENT_PIPE_CAPACITY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(8192)
+}
+
 /// Create a connected pipe with the given data-plane capacity.
 pub fn event_pipe(capacity: usize) -> (EventPipe, EventPipeRx) {
     let (data_tx, data_rx) = mpsc::channel(capacity);

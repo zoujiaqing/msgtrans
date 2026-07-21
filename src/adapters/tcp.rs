@@ -373,7 +373,8 @@ impl<C> TcpAdapter<C> {
         let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel();
         // Bounded event backbone: the loop task owns the sender half; when the
         // loop ends the pipe drops and the consumer sees end-of-data.
-        let (event_pipe, event_pipe_rx) = crate::adapters::events::event_pipe(8192);
+        let (event_pipe, event_pipe_rx) =
+            crate::adapters::events::event_pipe(crate::adapters::events::default_pipe_capacity());
 
         let memory_pool = shared_memory_pool();
 

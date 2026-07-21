@@ -491,7 +491,7 @@ impl TransportClient {
             let handle = tokio::spawn(async move {
                 tracing::debug!("[LOOP] TransportClient event forwarding task started");
 
-                while let Ok(transport_event) = transport_events.recv().await {
+                while let Some(transport_event) = transport_events.recv().await {
                     tracing::debug!("[RECV] TransportClient received Transport event");
 
                     // [TARGET] Special handling of Request packets in MessageReceived

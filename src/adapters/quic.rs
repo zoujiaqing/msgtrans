@@ -370,7 +370,8 @@ impl<C> QuicAdapter<C> {
         // Bounded event backbone shared by the supervisor/read/write tasks;
         // whichever ends first publishes the close, and when all clones drop
         // the consumer sees end-of-data.
-        let (event_pipe, event_pipe_rx) = crate::adapters::events::event_pipe(8192);
+        let (event_pipe, event_pipe_rx) =
+            crate::adapters::events::event_pipe(crate::adapters::events::default_pipe_capacity());
         let event_pipe = std::sync::Arc::new(event_pipe);
         let event_loop_handle = Self::start_event_loop(
             connection,
