@@ -10,8 +10,6 @@ use std::time::Duration;
 pub struct TcpServerConfig {
     /// Bind address
     pub(crate) bind_address: std::net::SocketAddr,
-    /// Maximum connections
-    pub(crate) max_connections: usize,
     /// TCP_NODELAY option
     pub(crate) nodelay: bool,
     /// Keepalive time
@@ -34,7 +32,6 @@ impl Default for TcpServerConfig {
     fn default() -> Self {
         Self {
             bind_address: "127.0.0.1:8080".parse().unwrap(),
-            max_connections: 1000,
             nodelay: true,
             keepalive: Some(Duration::from_secs(60)),
             read_buffer_size: 8192,
@@ -49,14 +46,6 @@ impl Default for TcpServerConfig {
 
 impl ProtocolConfig for TcpServerConfig {
     fn validate(&self) -> Result<(), ConfigError> {
-        if self.max_connections == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "max_connections".to_string(),
-                value: "0".to_string(),
-                reason: "must be > 0".to_string(),
-                suggestion: "set a positive value like 1000".to_string(),
-            });
-        }
         Ok(())
     }
 
@@ -68,9 +57,6 @@ impl ProtocolConfig for TcpServerConfig {
         // Simplified merge logic
         if other.bind_address.to_string() != "127.0.0.1:8080" {
             self.bind_address = other.bind_address;
-        }
-        if other.max_connections != 1000 {
-            self.max_connections = other.max_connections;
         }
         self.nodelay = other.nodelay;
         if other.keepalive.is_some() {
@@ -153,12 +139,6 @@ impl TcpServerConfig {
         self
     }
 
-    /// Set maximum connections
-    pub fn max_connections(mut self, max: usize) -> Self {
-        self.max_connections = max;
-        self
-    }
-
     /// Set TCP_NODELAY option
     pub fn nodelay(mut self, nodelay: bool) -> Self {
         self.nodelay = nodelay;
@@ -231,8 +211,6 @@ pub struct WebSocketServerConfig {
     pub(crate) ping_interval: Option<Duration>,
     /// Pong timeout
     pub(crate) pong_timeout: Duration,
-    /// Maximum connections
-    pub(crate) max_connections: usize,
     /// Connection idle timeout
     pub(crate) idle_timeout: Option<Duration>,
 }
@@ -247,7 +225,6 @@ impl Default for WebSocketServerConfig {
             max_message_size: 64 * 1024 * 1024, // 64MB
             ping_interval: Some(Duration::from_secs(30)),
             pong_timeout: Duration::from_secs(10),
-            max_connections: 1000,
             idle_timeout: Some(Duration::from_secs(300)),
         }
     }
@@ -255,14 +232,6 @@ impl Default for WebSocketServerConfig {
 
 impl ProtocolConfig for WebSocketServerConfig {
     fn validate(&self) -> Result<(), ConfigError> {
-        if self.max_connections == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "max_connections".to_string(),
-                value: "0".to_string(),
-                reason: "must be > 0".to_string(),
-                suggestion: "set a positive value like 1000".to_string(),
-            });
-        }
         Ok(())
     }
 
@@ -399,12 +368,6 @@ impl WebSocketServerConfig {
         self
     }
 
-    /// Set maximum connections
-    pub fn max_connections(mut self, max: usize) -> Self {
-        self.max_connections = max;
-        self
-    }
-
     /// Set connection idle timeout
     pub fn idle_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.idle_timeout = timeout;
@@ -435,8 +398,6 @@ pub struct QuicServerConfig {
     pub(crate) keep_alive_interval: Option<Duration>,
     /// Initial RTT estimate
     pub(crate) initial_rtt: Duration,
-    /// Maximum connections
-    pub(crate) max_connections: usize,
     /// Receive window size
     pub(crate) receive_window: u32,
     /// Send window size
@@ -453,7 +414,6 @@ impl Default for QuicServerConfig {
             max_idle_timeout: Duration::from_secs(30),
             keep_alive_interval: Some(Duration::from_secs(15)),
             initial_rtt: Duration::from_millis(100),
-            max_connections: 1000,
             receive_window: 1024 * 1024, // 1MB
             send_window: 1024 * 1024,    // 1MB
         }
@@ -462,14 +422,6 @@ impl Default for QuicServerConfig {
 
 impl ProtocolConfig for QuicServerConfig {
     fn validate(&self) -> Result<(), ConfigError> {
-        if self.max_connections == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "max_connections".to_string(),
-                value: "0".to_string(),
-                reason: "must be > 0".to_string(),
-                suggestion: "set a positive value like 1000".to_string(),
-            });
-        }
         Ok(())
     }
 
@@ -597,12 +549,6 @@ impl QuicServerConfig {
     /// 设置初始RTT估值
     pub fn initial_rtt(mut self, rtt: Duration) -> Self {
         self.initial_rtt = rtt;
-        self
-    }
-
-    /// 设置最大连接数
-    pub fn max_connections(mut self, max: usize) -> Self {
-        self.max_connections = max;
         self
     }
 

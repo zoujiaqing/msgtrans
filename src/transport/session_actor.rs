@@ -338,6 +338,9 @@ pub struct SessionActor {
     handler: Arc<dyn SessionHandler>,
     connection_info: ConnectionInfo,
     inbound_registry: Option<Arc<RequestRegistry>>,
+    /// Connection-cap permit (server side). Held for the actor's lifetime and
+    /// released on drop, i.e. exactly when the session truly ends.
+    _connection_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl SessionActor {
@@ -356,7 +359,17 @@ impl SessionActor {
             handler,
             connection_info,
             inbound_registry: None,
+            _connection_permit: None,
         }
+    }
+
+    /// Attach the server's connection-cap permit (internal).
+    pub(crate) fn with_connection_permit(
+        mut self,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Self {
+        self._connection_permit = permit;
+        self
     }
 
     /// Attach the inbound request registry (actor mode) for idempotent responses

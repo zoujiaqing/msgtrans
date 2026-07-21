@@ -9,18 +9,47 @@ use tokio::sync::oneshot;
 const DEFAULT_TIMEOUT_BUCKET_COUNT: usize = 256;
 const DEFAULT_TIMEOUT_TICK: Duration = Duration::from_millis(100);
 
+/// Which side of the wire a tracked request belongs to.
+///
+/// Inbound and outbound requests live in disjoint id spaces (each peer numbers
+/// its own requests), so the same `(session_id, request_id)` can legitimately
+/// be in flight in both directions at once. Without this field in the key, an
+/// inbound request colliding with a pending outbound one was refused outright,
+/// and responding to it could terminate the outbound entry instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RequestDirection {
+    /// A request received from the peer — we owe the response.
+    Inbound,
+    /// A request we sent — we await the response.
+    Outbound,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RequestKey {
     pub session_id: Option<SessionId>,
     pub request_id: u32,
+    pub direction: RequestDirection,
 }
 
 impl RequestKey {
-    pub fn new(session_id: Option<SessionId>, request_id: u32) -> Self {
+    pub fn new(
+        session_id: Option<SessionId>,
+        request_id: u32,
+        direction: RequestDirection,
+    ) -> Self {
         Self {
             session_id,
             request_id,
+            direction,
         }
+    }
+
+    fn inbound(session_id: Option<SessionId>, request_id: u32) -> Self {
+        Self::new(session_id, request_id, RequestDirection::Inbound)
+    }
+
+    fn outbound(session_id: Option<SessionId>, request_id: u32) -> Self {
+        Self::new(session_id, request_id, RequestDirection::Outbound)
     }
 }
 
@@ -197,6 +226,7 @@ impl RequestRegistry {
         }
     }
 
+    /// Track an inbound request (one the peer sent us and we owe a response to).
     pub fn register(
         &self,
         request_id: u32,
@@ -206,18 +236,21 @@ impl RequestRegistry {
     ) -> bool {
         // Inbound requests have no caller-side timeout, so they are scheduled into
         // the timeout wheel and reaped by the background scanner.
-        self.register_impl(request_id, session_id, biz_type, timeout, true)
+        self.register_impl(
+            RequestKey::inbound(session_id, request_id),
+            biz_type,
+            timeout,
+            true,
+        )
     }
 
     fn register_impl(
         &self,
-        request_id: u32,
-        session_id: Option<SessionId>,
+        key: RequestKey,
         biz_type: u8,
         timeout: Duration,
         schedule: bool,
     ) -> bool {
-        let key = RequestKey::new(session_id, request_id);
         let now = Instant::now();
         let entry = Arc::new(RequestEntry {
             key,
@@ -235,7 +268,7 @@ impl RequestRegistry {
             }
         }
 
-        if let Some(sid) = session_id {
+        if let Some(sid) = key.session_id {
             let set = self.session_index.entry(sid).or_default();
             set.insert(key);
         }
@@ -268,15 +301,15 @@ impl RequestRegistry {
         // (e.g. tokio::time::timeout) plus explicit removal, so they are NOT
         // scheduled into the timeout wheel. This also avoids unbounded bucket
         // growth on clients that run no timeout scanner.
-        if !self.register_impl(request_id, session_id, biz_type, timeout, false) {
+        let key = RequestKey::outbound(session_id, request_id);
+        if !self.register_impl(key, biz_type, timeout, false) {
             return Err(DuplicateRequest {
                 session_id,
                 request_id,
             });
         }
         let (tx, rx) = oneshot::channel();
-        self.waiters
-            .insert(RequestKey::new(session_id, request_id), tx);
+        self.waiters.insert(key, tx);
         Ok(rx)
     }
 
@@ -289,12 +322,10 @@ impl RequestRegistry {
         request_id: u32,
         packet: Packet,
     ) -> bool {
-        match self.mark_responded(session_id, request_id) {
+        let key = RequestKey::outbound(session_id, request_id);
+        match self.mark_responded_key(key) {
             MarkResult::Updated => {
-                if let Some((_, tx)) = self
-                    .waiters
-                    .remove(&RequestKey::new(session_id, request_id))
-                {
+                if let Some((_, tx)) = self.waiters.remove(&key) {
                     let _ = tx.send(packet);
                 }
                 true
@@ -307,12 +338,9 @@ impl RequestRegistry {
     /// Dropped and drop its waiter so the receiver observes cancellation.
     /// Returns true if a pending request was aborted.
     pub fn abort_waiter(&self, session_id: Option<SessionId>, request_id: u32) -> bool {
-        let aborted = matches!(
-            self.mark_dropped(session_id, request_id),
-            MarkResult::Updated
-        );
-        self.waiters
-            .remove(&RequestKey::new(session_id, request_id));
+        let key = RequestKey::outbound(session_id, request_id);
+        let aborted = matches!(self.mark_dropped_key(key), MarkResult::Updated);
+        self.waiters.remove(&key);
         aborted
     }
 
@@ -322,10 +350,7 @@ impl RequestRegistry {
         let keys: Vec<RequestKey> = self.entries.iter().map(|e| *e.key()).collect();
         let mut aborted = 0;
         for key in keys {
-            if matches!(
-                self.mark_dropped(key.session_id, key.request_id),
-                MarkResult::Updated
-            ) {
+            if matches!(self.mark_dropped_key(key), MarkResult::Updated) {
                 aborted += 1;
             }
             self.waiters.remove(&key);
@@ -337,9 +362,10 @@ impl RequestRegistry {
         &self,
         session_id: Option<SessionId>,
         request_id: u32,
+        direction: RequestDirection,
     ) -> Option<RequestState> {
         self.entries
-            .get(&RequestKey::new(session_id, request_id))
+            .get(&RequestKey::new(session_id, request_id, direction))
             .map(|entry| entry.state())
     }
 
@@ -347,8 +373,14 @@ impl RequestRegistry {
         self.entries.len()
     }
 
+    /// Mark an *inbound* request as responded (the business layer sent its
+    /// reply). Outbound completions go through `complete_waiter`, which uses
+    /// the outbound key internally.
     pub fn mark_responded(&self, session_id: Option<SessionId>, request_id: u32) -> MarkResult {
-        let key = RequestKey::new(session_id, request_id);
+        self.mark_responded_key(RequestKey::inbound(session_id, request_id))
+    }
+
+    fn mark_responded_key(&self, key: RequestKey) -> MarkResult {
         let Some(entry) = self.entries.get(&key) else {
             self.counters
                 .duplicate_response_total
@@ -398,8 +430,7 @@ impl RequestRegistry {
         }
     }
 
-    pub fn mark_dropped(&self, session_id: Option<SessionId>, request_id: u32) -> MarkResult {
-        let key = RequestKey::new(session_id, request_id);
+    fn mark_dropped_key(&self, key: RequestKey) -> MarkResult {
         let Some(entry) = self.entries.get(&key) else {
             return MarkResult::NotFound;
         };
@@ -548,7 +579,7 @@ mod tests {
 
         assert!(registry.register(request_id, session_id, 1, Duration::from_secs(3)));
         assert_eq!(
-            registry.get_state(session_id, request_id),
+            registry.get_state(session_id, request_id, RequestDirection::Inbound),
             Some(RequestState::Pending)
         );
 
@@ -556,7 +587,10 @@ mod tests {
             registry.mark_responded(session_id, request_id),
             MarkResult::Updated
         );
-        assert_eq!(registry.get_state(session_id, request_id), None);
+        assert_eq!(
+            registry.get_state(session_id, request_id, RequestDirection::Inbound),
+            None
+        );
 
         assert_eq!(
             registry.mark_responded(session_id, request_id),
@@ -580,9 +614,12 @@ mod tests {
             registry.mark_responded(Some(SessionId(1)), 77),
             MarkResult::Updated
         );
-        assert_eq!(registry.get_state(Some(SessionId(1)), 77), None);
         assert_eq!(
-            registry.get_state(Some(SessionId(2)), 77),
+            registry.get_state(Some(SessionId(1)), 77, RequestDirection::Inbound),
+            None
+        );
+        assert_eq!(
+            registry.get_state(Some(SessionId(2)), 77, RequestDirection::Inbound),
             Some(RequestState::Pending)
         );
         assert_eq!(registry.pending_count(), 1);
@@ -592,11 +629,14 @@ mod tests {
     fn timeout_only_updates_pending() {
         let registry = RequestRegistry::new();
         let request_id = 100;
-        let key = RequestKey::new(None, request_id);
+        let key = RequestKey::inbound(None, request_id);
 
         assert!(registry.register(request_id, None, 2, Duration::from_secs(1)));
         assert_eq!(registry.mark_timed_out(key), MarkResult::Updated);
-        assert_eq!(registry.get_state(None, request_id), None);
+        assert_eq!(
+            registry.get_state(None, request_id, RequestDirection::Inbound),
+            None
+        );
 
         assert_eq!(registry.mark_timed_out(key), MarkResult::NotFound);
 
@@ -618,10 +658,16 @@ mod tests {
         let closed = registry.close_session_pending(sid);
         assert_eq!(closed, 2);
 
-        assert_eq!(registry.get_state(Some(sid), 1), None);
-        assert_eq!(registry.get_state(Some(sid), 2), None);
         assert_eq!(
-            registry.get_state(Some(SessionId(1000)), 3),
+            registry.get_state(Some(sid), 1, RequestDirection::Inbound),
+            None
+        );
+        assert_eq!(
+            registry.get_state(Some(sid), 2, RequestDirection::Inbound),
+            None
+        );
+        assert_eq!(
+            registry.get_state(Some(SessionId(1000)), 3, RequestDirection::Inbound),
             Some(RequestState::Pending)
         );
 
@@ -653,8 +699,11 @@ mod tests {
         }
 
         assert!(timeout_total >= 1);
-        assert_eq!(registry.get_state(None, 1), None);
-        assert_eq!(registry.get_state(None, 2), Some(RequestState::Pending));
+        assert_eq!(registry.get_state(None, 1, RequestDirection::Inbound), None);
+        assert_eq!(
+            registry.get_state(None, 2, RequestDirection::Inbound),
+            Some(RequestState::Pending)
+        );
         assert_eq!(registry.active_len(), 1);
     }
 
@@ -674,13 +723,19 @@ mod tests {
         let mut rx = registry
             .try_register_waiter(50, sid, 0, Duration::from_secs(5))
             .expect("fresh key registers");
-        assert_eq!(registry.get_state(sid, 50), Some(RequestState::Pending));
+        assert_eq!(
+            registry.get_state(sid, 50, RequestDirection::Outbound),
+            Some(RequestState::Pending)
+        );
 
         let resp = Packet::response(50, b"pong".to_vec());
         assert!(registry.complete_waiter(sid, 50, resp));
         let got = rx.try_recv().expect("response delivered to waiter");
         assert_eq!(got.message_id(), 50);
-        assert_eq!(registry.get_state(sid, 50), None);
+        assert_eq!(
+            registry.get_state(sid, 50, RequestDirection::Outbound),
+            None
+        );
     }
 
     #[test]
@@ -702,7 +757,7 @@ mod tests {
     #[test]
     fn timeout_drops_waiter() {
         let registry = RequestRegistry::new();
-        let key = RequestKey::new(None, 70);
+        let key = RequestKey::outbound(None, 70);
         let mut rx = registry
             .try_register_waiter(70, None, 0, Duration::from_secs(1))
             .expect("fresh key registers");
@@ -752,7 +807,47 @@ mod tests {
             rx.try_recv(),
             Err(oneshot::error::TryRecvError::Closed)
         ));
-        assert_eq!(registry.get_state(sid, 100), None);
+        assert_eq!(
+            registry.get_state(sid, 100, RequestDirection::Outbound),
+            None
+        );
+    }
+
+    #[test]
+    fn same_id_inbound_and_outbound_coexist() {
+        // Peers number their own requests independently, so the same id can be
+        // in flight in both directions on one session. Before direction landed
+        // in the key, the inbound register was refused as a duplicate and
+        // responding to it could terminate the outbound entry.
+        let registry = RequestRegistry::new();
+        let sid = Some(SessionId(42));
+
+        let mut rx = registry
+            .try_register_waiter(500, sid, 0, Duration::from_secs(5))
+            .expect("outbound registers");
+        assert!(
+            registry.register(500, sid, 0, Duration::from_secs(5)),
+            "inbound with the same id must not be refused as a duplicate"
+        );
+
+        // Responding to the inbound request must not complete the outbound one.
+        assert_eq!(registry.mark_responded(sid, 500), MarkResult::Updated);
+        assert!(
+            rx.try_recv().is_err(),
+            "outbound waiter must still be pending"
+        );
+        assert_eq!(
+            registry.get_state(sid, 500, RequestDirection::Outbound),
+            Some(RequestState::Pending)
+        );
+        assert_eq!(
+            registry.get_state(sid, 500, RequestDirection::Inbound),
+            None
+        );
+
+        // The peer's response then completes the outbound normally.
+        assert!(registry.complete_waiter(sid, 500, Packet::response(500, b"ok".to_vec())));
+        assert!(rx.try_recv().is_ok());
     }
 
     #[test]

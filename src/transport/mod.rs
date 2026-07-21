@@ -77,8 +77,8 @@ pub use lockfree_connection::{
 // [STATE] Connection state management exports
 pub use connection_state::{ConnectionState, ConnectionStateManager};
 pub use request_registry::{
-    MarkResult as RequestMarkResult, RequestCountersSnapshot, RequestEntry, RequestKey,
-    RequestRegistry, RequestState,
+    MarkResult as RequestMarkResult, RequestCountersSnapshot, RequestDirection, RequestEntry,
+    RequestKey, RequestRegistry, RequestState,
 };
 
 use crate::packet::CompressionType;

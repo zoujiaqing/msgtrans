@@ -53,6 +53,60 @@ async fn echo_works(client: &TransportClient) -> bool {
     }
 }
 
+/// The cap must hold under a concurrent connect burst: the permit acquisition
+/// is atomic across accept loops, unlike the len() check it replaced, which
+/// could let several simultaneous accepts all observe N-1 and pass.
+#[tokio::test(flavor = "multi_thread")]
+async fn cap_holds_under_concurrent_burst() {
+    let addr = "127.0.0.1:28872";
+    const CAP: usize = 5;
+    let server = TransportServerBuilder::new()
+        .max_connections(CAP)
+        .protocol(TcpServerConfig::new(addr).expect("tcp server config"))
+        .build(Arc::new(Echo))
+        .await
+        .expect("build server");
+
+    let server_bg = server.clone();
+    tokio::spawn(async move {
+        let _ = server_bg.serve().await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // 20 clients connect simultaneously; hold them all open.
+    let mut tasks = Vec::new();
+    for _ in 0..20 {
+        tasks.push(tokio::spawn(async move {
+            let client = connect_client(addr).await;
+            let served = echo_works(&client).await;
+            (client, served)
+        }));
+    }
+    let mut clients = Vec::new();
+    let mut served = 0usize;
+    for t in tasks {
+        let (client, ok) = t.await.expect("join");
+        if ok {
+            served += 1;
+        }
+        clients.push(client); // keep alive so slots stay occupied
+    }
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let sessions = server.session_count().await;
+    assert!(
+        sessions <= CAP,
+        "cap must never be exceeded: {} sessions > cap {}",
+        sessions,
+        CAP
+    );
+    assert_eq!(
+        served, CAP,
+        "exactly cap clients should be served (got {})",
+        served
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn cap_rejects_then_releases() {
     let addr = "127.0.0.1:28871";

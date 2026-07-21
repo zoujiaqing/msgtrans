@@ -47,13 +47,16 @@ pub struct TransportServer {
         std::collections::HashMap<String, Box<dyn crate::protocol::adapter::DynServerConfig>>,
     state_manager: ConnectionStateManager,
     request_registry: Arc<crate::transport::request_registry::RequestRegistry>,
-    message_id_counter: std::sync::atomic::AtomicU32,
     session_handler: Arc<dyn SessionHandler>,
     actor_buffer_size: usize,
     frame_policy: crate::packet::FramePolicy,
-    /// Hard cap on concurrent sessions across all protocols. Connections
-    /// accepted while at capacity are closed immediately, before a Transport
-    /// or actor is allocated for them. `usize::MAX` = unlimited (default).
+    /// Hard cap on concurrent sessions across all protocols, enforced with a
+    /// semaphore so concurrent accept loops (TCP/WS/QUIC) cannot race past the
+    /// limit the way a len() check could. A connection accepted at capacity is
+    /// closed immediately, before a Transport or actor is allocated; the permit
+    /// lives inside the session's actor and is released when the actor ends.
+    connection_permits: Arc<tokio::sync::Semaphore>,
+    /// Configured cap, kept for logging only (the semaphore is the enforcer).
     max_connections: usize,
 }
 
@@ -91,10 +94,12 @@ impl TransportServer {
             request_registry: Arc::new(
                 crate::transport::request_registry::RequestRegistry::new_with_start_id(10000),
             ),
-            message_id_counter: std::sync::atomic::AtomicU32::new(20000),
             session_handler: handler,
             actor_buffer_size: buffer_size.unwrap_or(DEFAULT_ACTOR_BUFFER_SIZE),
             frame_policy: crate::packet::FramePolicy::Lenient,
+            connection_permits: Arc::new(tokio::sync::Semaphore::new(
+                tokio::sync::Semaphore::MAX_PERMITS,
+            )),
             max_connections: usize::MAX,
         })
     }
@@ -109,6 +114,8 @@ impl TransportServer {
     /// Set the concurrent-session cap. Internal; set via
     /// `TransportServerBuilder::max_connections`.
     pub(crate) fn with_max_connections(mut self, max: usize) -> Self {
+        let permits = max.min(tokio::sync::Semaphore::MAX_PERMITS);
+        self.connection_permits = Arc::new(tokio::sync::Semaphore::new(permits));
         self.max_connections = max;
         self
     }
@@ -314,9 +321,7 @@ impl TransportServer {
         session_id: SessionId,
         data: &[u8],
     ) -> Result<crate::event::TransportResult, TransportError> {
-        let message_id = self
-            .message_id_counter
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let message_id = self.request_registry.next_message_id();
         let packet = crate::packet::Packet::one_way(message_id, data.to_vec());
 
         tracing::debug!(
@@ -344,9 +349,7 @@ impl TransportServer {
         session_id: SessionId,
         data: &[u8],
     ) -> Result<crate::event::TransportResult, TransportError> {
-        let message_id = self
-            .message_id_counter
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let message_id = self.request_registry.next_message_id();
         let packet = crate::packet::Packet::request(message_id, data.to_vec());
 
         tracing::debug!(
@@ -386,6 +389,17 @@ impl TransportServer {
 
     /// [ABSTRACT] Add session - using Transport abstraction
     pub async fn add_session(&self, connection: Box<dyn crate::Connection>) -> SessionId {
+        self.add_session_with_permit(connection, None).await
+    }
+
+    /// Add a session carrying its connection-cap permit. The permit is moved
+    /// into the session's actor so capacity is released exactly when the actor
+    /// ends — whichever side closed and however teardown was reached.
+    pub(crate) async fn add_session_with_permit(
+        &self,
+        connection: Box<dyn crate::Connection>,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> SessionId {
         // [FIX] Use existing session ID from connection instead of generating new one
         let session_id = connection.session_id();
         let mut connection = connection;
@@ -441,7 +455,9 @@ impl TransportServer {
             connection_info,
             self.actor_buffer_size,
         );
-        let actor = actor.with_inbound_registry(Some(self.request_registry.clone()));
+        let actor = actor
+            .with_inbound_registry(Some(self.request_registry.clone()))
+            .with_connection_permit(permit);
         let actor_handle = match self.session_handles.insert(session_id, handle.clone()) {
             Ok(_) => {
                 tokio::spawn(actor.run());
@@ -950,20 +966,25 @@ impl TransportServer {
                             );
 
                             // Enforce the session cap before allocating a
-                            // Transport/actor for this connection. Rejecting here
-                            // keeps an over-capacity flood cheap: accept, close,
-                            // move on.
-                            let active = server_clone.transports.len();
-                            if active >= server_clone.max_connections {
-                                tracing::warn!(
-                                    "[LIMIT] {} connection rejected: at capacity ({}/{})",
-                                    protocol_name,
-                                    active,
-                                    server_clone.max_connections
-                                );
-                                let _ = connection.close().await;
-                                continue;
-                            }
+                            // Transport/actor for this connection. try_acquire on
+                            // a shared semaphore is atomic across the concurrent
+                            // per-protocol accept loops, so the cap cannot be
+                            // raced past the way a len() check could. Rejecting
+                            // here keeps an over-capacity flood cheap: accept,
+                            // close, move on.
+                            let permit =
+                                match server_clone.connection_permits.clone().try_acquire_owned() {
+                                    Ok(permit) => permit,
+                                    Err(_) => {
+                                        tracing::warn!(
+                                            "[LIMIT] {} connection rejected: at capacity ({})",
+                                            protocol_name,
+                                            server_clone.max_connections
+                                        );
+                                        let _ = connection.close().await;
+                                        continue;
+                                    }
+                                };
 
                             // Get connection info
                             let connection_info = connection.connection_info();
@@ -989,7 +1010,9 @@ impl TransportServer {
                             // `on_connected` itself, so there is no separate event
                             // to publish here (and no window where a message could
                             // overtake the connect notification).
-                            server_clone.add_session(connection).await;
+                            server_clone
+                                .add_session_with_permit(connection, Some(permit))
+                                .await;
                         }
                         Err(e) => {
                             if !server_clone
@@ -1090,11 +1113,11 @@ impl Clone for TransportServer {
             protocol_configs: cloned_configs,
             state_manager: self.state_manager.clone(),
             request_registry: self.request_registry.clone(),
-            message_id_counter: std::sync::atomic::AtomicU32::new(20000),
             session_handles: self.session_handles.clone(),
             session_handler: self.session_handler.clone(),
             actor_buffer_size: self.actor_buffer_size,
             frame_policy: self.frame_policy,
+            connection_permits: self.connection_permits.clone(),
             max_connections: self.max_connections,
         }
     }
