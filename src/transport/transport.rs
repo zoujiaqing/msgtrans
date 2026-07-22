@@ -118,10 +118,18 @@ impl Transport {
                 _ => None,
             }
         };
+        // The generation is closed either way — mark it even when its slot
+        // was already replaced by a newer generation (which must not be
+        // touched, but the OLD generation's state must still say closed).
+        self.state_manager.mark_closed(session_id).await;
         if taken.is_some() {
-            self.state_manager.mark_closed(session_id).await;
             tracing::debug!(
                 "[RETIRE] Generation {} slot removed after peer close",
+                session_id
+            );
+        } else {
+            tracing::debug!(
+                "[RETIRE] Stale generation {} retired (slot already replaced)",
                 session_id
             );
         }
@@ -567,6 +575,12 @@ impl Transport {
                         source_session
                     );
                 }
+                // Retire the dead slot BEFORE forwarding: the forward below can
+                // park on a saturated client queue, and until retirement runs
+                // is_connected() would keep reporting a corpse as live. The
+                // pipe teardown's retire remains as the idempotent fallback
+                // for abnormal endings that never produce this event.
+                self.retire_generation(source_session).await;
                 self.forward_client_event(crate::event::TransportEvent::ConnectionClosed {
                     reason,
                 })
@@ -872,21 +886,19 @@ mod generation_tests {
             .expect("registers");
 
         // A delayed response from generation 1 with the same message id must
-        // not complete it.
+        // not complete it — exercised through the REAL on_event path, so a
+        // regression that falls back to current_session_id is caught here.
         let stale = Packet::response(42, b"stale".to_vec());
-        assert!(
-            !transport
-                .request_registry
-                .complete_waiter(Some(id1), 42, stale),
-            "stale generation's response completed the new generation's request"
-        );
+        transport
+            .on_event(id1, crate::event::TransportEvent::MessageReceived(stale))
+            .await;
         assert!(rx.try_recv().is_err(), "waiter must still be pending");
 
-        // The correct generation's response completes it.
+        // The correct generation's response completes it, same path.
         let good = Packet::response(42, b"good".to_vec());
-        assert!(transport
-            .request_registry
-            .complete_waiter(Some(id2), 42, good));
+        transport
+            .on_event(id2, crate::event::TransportEvent::MessageReceived(good))
+            .await;
         assert_eq!(rx.try_recv().expect("delivered").payload, b"good"[..]);
     }
 }
