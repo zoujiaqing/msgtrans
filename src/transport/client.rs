@@ -124,11 +124,12 @@ impl Default for TransportClientBuilder {
 }
 
 /// [TARGET] Transport layer client - Uses Transport for single connection management
-/// Dropping a TransportClient is deterministic: the forwarding task is
-/// aborted synchronously (it only forwards; nothing user-visible is lost by a
-/// dropped client), and everything else cascades — the background tasks hold
-/// only Weak<Transport>, so the Transport, connection, socket and the server's
-/// session/permit are released without needing an explicit disconnect().
+/// Dropping a TransportClient deterministically REQUESTS cancellation (the
+/// abort cannot be skipped) but does not join the task; resources are then
+/// released by cascade — background tasks hold only Weak<Transport>, so the
+/// Transport, connection, socket and the server-side session/permit are freed
+/// shortly after, without an explicit disconnect(). Completion guarantees
+/// belong to the async shutdown path (planned shutdown().await).
 pub struct TransportClient {
     inner: Arc<Transport>,
     retry_config: RetryConfig,

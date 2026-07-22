@@ -123,3 +123,96 @@ async fn shutdown_drains_sessions_and_reports() {
     );
     assert_eq!(server.session_count().await, 0);
 }
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::Notify;
+
+struct GatedEcho {
+    gate: Arc<Notify>,
+    open: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl SessionHandler for GatedEcho {
+    async fn on_message(&self, _s: SessionId, _p: Packet, _tx: SessionSender) {
+        while !self.open.load(Ordering::SeqCst) {
+            self.gate.notified().await;
+        }
+    }
+}
+
+/// The zombie-session regression: shutdown's deadline fires while a close is
+/// already past the Closing state transition (the actor is blocked, its tiny
+/// mailbox full, so the close parks feeding it the close event). Cancelling
+/// that close future would strand the session as a permanent zombie — both
+/// close paths gate on "already closing" and would return Ok forever. With
+/// owned close tasks, the deadline only abandons the JOIN: the close keeps
+/// running, finishes once unblocked, and a second shutdown finds nothing left.
+#[tokio::test(flavor = "multi_thread")]
+async fn deadline_during_close_leaves_no_zombie_session() {
+    let addr = "127.0.0.1:28884";
+    let gate = Arc::new(Notify::new());
+    let open = Arc::new(AtomicBool::new(false));
+    let server = TransportServerBuilder::new()
+        .actor_buffer_size(4)
+        .protocol(TcpServerConfig::new(addr).expect("cfg"))
+        .build(Arc::new(GatedEcho {
+            gate: gate.clone(),
+            open: open.clone(),
+        }))
+        .await
+        .expect("server");
+    let bg = server.clone();
+    tokio::spawn(async move {
+        let _ = bg.serve().await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let client = connect(addr).await;
+    // Block the actor and fill its mailbox so the close event cannot enter.
+    for i in 0..12u32 {
+        client
+            .send(format!("{}", i).as_bytes())
+            .await
+            .expect("send");
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(server.session_count().await, 1);
+
+    // Tiny budget: the deadline WILL fire mid-close.
+    let started = std::time::Instant::now();
+    let report = server
+        .shutdown_with_timeout(Duration::from_millis(300))
+        .await;
+    let elapsed = started.elapsed();
+    assert!(!report.clean, "blocked actor must force clean=false");
+    assert_eq!(report.sessions_remaining, 1);
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "small timeout must bound real elapsed, took {:?}",
+        elapsed
+    );
+
+    // Unblock: the detached close task must finish the job on its own.
+    open.store(true, Ordering::SeqCst);
+    gate.notify_waiters();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while server.session_count().await != 0 {
+        gate.notify_waiters();
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "zombie session: close never completed after unblocking"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // A second shutdown must be clean and instant — no stuck Closing state.
+    let report2 = server.shutdown_with_timeout(Duration::from_secs(2)).await;
+    assert!(
+        report2.clean,
+        "second shutdown hit zombie state: {:?}",
+        report2
+    );
+    assert_eq!(report2.sessions_remaining, 0);
+    drop(client);
+}

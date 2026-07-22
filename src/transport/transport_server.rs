@@ -1132,14 +1132,29 @@ impl TransportServer {
         self.is_running
             .store(false, std::sync::atomic::Ordering::SeqCst);
 
-        // Close every live session, each bounded by the remaining budget.
+        // Close every live session as an OWNED task and bound the JOIN by the
+        // remaining budget. Timing out the join must not cancel the close:
+        // close_session flips the state to Closing before its awaits, and a
+        // dropped future there would leave a session neither closable again
+        // (both close paths gate on "already closing") nor removed — a
+        // permanent zombie holding its permit. Spawned tasks keep running
+        // past the deadline and finish on their own (the in-close graceful
+        // timeout bounds them); the report then simply says clean=false.
         let session_ids: Vec<SessionId> = self.transports.keys().unwrap_or_default();
-        let mut sessions_closed = 0usize;
-        for session_id in session_ids {
-            match tokio::time::timeout_at(deadline, self.close_session(session_id)).await {
-                Ok(Ok(())) => sessions_closed += 1,
-                Ok(Err(_)) => {}
-                Err(_) => break, // budget exhausted; report will say so
+        let initial: std::collections::HashSet<SessionId> = session_ids.iter().copied().collect();
+        let close_tasks: Vec<tokio::task::JoinHandle<()>> = session_ids
+            .into_iter()
+            .map(|session_id| {
+                let server = self.clone();
+                tokio::spawn(async move {
+                    let _ = server.close_session(session_id).await;
+                })
+            })
+            .collect();
+        for task in close_tasks {
+            if tokio::time::timeout_at(deadline, task).await.is_err() {
+                // Budget spent waiting; remaining closes continue detached.
+                break;
             }
         }
         loop {
@@ -1154,20 +1169,35 @@ impl TransportServer {
                 );
                 break;
             }
-            // Close anything that slipped in after the first sweep, still
-            // spending from the same budget.
+            // Close anything that slipped in after the first sweep — same
+            // owned-task pattern, same budget, never cancelling a close.
             for session_id in self.transports.keys().unwrap_or_default() {
-                if tokio::time::timeout_at(deadline, self.close_session(session_id))
-                    .await
-                    .is_err()
-                {
+                let server = self.clone();
+                let task = tokio::spawn(async move {
+                    let _ = server.close_session(session_id).await;
+                });
+                if tokio::time::timeout_at(deadline, task).await.is_err() {
                     break;
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            // Poll pause bounded by the SAME deadline (a fixed sleep could
+            // overshoot a small timeout).
+            let pause = std::cmp::min(
+                deadline,
+                tokio::time::Instant::now() + std::time::Duration::from_millis(20),
+            );
+            tokio::time::sleep_until(pause).await;
         }
 
         let sessions_remaining = self.transports.len();
+        // Count sessions that were present at entry and are actually gone now
+        // (an Ok(()) from close_session can also mean "already closing", which
+        // proves nothing). Runtime-join based accounting arrives with the
+        // supervisor.
+        let sessions_closed = initial
+            .iter()
+            .filter(|sid| self.transports.get(sid).is_none())
+            .count();
         let report = ShutdownReport {
             sessions_closed,
             sessions_remaining,
@@ -1194,7 +1224,8 @@ pub struct ShutdownReport {
     pub sessions_closed: usize,
     /// Sessions still draining when the deadline hit (0 on a clean shutdown).
     pub sessions_remaining: usize,
-    /// True iff every session was fully reaped before the deadline.
+    /// True iff the session map drained before the deadline (see the
+    /// LIMITATION on shutdown_with_timeout for what this does not yet prove).
     pub clean: bool,
     /// Wall time the shutdown took.
     pub elapsed: std::time::Duration,
