@@ -124,6 +124,11 @@ impl Default for TransportClientBuilder {
 }
 
 /// [TARGET] Transport layer client - Uses Transport for single connection management
+/// Dropping a TransportClient is deterministic: the forwarding task is
+/// aborted synchronously (it only forwards; nothing user-visible is lost by a
+/// dropped client), and everything else cascades — the background tasks hold
+/// only Weak<Transport>, so the Transport, connection, socket and the server's
+/// session/permit are released without needing an explicit disconnect().
 pub struct TransportClient {
     inner: Arc<Transport>,
     retry_config: RetryConfig,
@@ -629,3 +634,17 @@ impl TransportClient {
 }
 
 // Simplification complete - Unique connection method that meets user requirements
+
+impl Drop for TransportClient {
+    fn drop(&mut self) {
+        // try_write: Drop cannot await. The forwarding task owns the client
+        // event receiver; aborting it here (instead of relying on the channel
+        // closing) makes teardown immediate even if the task is parked on a
+        // saturated queue.
+        if let Ok(mut guard) = self.event_forwarding_task.try_write() {
+            if let Some(handle) = guard.take() {
+                handle.abort();
+            }
+        }
+    }
+}

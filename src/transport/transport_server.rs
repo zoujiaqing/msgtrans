@@ -1096,11 +1096,97 @@ impl TransportServer {
     }
 
     /// [STOP] Stop server
+    ///
+    /// Only flips the accept flag; listeners exit on their next poll but
+    /// nothing is awaited. For a verifiable teardown use [`Self::shutdown`].
     pub async fn stop(&self) {
         tracing::info!("[STOP] Stopping TransportServer");
         self.is_running
             .store(false, std::sync::atomic::Ordering::SeqCst);
     }
+
+    /// Graceful, awaitable shutdown with a default 10s deadline.
+    pub async fn shutdown(&self) -> ShutdownReport {
+        self.shutdown_with_timeout(std::time::Duration::from_secs(10))
+            .await
+    }
+
+    /// Stop accepting, close every session, and wait (up to `timeout`) until
+    /// all sessions have actually been reaped — actors ended, permits
+    /// released. Returns what really happened instead of pretending: if the
+    /// deadline passes with sessions still draining, `clean` is false and
+    /// `sessions_remaining` says how many are left.
+    ///
+    /// Listener tasks exit on their next accept poll after the flag flips;
+    /// `serve()` (which owns their JoinHandles) returns once they do, so the
+    /// caller's existing `serve().await` is the listener join point.
+    pub async fn shutdown_with_timeout(&self, timeout: std::time::Duration) -> ShutdownReport {
+        let started = std::time::Instant::now();
+        tracing::info!("[SHUTDOWN] TransportServer shutdown initiated");
+        self.is_running
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+
+        // Close every live session. close_session feeds the actor a close,
+        // closes the connection, and removes the session's maps + permit.
+        let session_ids: Vec<SessionId> = self.transports.keys().unwrap_or_default();
+        let mut sessions_closed = 0usize;
+        for session_id in session_ids {
+            if self.close_session(session_id).await.is_ok() {
+                sessions_closed += 1;
+            }
+        }
+
+        // Wait for stragglers (sessions racing in through the last accept
+        // window, or teardown still reaping) to drain, bounded by the deadline.
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = self.transports.len();
+            if remaining == 0 {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    "[SHUTDOWN] Deadline reached with {} session(s) still draining",
+                    remaining
+                );
+                break;
+            }
+            // Close anything that slipped in after the first sweep.
+            for session_id in self.transports.keys().unwrap_or_default() {
+                let _ = self.close_session(session_id).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let sessions_remaining = self.transports.len();
+        let report = ShutdownReport {
+            sessions_closed,
+            sessions_remaining,
+            clean: sessions_remaining == 0,
+            elapsed: started.elapsed(),
+        };
+        tracing::info!(
+            "[SHUTDOWN] Complete: closed={} remaining={} clean={} elapsed={:?}",
+            report.sessions_closed,
+            report.sessions_remaining,
+            report.clean,
+            report.elapsed
+        );
+        report
+    }
+}
+
+/// What a [`TransportServer::shutdown`] actually accomplished.
+#[derive(Debug, Clone)]
+pub struct ShutdownReport {
+    /// Sessions gracefully closed by this shutdown.
+    pub sessions_closed: usize,
+    /// Sessions still draining when the deadline hit (0 on a clean shutdown).
+    pub sessions_remaining: usize,
+    /// True iff every session was fully reaped before the deadline.
+    pub clean: bool,
+    /// Wall time the shutdown took.
+    pub elapsed: std::time::Duration,
 }
 
 impl Clone for TransportServer {

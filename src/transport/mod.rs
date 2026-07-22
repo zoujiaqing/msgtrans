@@ -47,7 +47,7 @@ pub use client::{RetryConfig, TransportClient, TransportClientBuilder};
 pub use context::TransportContext;
 pub use server::TransportServerBuilder;
 pub use transport::Transport;
-pub use transport_server::TransportServer;
+pub use transport_server::{ShutdownReport, TransportServer};
 
 // [CONFIG] Configuration exports
 pub use config::TransportConfig;
