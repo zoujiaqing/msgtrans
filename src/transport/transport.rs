@@ -104,6 +104,29 @@ impl Transport {
         }
     }
 
+    /// Retire a dead generation: atomically remove the ConnectionSlot if it
+    /// still belongs to `session_id` and mark the connection closed. Called
+    /// from the pipe consumer's teardown after a peer-initiated close, so a
+    /// dead connection is not left installed — without this, is_connected()
+    /// kept answering true and the corpse was only discovered on the next
+    /// send. A newer generation's slot is never touched.
+    pub(crate) async fn retire_generation(&self, session_id: SessionId) {
+        let taken = {
+            let mut guard = self.slot.lock().await;
+            match guard.as_ref() {
+                Some(slot) if slot.session_id == session_id => guard.take(),
+                _ => None,
+            }
+        };
+        if taken.is_some() {
+            self.state_manager.mark_closed(session_id).await;
+            tracing::debug!(
+                "[RETIRE] Generation {} slot removed after peer close",
+                session_id
+            );
+        }
+    }
+
     /// [TARGET] Unified close method: graceful session shutdown
     pub async fn close_session(&self, session_id: SessionId) -> Result<(), TransportError> {
         // 1. Check if we can start closing
@@ -251,23 +274,30 @@ impl Transport {
     /// construction — a stale generation's cleanup can never touch its
     /// replacement, because they never share an id. Callers must use the
     /// returned id; nothing else may invent one.
-    pub async fn set_connection(
+    pub(crate) async fn set_connection(
         self: &Arc<Self>,
         mut connection: Box<dyn Connection>,
     ) -> SessionId {
-        let epoch = self
-            .connection_epoch
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            + 1;
-        let session_id = SessionId::new(epoch);
-
-        connection.set_session_id(session_id);
-        let event_pipe_opt = connection.take_event_pipe();
-
-        *self.slot.lock().await = Some(ConnectionSlot {
-            session_id,
-            connection,
-        });
+        // Allocate the epoch INSIDE the slot lock so allocation order and
+        // installation order cannot invert under concurrent calls (an
+        // out-of-order install would make the newest generation judge itself
+        // stale). pub(crate): the supervisor/protocol layer is the only
+        // legitimate installer.
+        let (session_id, event_pipe_opt) = {
+            let mut guard = self.slot.lock().await;
+            let epoch = self
+                .connection_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            let session_id = SessionId::new(epoch);
+            connection.set_session_id(session_id);
+            let event_pipe_opt = connection.take_event_pipe();
+            *guard = Some(ConnectionSlot {
+                session_id,
+                connection,
+            });
+            (session_id, event_pipe_opt)
+        };
         self.state_manager.add_connection(session_id);
         // Open request tracking for this session; the registry refuses
         // registrations for sessions that were never opened or already closed.
@@ -283,9 +313,8 @@ impl Transport {
             let this = Arc::downgrade(self);
             tokio::spawn(async move {
                 tracing::debug!(
-                    "[LISTEN] Transport event consumer started (pipe, session: {}, epoch: {})",
-                    session_id,
-                    epoch
+                    "[LISTEN] Transport event consumer started (pipe, session: {})",
+                    session_id
                 );
                 while let Some(event) = pipe.next().await {
                     let Some(strong) = this.upgrade() else { break };
@@ -296,7 +325,7 @@ impl Transport {
                     if strong
                         .connection_epoch
                         .load(std::sync::atomic::Ordering::SeqCst)
-                        != epoch
+                        != session_id.as_u64()
                     {
                         break;
                     }
@@ -306,6 +335,7 @@ impl Transport {
                 // Generation-scoped teardown: closes only THIS connection's
                 // session, so even a late-running stale task cannot cancel the
                 // replacement generation's requests (its session id differs).
+                strong.retire_generation(session_id).await;
                 let failed_pending = strong.request_registry.close_session_pending(session_id);
                 if failed_pending > 0 {
                     tracing::debug!(
@@ -315,9 +345,8 @@ impl Transport {
                     );
                 }
                 tracing::debug!(
-                    "[LISTEN] Transport event consumer ended (pipe, session: {}, epoch: {})",
-                    session_id,
-                    epoch
+                    "[LISTEN] Transport event consumer ended (pipe, session: {})",
+                    session_id
                 );
             });
         }
