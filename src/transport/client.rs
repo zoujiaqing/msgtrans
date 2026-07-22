@@ -351,18 +351,29 @@ impl TransportClient {
     /// `connect()` again); `shutdown()` ends the client. After it returns, no
     /// background task of this client is running.
     pub async fn shutdown(&mut self) -> Result<(), TransportError> {
-        // Idempotent: only the Active -> ShuttingDown winner runs the flow.
-        if self
-            .phase
-            .compare_exchange(
-                CLIENT_ACTIVE,
-                CLIENT_SHUTTING_DOWN,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            )
-            .is_err()
-        {
-            return Ok(());
+        // Lifecycle gate: Stopped is done; Active transitions to
+        // ShuttingDown; a leftover ShuttingDown (a previous shutdown future
+        // was cancelled mid-flight) is RESUMED, not reported as success — the
+        // body below is idempotent, so re-running it finishes the teardown.
+        loop {
+            match self.phase.load(Ordering::SeqCst) {
+                CLIENT_STOPPED => return Ok(()),
+                CLIENT_SHUTTING_DOWN => break, // resume interrupted teardown
+                _ => {
+                    if self
+                        .phase
+                        .compare_exchange(
+                            CLIENT_ACTIVE,
+                            CLIENT_SHUTTING_DOWN,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        )
+                        .is_ok()
+                    {
+                        break;
+                    }
+                }
+            }
         }
         // Graceful disconnect; a failure while actually connected is real and
         // must not be swallowed — but teardown continues regardless.

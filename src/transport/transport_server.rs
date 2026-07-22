@@ -81,10 +81,13 @@ pub struct TransportServer {
     server_phase: Arc<std::sync::atomic::AtomicU8>,
     phase_notify: Arc<tokio::sync::watch::Sender<u8>>,
     /// Session-completion channel: supervisors send their id as their last
-    /// act; the reaper (owned below) is the ONE owner that joins the finished
-    /// supervisor handle and removes the registry entry. Session tasks never
-    /// remove their own ownership.
+    /// act; the reaper is the ONE owner that joins the finished supervisor
+    /// handle and removes the registry entry. Session tasks never remove
+    /// their own ownership.
     reaper_tx: tokio::sync::mpsc::UnboundedSender<SessionId>,
+    /// The reaper's JoinHandle — owned here, not detached. It runs for the
+    /// server object's lifetime and exits when the last sender drops.
+    reaper_task: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// Serializes shutdown owners; concurrent/repeat shutdowns queue here and
     /// re-run the idempotent flow (instant once everything is drained).
     shutdown_lock: Arc<tokio::sync::Mutex<()>>,
@@ -144,6 +147,7 @@ impl TransportServer {
             server_phase: Arc::new(std::sync::atomic::AtomicU8::new(PHASE_IDLE)),
             phase_notify: Arc::new(tokio::sync::watch::channel(PHASE_IDLE).0),
             reaper_tx,
+            reaper_task: Arc::new(std::sync::Mutex::new(None)),
             shutdown_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
         server.spawn_reaper(reaper_rx);
@@ -681,16 +685,18 @@ impl TransportServer {
     /// and holds the entry out simply wins; the reaper's remove is a no-op.
     fn spawn_reaper(&self, mut rx: tokio::sync::mpsc::UnboundedReceiver<SessionId>) {
         let supervisors = self.session_supervisors.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             while let Some(session_id) = rx.recv().await {
                 if let Some((_, entry)) = supervisors.remove(&session_id) {
                     // The signal is sent just before return, so this join is
                     // effectively instant — the reaper never blocks on a live
-                    // session.
+                    // session. Ownership note: remove() is the arbiter — either
+                    // the reaper or a shutdown gets the entry, never both.
                     let _ = entry.task.await;
                 }
             }
         });
+        *self.reaper_task.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
     }
 
     /// Handle one pumped transport event for a session: complete server-side
@@ -1072,6 +1078,13 @@ impl TransportServer {
                                 task.abort();
                                 let _ = task.await;
                             }
+                            // Sessions admitted through the listeners that DID start
+                            // must not leak past this failure: close admission
+                            // and cancel the root — their supervisors cascade
+                            // and the reaper reaps them.
+                            self.admission_open
+                                .store(false, std::sync::atomic::Ordering::SeqCst);
+                            self.root_cancel.cancel();
                             return Err(e);
                         }
                     }
@@ -1084,27 +1097,58 @@ impl TransportServer {
                         task.abort();
                         let _ = task.await;
                     }
+                    // Sessions admitted through the listeners that DID start
+                    // must not leak past this failure: close admission
+                    // and cancel the root — their supervisors cascade
+                    // and the reaper reaps them.
+                    self.admission_open
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                    self.root_cancel.cancel();
                     return Err(e);
                 }
             }
         }
 
         listen_tasks.push(self.start_request_timeout_scanner());
-        self.set_phase(PHASE_RUNNING);
+        // CAS, not a blind store: a shutdown that raced us during Starting has
+        // already published ShuttingDown, and Running must not resurrect the
+        // server past it (the listeners will observe is_running=false and
+        // exit; the guard still lands on Stopped).
+        if self
+            .server_phase
+            .compare_exchange(
+                PHASE_STARTING,
+                PHASE_RUNNING,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            let _ = self.phase_notify.send_replace(PHASE_RUNNING);
+        }
 
         tracing::info!("[TARGET] All protocol servers started, waiting for connections...");
 
-        // Root join: every listener + the scanner completes here. An abnormal
-        // child exit (panic/cancel) stops the siblings and STILL joins them
-        // all, so no infra task can outlive serve().
+        // Root join via JoinSet: completion/failure is observed in ARRIVAL
+        // order, so a later-started task failing first is seen immediately
+        // (sequential awaits would sit blind on task 0). On any failure the
+        // stop flag drops and the remaining siblings are still drained — no
+        // infra task can outlive serve().
+        let mut join_set = tokio::task::JoinSet::new();
+        for task in listen_tasks {
+            join_set.spawn(async move { task.await });
+        }
         let mut failed = false;
-        for (index, task) in listen_tasks.into_iter().enumerate() {
-            if let Err(e) = task.await {
-                tracing::error!("[ERROR] Infra task {} failed: {:?}", index + 1, e);
+        while let Some(res) = join_set.join_next().await {
+            let inner = match res {
+                Ok(inner) => inner,
+                Err(e) => Err(e),
+            };
+            if let Err(e) = inner {
+                tracing::error!("[ERROR] Infra task failed: {:?}", e);
                 failed = true;
                 self.is_running
                     .store(false, std::sync::atomic::Ordering::SeqCst);
-                // Remaining iterations join the (now stopping) siblings.
             }
         }
         if failed {
@@ -1396,15 +1440,38 @@ impl TransportServer {
         let sids: Vec<SessionId> = self.session_supervisors.iter().map(|e| *e.key()).collect();
         let mut sessions_closed = 0usize;
         for sid in sids {
-            let Some((_, mut entry)) = self.session_supervisors.remove(&sid) else {
-                sessions_closed += 1; // supervisor self-completed meanwhile
+            let Some((_, entry)) = self.session_supervisors.remove(&sid) else {
+                sessions_closed += 1; // reaper got there first
                 continue;
             };
-            match tokio::time::timeout_at(deadline, &mut entry.task).await {
-                Ok(_) => sessions_closed += 1,
+            // Cancel-safety: if THIS shutdown future is dropped mid-join, the
+            // guard re-inserts the entry — the removed JoinHandle is never
+            // lost with the cancelled future.
+            struct Reinsert<'a> {
+                map: &'a dashmap::DashMap<SessionId, SessionSupervisorEntry>,
+                sid: SessionId,
+                entry: Option<SessionSupervisorEntry>,
+            }
+            impl Drop for Reinsert<'_> {
+                fn drop(&mut self) {
+                    if let Some(entry) = self.entry.take() {
+                        self.map.insert(self.sid, entry);
+                    }
+                }
+            }
+            let mut guard = Reinsert {
+                map: &self.session_supervisors,
+                sid,
+                entry: Some(entry),
+            };
+            let task = &mut guard.entry.as_mut().expect("present").task;
+            match tokio::time::timeout_at(deadline, task).await {
+                Ok(_) => {
+                    guard.entry.take(); // joined: consume, do not re-insert
+                    sessions_closed += 1;
+                }
                 Err(_) => {
-                    // Budget exhausted: keep ownership for a later shutdown.
-                    self.session_supervisors.insert(sid, entry);
+                    // Budget exhausted: guard's Drop re-inserts — still owned.
                 }
             }
         }
@@ -1539,6 +1606,7 @@ impl Clone for TransportServer {
             server_phase: self.server_phase.clone(),
             phase_notify: self.phase_notify.clone(),
             reaper_tx: self.reaper_tx.clone(),
+            reaper_task: self.reaper_task.clone(),
             shutdown_lock: self.shutdown_lock.clone(),
         }
     }
