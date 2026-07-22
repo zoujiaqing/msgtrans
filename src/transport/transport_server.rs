@@ -1111,34 +1111,37 @@ impl TransportServer {
             .await
     }
 
-    /// Stop accepting, close every session, and wait (up to `timeout`) until
-    /// all sessions have actually been reaped — actors ended, permits
-    /// released. Returns what really happened instead of pretending: if the
-    /// deadline passes with sessions still draining, `clean` is false and
-    /// `sessions_remaining` says how many are left.
+    /// Stop accepting, close every session, and wait (up to `timeout`) for the
+    /// session map to drain.
     ///
-    /// Listener tasks exit on their next accept poll after the flag flips;
-    /// `serve()` (which owns their JoinHandles) returns once they do, so the
-    /// caller's existing `serve().await` is the listener join point.
+    /// LIMITATION (tracked, pre-supervisor): `clean` currently proves only
+    /// that the session map emptied within the deadline. It does NOT yet prove
+    /// listener exit (ports may still be briefly bound), actor completion
+    /// (permits are held by actors and release on actor drop), or pump/scanner
+    /// termination — those require the server to own the task JoinHandles and
+    /// join them, which is the supervisor work in progress. Await `serve()`
+    /// after this returns for the listener join today.
     pub async fn shutdown_with_timeout(&self, timeout: std::time::Duration) -> ShutdownReport {
         let started = std::time::Instant::now();
+        // ONE deadline, created before any work: every phase below spends from
+        // the same budget. (The first version created it after the close
+        // sweep, so N slow sessions could burn N x graceful_timeout before the
+        // "timeout" even started.)
+        let deadline = tokio::time::Instant::now() + timeout;
         tracing::info!("[SHUTDOWN] TransportServer shutdown initiated");
         self.is_running
             .store(false, std::sync::atomic::Ordering::SeqCst);
 
-        // Close every live session. close_session feeds the actor a close,
-        // closes the connection, and removes the session's maps + permit.
+        // Close every live session, each bounded by the remaining budget.
         let session_ids: Vec<SessionId> = self.transports.keys().unwrap_or_default();
         let mut sessions_closed = 0usize;
         for session_id in session_ids {
-            if self.close_session(session_id).await.is_ok() {
-                sessions_closed += 1;
+            match tokio::time::timeout_at(deadline, self.close_session(session_id)).await {
+                Ok(Ok(())) => sessions_closed += 1,
+                Ok(Err(_)) => {}
+                Err(_) => break, // budget exhausted; report will say so
             }
         }
-
-        // Wait for stragglers (sessions racing in through the last accept
-        // window, or teardown still reaping) to drain, bounded by the deadline.
-        let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let remaining = self.transports.len();
             if remaining == 0 {
@@ -1151,9 +1154,15 @@ impl TransportServer {
                 );
                 break;
             }
-            // Close anything that slipped in after the first sweep.
+            // Close anything that slipped in after the first sweep, still
+            // spending from the same budget.
             for session_id in self.transports.keys().unwrap_or_default() {
-                let _ = self.close_session(session_id).await;
+                if tokio::time::timeout_at(deadline, self.close_session(session_id))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
@@ -1176,7 +1185,9 @@ impl TransportServer {
     }
 }
 
-/// What a [`TransportServer::shutdown`] actually accomplished.
+/// What a [`TransportServer::shutdown`] accomplished. See the LIMITATION on
+/// [`TransportServer::shutdown_with_timeout`] for what `clean` does and does
+/// not yet prove.
 #[derive(Debug, Clone)]
 pub struct ShutdownReport {
     /// Sessions gracefully closed by this shutdown.

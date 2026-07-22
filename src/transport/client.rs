@@ -145,6 +145,9 @@ pub struct TransportClient {
     event_receiver: Arc<RwLock<Option<tokio::sync::mpsc::Receiver<crate::event::ClientEvent>>>>,
     event_forwarding_running: Arc<AtomicBool>,
     event_forwarding_task: Arc<RwLock<Option<JoinHandle<()>>>>,
+    /// Synchronously accessible abort handle for Drop (try_write on the
+    /// RwLock could silently skip the abort under contention).
+    forwarding_abort: Arc<std::sync::Mutex<Option<tokio::task::AbortHandle>>>,
 }
 
 /// Capacity of the client event queue.
@@ -168,6 +171,7 @@ impl TransportClient {
             event_receiver: Arc::new(RwLock::new(Some(event_receiver))),
             event_forwarding_running: Arc::new(AtomicBool::new(false)),
             event_forwarding_task: Arc::new(RwLock::new(None)),
+            forwarding_abort: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -601,6 +605,10 @@ impl TransportClient {
                 tracing::debug!("[END] TransportClient event forwarding task ended");
             });
 
+            *self
+                .forwarding_abort
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(handle.abort_handle());
             *self.event_forwarding_task.write().await = Some(handle);
 
             tracing::debug!("[SUCCESS] TransportClient event forwarding task started");
@@ -637,14 +645,17 @@ impl TransportClient {
 
 impl Drop for TransportClient {
     fn drop(&mut self) {
-        // try_write: Drop cannot await. The forwarding task owns the client
-        // event receiver; aborting it here (instead of relying on the channel
-        // closing) makes teardown immediate even if the task is parked on a
-        // saturated queue.
-        if let Ok(mut guard) = self.event_forwarding_task.try_write() {
-            if let Some(handle) = guard.take() {
-                handle.abort();
-            }
+        // Best-effort cancellation, but never silently skipped: the
+        // AbortHandle lives behind a sync Mutex, so no async-lock contention
+        // can make Drop miss it. abort() requests cancellation; it does not
+        // join — deterministic completion is the async shutdown path's job.
+        if let Some(abort) = self
+            .forwarding_abort
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            abort.abort();
         }
     }
 }
