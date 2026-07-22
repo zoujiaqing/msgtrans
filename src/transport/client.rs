@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU8, Ordering},
     Arc,
 };
 /// Client transport layer module
@@ -149,7 +149,16 @@ pub struct TransportClient {
     /// Synchronously accessible abort handle for Drop (try_write on the
     /// RwLock could silently skip the abort under contention).
     forwarding_abort: Arc<std::sync::Mutex<Option<tokio::task::AbortHandle>>>,
+    /// Client lifecycle: 0 Active, 1 ShuttingDown, 2 Stopped. Once Stopped,
+    /// connect() rejects before touching the network — the take-once event
+    /// receiver is gone, so a new connection could never receive events and
+    /// would be a half-alive lie.
+    phase: Arc<AtomicU8>,
 }
+
+const CLIENT_ACTIVE: u8 = 0;
+const CLIENT_SHUTTING_DOWN: u8 = 1;
+const CLIENT_STOPPED: u8 = 2;
 
 /// Capacity of the client event queue.
 const CLIENT_EVENT_QUEUE: usize = 8192;
@@ -173,11 +182,21 @@ impl TransportClient {
             event_forwarding_running: Arc::new(AtomicBool::new(false)),
             event_forwarding_task: Arc::new(RwLock::new(None)),
             forwarding_abort: Arc::new(std::sync::Mutex::new(None)),
+            phase: Arc::new(AtomicU8::new(CLIENT_ACTIVE)),
         }
     }
 
     /// [CONNECT] Use protocol configuration specified at build time for connection - Framework's only connection method
     pub async fn connect(&mut self) -> Result<(), TransportError> {
+        // Lifecycle gate BEFORE any network work: a shut-down client's event
+        // receiver is permanently gone, so a connection made here could send
+        // but never receive — reject instead of building that half-alive state.
+        if self.phase.load(Ordering::SeqCst) != CLIENT_ACTIVE {
+            return Err(TransportError::connection_error(
+                "Client has been shut down; create a new client to reconnect",
+                false,
+            ));
+        }
         // Check if protocol configuration exists and clone to avoid borrow conflicts
         let protocol_config = self.protocol_config.as_ref()
             .ok_or_else(|| TransportError::config_error("protocol",
@@ -332,8 +351,24 @@ impl TransportClient {
     /// `connect()` again); `shutdown()` ends the client. After it returns, no
     /// background task of this client is running.
     pub async fn shutdown(&mut self) -> Result<(), TransportError> {
-        // Not-connected is fine — shutdown must be callable from any state.
-        let _ = self.disconnect().await;
+        // Idempotent: only the Active -> ShuttingDown winner runs the flow.
+        if self
+            .phase
+            .compare_exchange(
+                CLIENT_ACTIVE,
+                CLIENT_SHUTTING_DOWN,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            return Ok(());
+        }
+        // Graceful disconnect; a failure while actually connected is real and
+        // must not be swallowed — but teardown continues regardless.
+        let was_connected = self.is_connected().await;
+        let disconnect_result = self.disconnect().await;
+
         let handle = self.event_forwarding_task.write().await.take();
         if let Some(handle) = handle {
             handle.abort();
@@ -344,7 +379,12 @@ impl TransportClient {
             .unwrap_or_else(|e| e.into_inner())
             .take();
         self.event_forwarding_running.store(false, Ordering::SeqCst);
-        Ok(())
+        self.phase.store(CLIENT_STOPPED, Ordering::SeqCst);
+
+        match disconnect_result {
+            Err(e) if was_connected => Err(e),
+            _ => Ok(()),
+        }
     }
 
     /// [DISCONNECT] Disconnect (graceful close)

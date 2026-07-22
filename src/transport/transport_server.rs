@@ -25,6 +25,12 @@ use crate::{
 /// its own connection. A fan-out bus would instead drop messages for every
 /// subscriber once one of them lagged.
 use std::sync::Arc;
+const PHASE_IDLE: u8 = 0;
+const PHASE_STARTING: u8 = 1;
+const PHASE_RUNNING: u8 = 2;
+const PHASE_SHUTTING_DOWN: u8 = 3;
+const PHASE_STOPPED: u8 = 4;
+
 const LISTENER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 const DEFAULT_REQUEST_LIFECYCLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -69,9 +75,16 @@ pub struct TransportServer {
     /// racer that slipped past the gate self-cancels on its re-check), so no
     /// session can be inserted after a shutdown report returns.
     admission_open: Arc<std::sync::atomic::AtomicBool>,
-    /// serve() lifecycle: 0 = never started, 1 = running, 2 = finished.
-    /// Shutdown waits for 2 (bounded) so `clean` covers listener + scanner exit.
-    serve_state: Arc<tokio::sync::watch::Sender<u8>>,
+    /// Server lifecycle phase (single source of truth, CAS-transitioned):
+    /// 0 Idle, 1 Starting, 2 Running, 3 ShuttingDown, 4 Stopped. The watch
+    /// only NOTIFIES phase changes; it is never the truth.
+    server_phase: Arc<std::sync::atomic::AtomicU8>,
+    phase_notify: Arc<tokio::sync::watch::Sender<u8>>,
+    /// Session-completion channel: supervisors send their id as their last
+    /// act; the reaper (owned below) is the ONE owner that joins the finished
+    /// supervisor handle and removes the registry entry. Session tasks never
+    /// remove their own ownership.
+    reaper_tx: tokio::sync::mpsc::UnboundedSender<SessionId>,
     /// Serializes shutdown owners; concurrent/repeat shutdowns queue here and
     /// re-run the idempotent flow (instant once everything is drained).
     shutdown_lock: Arc<tokio::sync::Mutex<()>>,
@@ -103,8 +116,9 @@ impl TransportServer {
         buffer_size: Option<usize>,
     ) -> Result<Self, TransportError> {
         let ctx = Arc::new(crate::transport::context::TransportContext::new().await?);
+        let (reaper_tx, reaper_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        Ok(Self {
+        let server = Self {
             config,
             context: ctx,
             transports: Arc::new(LockFreeHashMap::new()),
@@ -127,9 +141,13 @@ impl TransportServer {
             root_cancel: tokio_util::sync::CancellationToken::new(),
             session_supervisors: Arc::new(dashmap::DashMap::new()),
             admission_open: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            serve_state: Arc::new(tokio::sync::watch::channel(0u8).0),
+            server_phase: Arc::new(std::sync::atomic::AtomicU8::new(PHASE_IDLE)),
+            phase_notify: Arc::new(tokio::sync::watch::channel(PHASE_IDLE).0),
+            reaper_tx,
             shutdown_lock: Arc::new(tokio::sync::Mutex::new(())),
-        })
+        };
+        server.spawn_reaper(reaper_rx);
+        Ok(server)
     }
 
     /// Set the frame decode policy applied to accepted connections. Internal;
@@ -561,17 +579,24 @@ impl TransportServer {
         // exactly when the whole session runtime is done, not earlier — and
         // removes its own entry. Shutdown joins whichever supervisors are
         // still running; normal session end needs no shutdown involvement.
+        // Registration barrier: the supervisor may not begin until its entry
+        // is registered, so "task completes before registration" cannot leave
+        // a stale entry. The supervisor never removes its own ownership; it
+        // signals completion (last statement) and the reaper — the one
+        // external owner — joins the handle and removes the entry.
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
         let supervisor = {
             let server = self.clone();
             tokio::spawn(async move {
+                let _ = started_rx.await;
                 let _permit = permit;
                 if let Some(task) = actor_task {
                     let _ = task.await;
                 }
                 let _ = pump_task.await;
                 let _ = server.remove_session(session_id).await;
-                server.session_supervisors.remove(&session_id);
                 tracing::debug!("[SUPERVISOR] Session {} fully finalized", session_id);
+                let _ = server.reaper_tx.send(session_id);
             })
         };
         self.session_supervisors.insert(
@@ -581,6 +606,7 @@ impl TransportServer {
                 task: supervisor,
             },
         );
+        let _ = started_tx.send(());
 
         // Admission re-check: a shutdown that started between the gate check
         // and this insert could not see this session. Self-cancel so it tears
@@ -634,6 +660,37 @@ impl TransportServer {
         self.state_manager.remove_connection(session_id);
         tracing::info!("[REMOVE] TransportServer removed session: {}", session_id);
         Ok(())
+    }
+
+    /// Publish a phase value: CAS-free store used only by the owner of the
+    /// transition; the watch is notification-only.
+    fn set_phase(&self, phase: u8) {
+        self.server_phase
+            .store(phase, std::sync::atomic::Ordering::SeqCst);
+        let _ = self.phase_notify.send_replace(phase);
+    }
+
+    fn phase(&self) -> u8 {
+        self.server_phase.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The single external owner of finished session supervisors: receives a
+    /// completion signal (sent as the supervisor's last statement), joins the
+    /// handle — proving the task returned and its permit dropped — and only
+    /// then removes the registry entry. A shutdown that raced the completion
+    /// and holds the entry out simply wins; the reaper's remove is a no-op.
+    fn spawn_reaper(&self, mut rx: tokio::sync::mpsc::UnboundedReceiver<SessionId>) {
+        let supervisors = self.session_supervisors.clone();
+        tokio::spawn(async move {
+            while let Some(session_id) = rx.recv().await {
+                if let Some((_, entry)) = supervisors.remove(&session_id) {
+                    // The signal is sent just before return, so this join is
+                    // effectively instant — the reaper never blocks on a live
+                    // session.
+                    let _ = entry.task.await;
+                }
+            }
+        });
     }
 
     /// Handle one pumped transport event for a session: complete server-side
@@ -925,16 +982,35 @@ impl TransportServer {
 
     /// Start server
     pub async fn serve(&self) -> Result<(), TransportError> {
-        let _ = self.serve_state.send(1);
-        // Ensure the watch reaches Finished on every exit path, so shutdown's
-        // infra join cannot wait on a serve() that already returned.
-        struct ServeGuard(Arc<tokio::sync::watch::Sender<u8>>);
+        // One-shot lifecycle gate: only Idle -> Starting is allowed. A second
+        // or concurrent serve(), or a serve after shutdown, is rejected here
+        // BEFORE touching any shared state, so it cannot re-arm is_running or
+        // publish a phase that masks the real instance.
+        if self
+            .server_phase
+            .compare_exchange(
+                PHASE_IDLE,
+                PHASE_STARTING,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            return Err(TransportError::config_error(
+                "server",
+                "serve() may run once: server is already starting, running, or stopped",
+            ));
+        }
+        let _ = self.phase_notify.send_replace(PHASE_STARTING);
+        // Whatever exit path serve takes, the phase must end at Stopped —
+        // shutdown's infra join waits for exactly this.
+        struct ServeGuard(TransportServer);
         impl Drop for ServeGuard {
             fn drop(&mut self) {
-                let _ = self.0.send(2);
+                self.0.set_phase(PHASE_STOPPED);
             }
         }
-        let _serve_guard = ServeGuard(self.serve_state.clone());
+        let _serve_guard = ServeGuard(self.clone());
         self.is_running
             .store(true, std::sync::atomic::Ordering::SeqCst);
 
@@ -989,8 +1065,12 @@ impl TransportServer {
                             );
                             self.is_running
                                 .store(false, std::sync::atomic::Ordering::SeqCst);
+                            // Cancel siblings and JOIN them: a partial start
+                            // must release every already-bound endpoint before
+                            // this returns (Stopped is published by the guard).
                             for task in listen_tasks {
                                 task.abort();
+                                let _ = task.await;
                             }
                             return Err(e);
                         }
@@ -1002,6 +1082,7 @@ impl TransportServer {
                         .store(false, std::sync::atomic::Ordering::SeqCst);
                     for task in listen_tasks {
                         task.abort();
+                        let _ = task.await;
                     }
                     return Err(e);
                 }
@@ -1009,19 +1090,28 @@ impl TransportServer {
         }
 
         listen_tasks.push(self.start_request_timeout_scanner());
+        self.set_phase(PHASE_RUNNING);
 
         tracing::info!("[TARGET] All protocol servers started, waiting for connections...");
 
-        // Wait for all listen tasks to complete
+        // Root join: every listener + the scanner completes here. An abnormal
+        // child exit (panic/cancel) stops the siblings and STILL joins them
+        // all, so no infra task can outlive serve().
+        let mut failed = false;
         for (index, task) in listen_tasks.into_iter().enumerate() {
-            tracing::info!("[WAIT] Waiting for task {} to complete...", index + 1);
             if let Err(e) = task.await {
-                tracing::error!("[ERROR] Task {} was cancelled: {:?}", index + 1, e);
-                return Err(TransportError::config_error(
-                    "server",
-                    "Listener task cancelled",
-                ));
+                tracing::error!("[ERROR] Infra task {} failed: {:?}", index + 1, e);
+                failed = true;
+                self.is_running
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                // Remaining iterations join the (now stopping) siblings.
             }
+        }
+        if failed {
+            return Err(TransportError::config_error(
+                "server",
+                "an infrastructure task failed; all siblings were stopped and joined",
+            ));
         }
 
         tracing::info!("[STOP] TransportServer stopped");
@@ -1252,6 +1342,37 @@ impl TransportServer {
         };
 
         tracing::info!("[SHUTDOWN] TransportServer shutdown initiated");
+        // Phase transition on the CAS truth source. From Idle (never served)
+        // we own the whole lifecycle and mark Stopped ourselves; from
+        // Starting/Running we flip to ShuttingDown and later wait for serve's
+        // guard to publish Stopped; ShuttingDown/Stopped mean an earlier
+        // shutdown got here — the flow below is idempotent either way.
+        let mut never_served = false;
+        loop {
+            let cur = self.phase();
+            let target = match cur {
+                PHASE_IDLE => {
+                    never_served = true;
+                    PHASE_SHUTTING_DOWN
+                }
+                PHASE_STARTING | PHASE_RUNNING => PHASE_SHUTTING_DOWN,
+                _ => break,
+            };
+            if self
+                .server_phase
+                .compare_exchange(
+                    cur,
+                    target,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .is_ok()
+            {
+                let _ = self.phase_notify.send_replace(target);
+                break;
+            }
+            never_served = false;
+        }
         // Phase 1: gate + stop infra.
         self.admission_open
             .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -1288,16 +1409,19 @@ impl TransportServer {
             }
         }
 
-        // Phase 4: infra join — wait for serve() (listeners + scanner) to
-        // actually return, freeing the endpoints. 0 = never started counts as
-        // stopped.
-        let mut serve_rx = self.serve_state.subscribe();
+        // Phase 4: infra join — wait for serve()'s guard to publish Stopped,
+        // which happens only after every listener and the scanner have been
+        // joined (freeing the endpoints). A server that never served is
+        // finalized to Stopped by us right here.
+        if never_served {
+            self.set_phase(PHASE_STOPPED);
+        }
+        let mut phase_rx = self.phase_notify.subscribe();
         let infra_stopped = loop {
-            let state = *serve_rx.borrow();
-            if state != 1 {
+            if self.phase() == PHASE_STOPPED {
                 break true;
             }
-            match tokio::time::timeout_at(deadline, serve_rx.changed()).await {
+            match tokio::time::timeout_at(deadline, phase_rx.changed()).await {
                 Ok(Ok(())) => continue,
                 _ => break false,
             }
@@ -1343,7 +1467,7 @@ impl TransportServer {
         sessions_closed: usize,
     ) -> ShutdownReport {
         let sessions_remaining = self.session_supervisors.len().max(self.transports.len());
-        let infra_stopped = *self.serve_state.subscribe().borrow() != 1;
+        let infra_stopped = self.phase() == PHASE_STOPPED;
         let permits_restored = self.max_connections == usize::MAX
             || self.connection_permits.available_permits() == self.max_connections;
         ShutdownReport {
@@ -1412,7 +1536,9 @@ impl Clone for TransportServer {
             root_cancel: self.root_cancel.clone(),
             session_supervisors: self.session_supervisors.clone(),
             admission_open: self.admission_open.clone(),
-            serve_state: self.serve_state.clone(),
+            server_phase: self.server_phase.clone(),
+            phase_notify: self.phase_notify.clone(),
+            reaper_tx: self.reaper_tx.clone(),
             shutdown_lock: self.shutdown_lock.clone(),
         }
     }

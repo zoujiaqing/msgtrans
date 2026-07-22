@@ -248,13 +248,13 @@ async fn clean_shutdown_completes_serve_and_frees_all_ports() {
     assert!(report.clean, "not clean: {:?}", report);
     assert!(report.infra_stopped);
 
-    // serve() must have returned within the shutdown (its completion is part
-    // of clean); the handle resolves immediately.
-    tokio::time::timeout(Duration::from_secs(2), serve_handle)
-        .await
-        .expect("serve() did not complete after clean shutdown")
-        .expect("join")
-        .ok();
+    // The moment clean=true returns, serve() must ALREADY be finished — no
+    // waiting allowed, this is what infra_stopped claims to prove.
+    assert!(
+        serve_handle.is_finished(),
+        "clean=true but serve() had not returned"
+    );
+    let _ = serve_handle.await;
 
     // All three endpoints are free: a new server binds the SAME addresses and
     // actually serves.
@@ -387,4 +387,106 @@ async fn client_shutdown_joins_forwarding_and_is_idempotent() {
     }
     let report = server.shutdown_with_timeout(Duration::from_secs(5)).await;
     assert!(report.clean);
+}
+
+/// serve() is one-shot: shutdown-before-serve and a concurrent second serve
+/// are both rejected before touching shared state, and the running instance
+/// is unaffected.
+#[tokio::test(flavor = "multi_thread")]
+async fn serve_is_one_shot_and_shutdown_before_serve_finalizes() {
+    // shutdown before serve: clean (never served), then serve() refuses.
+    let s1 = TransportServerBuilder::new()
+        .protocol(TcpServerConfig::new("127.0.0.1:28892").expect("cfg"))
+        .build(Arc::new(Echo))
+        .await
+        .expect("server");
+    let report = s1.shutdown_with_timeout(Duration::from_secs(2)).await;
+    assert!(report.clean, "{:?}", report);
+    assert!(
+        s1.serve().await.is_err(),
+        "serve after shutdown must be rejected"
+    );
+
+    // concurrent second serve rejected; first keeps serving.
+    let addr = "127.0.0.1:28893";
+    let s2 = start_server(addr).await; // first serve running inside
+    assert!(
+        s2.serve().await.is_err(),
+        "second serve must be rejected while the first runs"
+    );
+    let client = connect(addr).await;
+    assert!(echo_ok(&client).await, "first instance must be unaffected");
+    drop(client);
+    let report = s2.shutdown_with_timeout(Duration::from_secs(10)).await;
+    assert!(report.clean, "{:?}", report);
+}
+
+/// Partial start failure releases every already-bound endpoint before serve()
+/// returns: occupy the TCP port so serve fails, then prove the WS port is
+/// immediately free.
+#[tokio::test(flavor = "multi_thread")]
+async fn partial_start_failure_frees_already_bound_ports() {
+    let (tcp, ws) = ("127.0.0.1:28894", "127.0.0.1:28895");
+    // Occupy TCP so the msgtrans TCP listener cannot bind.
+    let _blocker = tokio::net::TcpListener::bind(tcp).await.expect("blocker");
+
+    let server = TransportServerBuilder::new()
+        .protocol(WebSocketServerConfig::new(ws).expect("ws"))
+        .protocol(TcpServerConfig::new(tcp).expect("tcp"))
+        .build(Arc::new(Echo))
+        .await
+        .expect("build");
+    let result = server.serve().await;
+    assert!(
+        result.is_err(),
+        "serve must fail with the TCP port occupied"
+    );
+
+    // Whatever was bound before the failure must be released by now.
+    tokio::net::TcpListener::bind(ws)
+        .await
+        .expect("WS port must be free immediately after serve() failed");
+}
+
+/// Fast connect/drop churn cannot leave stale supervisor entries: the
+/// registration barrier orders start after registration, and the reaper is
+/// the only remover. Afterwards a shutdown is clean.
+#[tokio::test(flavor = "multi_thread")]
+async fn rapid_connect_drop_churn_leaves_no_stale_entries() {
+    let addr = "127.0.0.1:28896";
+    let server = start_server(addr).await;
+    for _ in 0..20 {
+        let client = connect(addr).await;
+        drop(client); // immediate drop: session may complete extremely fast
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while server.session_count().await != 0 {
+        assert!(tokio::time::Instant::now() < deadline, "sessions leaked");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let report = server.shutdown_with_timeout(Duration::from_secs(5)).await;
+    assert!(report.clean, "stale supervisor entries: {:?}", report);
+}
+
+/// After client shutdown(), connect() is rejected before any network work —
+/// the server must never see a session from a stopped client.
+#[tokio::test(flavor = "multi_thread")]
+async fn connect_after_client_shutdown_is_rejected() {
+    let addr = "127.0.0.1:28897";
+    let server = start_server(addr).await;
+    let mut client = connect(addr).await;
+    assert!(echo_ok(&client).await);
+    client.shutdown().await.expect("shutdown");
+
+    let before = server.session_count().await; // old session may still drain
+    assert!(
+        client.connect().await.is_err(),
+        "connect after shutdown must be rejected"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        server.session_count().await <= before,
+        "a stopped client created a server session"
+    );
+    drop(client);
 }
