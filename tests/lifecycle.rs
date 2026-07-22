@@ -216,3 +216,175 @@ async fn deadline_during_close_leaves_no_zombie_session() {
     assert_eq!(report2.sessions_remaining, 0);
     drop(client);
 }
+
+use msgtrans::protocol::{QuicServerConfig, WebSocketServerConfig};
+
+/// Full acceptance: after clean shutdown the serve() handle has completed and
+/// all three protocol endpoints (TCP/WS/QUIC) can be re-bound immediately by
+/// a brand-new server, which then actually serves.
+#[tokio::test(flavor = "multi_thread")]
+async fn clean_shutdown_completes_serve_and_frees_all_ports() {
+    let (tcp, ws, quic) = ("127.0.0.1:28885", "127.0.0.1:28886", "127.0.0.1:28887");
+    let build = || async {
+        TransportServerBuilder::new()
+            .protocol(TcpServerConfig::new(tcp).expect("tcp"))
+            .protocol(WebSocketServerConfig::new(ws).expect("ws"))
+            .protocol(QuicServerConfig::new(quic).expect("quic"))
+            .build(Arc::new(Echo))
+            .await
+            .expect("server")
+    };
+    let server = build().await;
+    let serve_handle = {
+        let bg = server.clone();
+        tokio::spawn(async move { bg.serve().await })
+    };
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let client = connect(tcp).await;
+    assert!(echo_ok(&client).await);
+    drop(client);
+
+    let report = server.shutdown_with_timeout(Duration::from_secs(10)).await;
+    assert!(report.clean, "not clean: {:?}", report);
+    assert!(report.infra_stopped);
+
+    // serve() must have returned within the shutdown (its completion is part
+    // of clean); the handle resolves immediately.
+    tokio::time::timeout(Duration::from_secs(2), serve_handle)
+        .await
+        .expect("serve() did not complete after clean shutdown")
+        .expect("join")
+        .ok();
+
+    // All three endpoints are free: a new server binds the SAME addresses and
+    // actually serves.
+    let server2 = build().await;
+    let bg2 = server2.clone();
+    tokio::spawn(async move {
+        let _ = bg2.serve().await;
+    });
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let client2 = connect(tcp).await;
+    assert!(echo_ok(&client2).await, "rebound server must serve");
+    drop(client2);
+    let report2 = server2.shutdown_with_timeout(Duration::from_secs(10)).await;
+    assert!(report2.clean, "second server shutdown: {:?}", report2);
+}
+
+/// Shutdown/accept interleave: connections hammer the server while shutdown
+/// runs. After the report returns and racers settle, no session may remain —
+/// gate refusals and post-insert self-cancels both end in zero.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_sessions_survive_shutdown_accept_interleave() {
+    let addr = "127.0.0.1:28888";
+    let server = start_server(addr).await;
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hammer = {
+        let stop = stop.clone();
+        tokio::spawn(async move {
+            while !stop.load(Ordering::SeqCst) {
+                if let Ok(cfg) = TcpClientConfig::new(addr) {
+                    if let Ok(mut c) = TransportClientBuilder::new().protocol(cfg).build().await {
+                        let _ = c.connect().await;
+                        // keep briefly, then drop
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }
+            }
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let report = server.shutdown_with_timeout(Duration::from_secs(10)).await;
+    stop.store(true, Ordering::SeqCst);
+    let _ = hammer.await;
+    // Post-report racers self-cancel; settle then verify emptiness sticks.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        server.session_count().await,
+        0,
+        "sessions survived the interleave (report: {:?})",
+        report
+    );
+    let report2 = server.shutdown_with_timeout(Duration::from_secs(5)).await;
+    assert!(report2.clean, "post-interleave shutdown: {:?}", report2);
+}
+
+/// With a cap configured, clean shutdown restores every permit.
+#[tokio::test(flavor = "multi_thread")]
+async fn permits_fully_restored_after_shutdown() {
+    let addr = "127.0.0.1:28889";
+    const CAP: usize = 2;
+    let server = TransportServerBuilder::new()
+        .max_connections(CAP)
+        .protocol(TcpServerConfig::new(addr).expect("cfg"))
+        .build(Arc::new(Echo))
+        .await
+        .expect("server");
+    let bg = server.clone();
+    tokio::spawn(async move {
+        let _ = bg.serve().await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let c1 = connect(addr).await;
+    let c2 = connect(addr).await;
+    assert!(echo_ok(&c1).await && echo_ok(&c2).await);
+    assert_eq!(server.available_permits(), 0);
+
+    let report = server.shutdown_with_timeout(Duration::from_secs(10)).await;
+    assert!(report.clean, "{:?}", report);
+    assert!(report.permits_restored);
+    assert_eq!(server.available_permits(), CAP);
+    drop((c1, c2));
+}
+
+/// Concurrent and repeated shutdowns are idempotent: both callers return, the
+/// server ends drained, and a follow-up shutdown is instantly clean.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_and_repeated_shutdowns_are_idempotent() {
+    let addr = "127.0.0.1:28890";
+    let server = start_server(addr).await;
+    let client = connect(addr).await;
+    assert!(echo_ok(&client).await);
+    drop(client);
+
+    let (a, b) = tokio::join!(
+        server.shutdown_with_timeout(Duration::from_secs(10)),
+        server.shutdown_with_timeout(Duration::from_secs(10)),
+    );
+    assert!(
+        a.clean || b.clean,
+        "at least one owner must finish clean: {:?} / {:?}",
+        a,
+        b
+    );
+    let again = server.shutdown_with_timeout(Duration::from_secs(2)).await;
+    assert!(again.clean, "repeat shutdown must be clean: {:?}", again);
+    assert!(
+        again.elapsed < Duration::from_millis(500),
+        "repeat must be instant"
+    );
+}
+
+/// Client shutdown() joins the forwarding task and is idempotent.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_shutdown_joins_forwarding_and_is_idempotent() {
+    let addr = "127.0.0.1:28891";
+    let server = start_server(addr).await;
+    let mut client = connect(addr).await;
+    assert!(echo_ok(&client).await);
+
+    client.shutdown().await.expect("shutdown");
+    client.shutdown().await.expect("shutdown twice is fine");
+    drop(client);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while server.session_count().await != 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "session not released"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let report = server.shutdown_with_timeout(Duration::from_secs(5)).await;
+    assert!(report.clean);
+}

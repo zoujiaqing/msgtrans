@@ -255,6 +255,13 @@ impl SessionHandle {
     /// Forward an inbound transport event to the actor
     ///
     /// This will apply backpressure if the channel is full.
+    /// Non-blocking event injection: used by shutdown to offer the actor a
+    /// graceful close without parking on a full mailbox (cancellation follows
+    /// either way).
+    pub(crate) fn try_send_event(&self, event: TransportEvent) -> bool {
+        self.tx.try_send(ActorMessage::InboundEvent(event)).is_ok()
+    }
+
     pub async fn send_event(
         &self,
         event: TransportEvent,
@@ -338,9 +345,9 @@ pub struct SessionActor {
     handler: Arc<dyn SessionHandler>,
     connection_info: ConnectionInfo,
     inbound_registry: Option<Arc<RequestRegistry>>,
-    /// Connection-cap permit (server side). Held for the actor's lifetime and
-    /// released on drop, i.e. exactly when the session truly ends.
-    _connection_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    /// Cooperative cancellation (server side): the session supervisor cancels
+    /// this to force the actor out of its mailbox wait during shutdown.
+    cancel: tokio_util::sync::CancellationToken,
 }
 
 impl SessionActor {
@@ -359,16 +366,13 @@ impl SessionActor {
             handler,
             connection_info,
             inbound_registry: None,
-            _connection_permit: None,
+            cancel: tokio_util::sync::CancellationToken::new(),
         }
     }
 
-    /// Attach the server's connection-cap permit (internal).
-    pub(crate) fn with_connection_permit(
-        mut self,
-        permit: Option<tokio::sync::OwnedSemaphorePermit>,
-    ) -> Self {
-        self._connection_permit = permit;
+    /// Attach the session supervisor's cancellation token (internal).
+    pub(crate) fn with_cancel(mut self, cancel: tokio_util::sync::CancellationToken) -> Self {
+        self.cancel = cancel;
         self
     }
 
@@ -413,7 +417,14 @@ impl SessionActor {
             batch.clear();
 
             // Batch receive: wait for first message, then drain up to BATCH_SIZE.
-            match self.rx.recv_async().await {
+            // The cancellation arm lets the session supervisor force the actor
+            // out of an idle mailbox wait during shutdown; a handler blocked
+            // inside on_message is only reached once it returns here.
+            let first = tokio::select! {
+                _ = self.cancel.cancelled() => break,
+                msg = self.rx.recv_async() => msg,
+            };
+            match first {
                 Ok(first) => batch.push(first),
                 Err(_) => break,
             }

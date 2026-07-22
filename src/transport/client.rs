@@ -324,7 +324,35 @@ impl TransportClient {
         std::time::Duration::from_secs_f64(delay)
     }
 
+    /// Terminate this client's lifecycle: disconnect (closing this
+    /// generation's pending requests), then cancel AND JOIN the forwarding
+    /// task — the completion guarantee Drop deliberately does not make.
+    ///
+    /// `disconnect()` is the reconnectable operation (the client can
+    /// `connect()` again); `shutdown()` ends the client. After it returns, no
+    /// background task of this client is running.
+    pub async fn shutdown(&mut self) -> Result<(), TransportError> {
+        // Not-connected is fine — shutdown must be callable from any state.
+        let _ = self.disconnect().await;
+        let handle = self.event_forwarding_task.write().await.take();
+        if let Some(handle) = handle {
+            handle.abort();
+            let _ = handle.await; // abort guarantees prompt completion
+        }
+        self.forwarding_abort
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        self.event_forwarding_running.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
     /// [DISCONNECT] Disconnect (graceful close)
+    ///
+    /// Reconnectable: closes the current connection and this generation's
+    /// pending requests, but leaves the client (and its forwarding task)
+    /// ready for a new `connect()`. To end the client entirely, use
+    /// [`Self::shutdown`].
     pub async fn disconnect(&self) -> Result<(), TransportError> {
         // Check if already connected
         let mut current_session = self.current_session_id.write().await;

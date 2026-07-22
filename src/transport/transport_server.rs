@@ -58,6 +58,29 @@ pub struct TransportServer {
     connection_permits: Arc<tokio::sync::Semaphore>,
     /// Configured cap, kept for logging only (the semaphore is the enforcer).
     max_connections: usize,
+    /// Root cancellation: shutdown cancels it; every session gets a child.
+    root_cancel: tokio_util::sync::CancellationToken,
+    /// One supervisor entry per live session: owns the session-supervisor
+    /// JoinHandle (which itself owns and joins the actor + pump handles and
+    /// releases the connection permit when both are done). Nothing session-
+    /// scoped is ever spawned detached.
+    session_supervisors: Arc<dashmap::DashMap<SessionId, SessionSupervisorEntry>>,
+    /// Admission gate: closed at shutdown start; add_session refuses (and a
+    /// racer that slipped past the gate self-cancels on its re-check), so no
+    /// session can be inserted after a shutdown report returns.
+    admission_open: Arc<std::sync::atomic::AtomicBool>,
+    /// serve() lifecycle: 0 = never started, 1 = running, 2 = finished.
+    /// Shutdown waits for 2 (bounded) so `clean` covers listener + scanner exit.
+    serve_state: Arc<tokio::sync::watch::Sender<u8>>,
+    /// Serializes shutdown owners; concurrent/repeat shutdowns queue here and
+    /// re-run the idempotent flow (instant once everything is drained).
+    shutdown_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// Supervisor entry for one session (see `session_supervisors`).
+struct SessionSupervisorEntry {
+    cancel: tokio_util::sync::CancellationToken,
+    task: tokio::task::JoinHandle<()>,
 }
 
 impl TransportServer {
@@ -101,6 +124,11 @@ impl TransportServer {
                 tokio::sync::Semaphore::MAX_PERMITS,
             )),
             max_connections: usize::MAX,
+            root_cancel: tokio_util::sync::CancellationToken::new(),
+            session_supervisors: Arc::new(dashmap::DashMap::new()),
+            admission_open: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            serve_state: Arc::new(tokio::sync::watch::channel(0u8).0),
+            shutdown_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -402,6 +430,15 @@ impl TransportServer {
         // [FIX] Use existing session ID from connection instead of generating new one
         let session_id = connection.session_id();
         let mut connection = connection;
+        // Admission gate: once shutdown began, no new session may form. The
+        // permit drops with this early return.
+        if !self
+            .admission_open
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            let _ = connection.close().await;
+            return session_id;
+        }
         connection.set_frame_policy(self.frame_policy);
         // Captured before the connection is moved into Transport, so the actor can
         // hand it to `on_connected` ahead of any inbound message.
@@ -457,14 +494,12 @@ impl TransportServer {
             connection_info,
             self.actor_buffer_size,
         );
+        let child_cancel = self.root_cancel.child_token();
         let actor = actor
             .with_inbound_registry(Some(self.request_registry.clone()))
-            .with_connection_permit(Some(permit));
-        let actor_handle = match self.session_handles.insert(session_id, handle.clone()) {
-            Ok(_) => {
-                tokio::spawn(actor.run());
-                Some(handle)
-            }
+            .with_cancel(child_cancel.clone());
+        let actor_task = match self.session_handles.insert(session_id, handle.clone()) {
+            Ok(_) => Some((tokio::spawn(actor.run()), handle)),
             Err(e) => {
                 tracing::error!(
                     "[ERROR] Failed to register session actor handle for {}: {:?}",
@@ -474,19 +509,34 @@ impl TransportServer {
                 None
             }
         };
+        let (actor_task, actor_handle) = match actor_task {
+            Some((t, h)) => (Some(t), Some(h)),
+            None => (None, None),
+        };
 
         // [LOOP] Pump the connection's transport events into this session's actor.
         // Bounded-backbone adapters hand over a single-consumer pipe (real
         // backpressure; ends with exactly one ConnectionClosed). Legacy
         // adapters still expose the broadcast facade until their migration.
-        if let Some(mut pipe) = event_pipe_opt {
+        let pump_task = if let Some(mut pipe) = event_pipe_opt {
             let server_clone = self.clone();
+            let pump_cancel = child_cancel.clone();
             tokio::spawn(async move {
                 tracing::info!(
                     "[LISTENER] TransportServer pump started for session {} (bounded pipe)",
                     session_id
                 );
-                while let Some(transport_event) = pipe.next().await {
+                loop {
+                    // The cancel arm matters for IDLE sessions: without it the
+                    // pump parks in pipe.next() until the ADAPTER ends, and
+                    // nothing would end an idle adapter during shutdown. On
+                    // cancel, pump_teardown's remove_session drops the
+                    // Transport -> connection -> adapter, closing the socket.
+                    let event = tokio::select! {
+                        _ = pump_cancel.cancelled() => None,
+                        ev = pipe.next() => ev,
+                    };
+                    let Some(transport_event) = event else { break };
                     if let Some(handle) = &actor_handle {
                         if !server_clone
                             .pump_one_event(session_id, handle, transport_event)
@@ -497,12 +547,49 @@ impl TransportServer {
                     }
                 }
                 server_clone.pump_teardown(session_id).await;
-            });
+            })
         } else {
             tracing::warn!(
                 "[WARN] Session {} unable to get event stream before connection setup",
                 session_id
             );
+            tokio::spawn(async {})
+        };
+
+        // Per-session supervisor: OWNS the actor + pump handles, joins both,
+        // then (idempotently) cleans the session maps, releases the permit —
+        // exactly when the whole session runtime is done, not earlier — and
+        // removes its own entry. Shutdown joins whichever supervisors are
+        // still running; normal session end needs no shutdown involvement.
+        let supervisor = {
+            let server = self.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                if let Some(task) = actor_task {
+                    let _ = task.await;
+                }
+                let _ = pump_task.await;
+                let _ = server.remove_session(session_id).await;
+                server.session_supervisors.remove(&session_id);
+                tracing::debug!("[SUPERVISOR] Session {} fully finalized", session_id);
+            })
+        };
+        self.session_supervisors.insert(
+            session_id,
+            SessionSupervisorEntry {
+                cancel: child_cancel.clone(),
+                task: supervisor,
+            },
+        );
+
+        // Admission re-check: a shutdown that started between the gate check
+        // and this insert could not see this session. Self-cancel so it tears
+        // down through the normal cascade; the supervisor releases the permit.
+        if !self
+            .admission_open
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            child_cancel.cancel();
         }
 
         tracing::info!(
@@ -838,6 +925,16 @@ impl TransportServer {
 
     /// Start server
     pub async fn serve(&self) -> Result<(), TransportError> {
+        let _ = self.serve_state.send(1);
+        // Ensure the watch reaches Finished on every exit path, so shutdown's
+        // infra join cannot wait on a serve() that already returned.
+        struct ServeGuard(Arc<tokio::sync::watch::Sender<u8>>);
+        impl Drop for ServeGuard {
+            fn drop(&mut self) {
+                let _ = self.0.send(2);
+            }
+        }
+        let _serve_guard = ServeGuard(self.serve_state.clone());
         self.is_running
             .store(true, std::sync::atomic::Ordering::SeqCst);
 
@@ -1111,107 +1208,158 @@ impl TransportServer {
             .await
     }
 
-    /// Stop accepting, close every session, and wait (up to `timeout`) for the
-    /// session map to drain.
+    /// Full supervised shutdown, spending one deadline across every phase:
     ///
-    /// LIMITATION (tracked, pre-supervisor): `clean` currently proves only
-    /// that the session map emptied within the deadline. It does NOT yet prove
-    /// listener exit (ports may still be briefly bound), actor completion
-    /// (permits are held by actors and release on actor drop), or pump/scanner
-    /// termination — those require the server to own the task JoinHandles and
-    /// join them, which is the supervisor work in progress. Await `serve()`
-    /// after this returns for the listener join today.
+    /// 1. Close the admission gate (no new session can form; racers
+    ///    self-cancel on their re-check) and stop the listeners/scanner.
+    /// 2. Offer every live actor a graceful close (non-blocking), then cancel
+    ///    the root token — every session's child token fires, actors leave
+    ///    their mailbox waits, and the teardown cascades (actor exit drops the
+    ///    mailbox, the pump unparks and reaps, the pipe consumer ends, the
+    ///    adapter closes the socket).
+    /// 3. Join every session supervisor within the remaining budget. Each
+    ///    supervisor owns and joins its actor + pump and releases the permit
+    ///    only when both are done — so a joined supervisor PROVES that
+    ///    session's tasks ended and its permit returned. A supervisor that
+    ///    outlives the budget stays owned in the registry (never detached,
+    ///    never cancelled mid-cleanup); a later shutdown joins it.
+    /// 4. Wait (bounded) for serve() to finish, which joins the listeners and
+    ///    the timeout scanner and frees the TCP/WS/QUIC endpoints.
+    ///
+    /// `clean` is true only when ALL of it is proven: no session supervisors
+    /// left, session map empty, infra finished (or never started), and — when
+    /// a cap is configured — every connection permit returned.
+    ///
+    /// Concurrent and repeated shutdowns serialize on an internal lock and
+    /// re-run the idempotent flow; once drained it completes immediately.
+    /// A caller whose deadline expires while another shutdown is still
+    /// running gets a clean=false snapshot without disturbing the owner.
+    ///
+    /// Note: handlers' `on_disconnected` is best-effort during shutdown (the
+    /// close offer is non-blocking; a full mailbox skips it and cancellation
+    /// ends the actor directly).
     pub async fn shutdown_with_timeout(&self, timeout: std::time::Duration) -> ShutdownReport {
         let started = std::time::Instant::now();
-        // ONE deadline, created before any work: every phase below spends from
-        // the same budget. (The first version created it after the close
-        // sweep, so N slow sessions could burn N x graceful_timeout before the
-        // "timeout" even started.)
         let deadline = tokio::time::Instant::now() + timeout;
+
+        // Serialize owners. If another shutdown holds the lock past our
+        // budget, report honestly and leave it alone.
+        let _owner = match tokio::time::timeout_at(deadline, self.shutdown_lock.lock()).await {
+            Ok(guard) => guard,
+            Err(_) => {
+                return self.report_snapshot(started, 0);
+            }
+        };
+
         tracing::info!("[SHUTDOWN] TransportServer shutdown initiated");
+        // Phase 1: gate + stop infra.
+        self.admission_open
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         self.is_running
             .store(false, std::sync::atomic::Ordering::SeqCst);
 
-        // Close every live session as an OWNED task and bound the JOIN by the
-        // remaining budget. Timing out the join must not cancel the close:
-        // close_session flips the state to Closing before its awaits, and a
-        // dropped future there would leave a session neither closable again
-        // (both close paths gate on "already closing") nor removed — a
-        // permanent zombie holding its permit. Spawned tasks keep running
-        // past the deadline and finish on their own (the in-close graceful
-        // timeout bounds them); the report then simply says clean=false.
-        let session_ids: Vec<SessionId> = self.transports.keys().unwrap_or_default();
-        let initial: std::collections::HashSet<SessionId> = session_ids.iter().copied().collect();
-        let close_tasks: Vec<tokio::task::JoinHandle<()>> = session_ids
-            .into_iter()
-            .map(|session_id| {
-                let server = self.clone();
-                tokio::spawn(async move {
-                    let _ = server.close_session(session_id).await;
-                })
-            })
-            .collect();
-        for task in close_tasks {
-            if tokio::time::timeout_at(deadline, task).await.is_err() {
-                // Budget spent waiting; remaining closes continue detached.
-                break;
+        // Phase 2: graceful offer, then cancel — both non-blocking, so no
+        // session can stall this phase.
+        for entry in self.session_handles.keys().unwrap_or_default() {
+            if let Some(handle) = self.session_handles.get(&entry) {
+                let _ = handle.try_send_event(crate::event::TransportEvent::ConnectionClosed {
+                    reason: crate::error::CloseReason::Normal,
+                });
             }
         }
-        loop {
-            let remaining = self.transports.len();
-            if remaining == 0 {
-                break;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                tracing::warn!(
-                    "[SHUTDOWN] Deadline reached with {} session(s) still draining",
-                    remaining
-                );
-                break;
-            }
-            // Close anything that slipped in after the first sweep — same
-            // owned-task pattern, same budget, never cancelling a close.
-            for session_id in self.transports.keys().unwrap_or_default() {
-                let server = self.clone();
-                let task = tokio::spawn(async move {
-                    let _ = server.close_session(session_id).await;
-                });
-                if tokio::time::timeout_at(deadline, task).await.is_err() {
-                    break;
+        self.root_cancel.cancel();
+
+        // Phase 3: join session supervisors within the budget. Joining the
+        // supervisor is the proof: actor + pump ended, maps cleaned, permit
+        // released. On timeout the entry is re-inserted — still owned.
+        let sids: Vec<SessionId> = self.session_supervisors.iter().map(|e| *e.key()).collect();
+        let mut sessions_closed = 0usize;
+        for sid in sids {
+            let Some((_, mut entry)) = self.session_supervisors.remove(&sid) else {
+                sessions_closed += 1; // supervisor self-completed meanwhile
+                continue;
+            };
+            match tokio::time::timeout_at(deadline, &mut entry.task).await {
+                Ok(_) => sessions_closed += 1,
+                Err(_) => {
+                    // Budget exhausted: keep ownership for a later shutdown.
+                    self.session_supervisors.insert(sid, entry);
                 }
             }
-            // Poll pause bounded by the SAME deadline (a fixed sleep could
-            // overshoot a small timeout).
+        }
+
+        // Phase 4: infra join — wait for serve() (listeners + scanner) to
+        // actually return, freeing the endpoints. 0 = never started counts as
+        // stopped.
+        let mut serve_rx = self.serve_state.subscribe();
+        let infra_stopped = loop {
+            let state = *serve_rx.borrow();
+            if state != 1 {
+                break true;
+            }
+            match tokio::time::timeout_at(deadline, serve_rx.changed()).await {
+                Ok(Ok(())) => continue,
+                _ => break false,
+            }
+        };
+
+        // Straggler drain: sessions racing the gate self-cancel; give their
+        // supervisors the remaining budget to finish.
+        while !self.session_supervisors.is_empty() && tokio::time::Instant::now() < deadline {
             let pause = std::cmp::min(
                 deadline,
-                tokio::time::Instant::now() + std::time::Duration::from_millis(20),
+                tokio::time::Instant::now() + std::time::Duration::from_millis(10),
             );
             tokio::time::sleep_until(pause).await;
         }
 
-        let sessions_remaining = self.transports.len();
-        // Count sessions that were present at entry and are actually gone now
-        // (an Ok(()) from close_session can also mean "already closing", which
-        // proves nothing). Runtime-join based accounting arrives with the
-        // supervisor.
-        let sessions_closed = initial
-            .iter()
-            .filter(|sid| self.transports.get(sid).is_none())
-            .count();
+        let sessions_remaining = self.session_supervisors.len().max(self.transports.len());
+        let permits_restored = self.max_connections == usize::MAX
+            || self.connection_permits.available_permits() == self.max_connections;
+        let clean = sessions_remaining == 0 && infra_stopped && permits_restored;
         let report = ShutdownReport {
             sessions_closed,
             sessions_remaining,
-            clean: sessions_remaining == 0,
+            infra_stopped,
+            permits_restored,
+            clean,
             elapsed: started.elapsed(),
         };
         tracing::info!(
-            "[SHUTDOWN] Complete: closed={} remaining={} clean={} elapsed={:?}",
+            "[SHUTDOWN] Complete: closed={} remaining={} infra={} permits={} clean={} elapsed={:?}",
             report.sessions_closed,
             report.sessions_remaining,
+            report.infra_stopped,
+            report.permits_restored,
             report.clean,
             report.elapsed
         );
         report
+    }
+
+    fn report_snapshot(
+        &self,
+        started: std::time::Instant,
+        sessions_closed: usize,
+    ) -> ShutdownReport {
+        let sessions_remaining = self.session_supervisors.len().max(self.transports.len());
+        let infra_stopped = *self.serve_state.subscribe().borrow() != 1;
+        let permits_restored = self.max_connections == usize::MAX
+            || self.connection_permits.available_permits() == self.max_connections;
+        ShutdownReport {
+            sessions_closed,
+            sessions_remaining,
+            infra_stopped,
+            permits_restored,
+            clean: false,
+            elapsed: started.elapsed(),
+        }
+    }
+
+    /// Test/introspection accessor for the connection-cap semaphore.
+    #[doc(hidden)]
+    pub fn available_permits(&self) -> usize {
+        self.connection_permits.available_permits()
     }
 }
 
@@ -1220,12 +1368,18 @@ impl TransportServer {
 /// not yet prove.
 #[derive(Debug, Clone)]
 pub struct ShutdownReport {
-    /// Sessions gracefully closed by this shutdown.
+    /// Session supervisors joined by this shutdown (each join proves that
+    /// session's actor + pump ended and its permit returned).
     pub sessions_closed: usize,
     /// Sessions still draining when the deadline hit (0 on a clean shutdown).
     pub sessions_remaining: usize,
-    /// True iff the session map drained before the deadline (see the
-    /// LIMITATION on shutdown_with_timeout for what this does not yet prove).
+    /// serve() — listeners and the timeout scanner — has returned (or was
+    /// never started), so the protocol endpoints are freed.
+    pub infra_stopped: bool,
+    /// Every connection permit is back (always true when uncapped).
+    pub permits_restored: bool,
+    /// True iff everything is proven: supervisors joined, maps empty, infra
+    /// finished, permits restored.
     pub clean: bool,
     /// Wall time the shutdown took.
     pub elapsed: std::time::Duration,
@@ -1255,6 +1409,11 @@ impl Clone for TransportServer {
             frame_policy: self.frame_policy,
             connection_permits: self.connection_permits.clone(),
             max_connections: self.max_connections,
+            root_cancel: self.root_cancel.clone(),
+            session_supervisors: self.session_supervisors.clone(),
+            admission_open: self.admission_open.clone(),
+            serve_state: self.serve_state.clone(),
+            shutdown_lock: self.shutdown_lock.clone(),
         }
     }
 }
