@@ -14,8 +14,18 @@ pub use protocol::{
 };
 
 // Re-export configuration types
-pub use client_config::{QuicClientConfig, TcpClientConfig, WebSocketClientConfig};
-pub use server_config::{QuicServerConfig, TcpServerConfig, WebSocketServerConfig};
+#[cfg(feature = "quic")]
+pub use client_config::QuicClientConfig;
+#[cfg(feature = "tcp")]
+pub use client_config::TcpClientConfig;
+#[cfg(feature = "websocket")]
+pub use client_config::WebSocketClientConfig;
+#[cfg(feature = "quic")]
+pub use server_config::QuicServerConfig;
+#[cfg(feature = "tcp")]
+pub use server_config::TcpServerConfig;
+#[cfg(feature = "websocket")]
+pub use server_config::WebSocketServerConfig;
 
 // Re-export adapter configuration
 pub use adapter::{

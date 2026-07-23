@@ -1,9 +1,11 @@
 use crate::command::ConnectionInfo;
 use crate::packet::Packet;
-use crate::protocol::{
-    QuicClientConfig, QuicServerConfig, TcpClientConfig, TcpServerConfig, WebSocketClientConfig,
-    WebSocketServerConfig,
-};
+#[cfg(feature = "quic")]
+use crate::protocol::{QuicClientConfig, QuicServerConfig};
+#[cfg(feature = "tcp")]
+use crate::protocol::{TcpClientConfig, TcpServerConfig};
+#[cfg(feature = "websocket")]
+use crate::protocol::{WebSocketClientConfig, WebSocketServerConfig};
 use crate::{error::TransportError, SessionId};
 use async_trait::async_trait;
 
@@ -214,6 +216,7 @@ pub enum ConfigError {
     Io(#[from] std::io::Error),
 }
 
+#[cfg(feature = "tcp")]
 impl ServerConfig for TcpServerConfig {
     type Server = crate::adapters::factories::TcpServerWrapper;
 
@@ -249,6 +252,7 @@ impl ServerConfig for TcpServerConfig {
     }
 }
 
+#[cfg(feature = "tcp")]
 impl ClientConfig for TcpClientConfig {
     type Connection = crate::adapters::tcp::TcpAdapter<TcpClientConfig>;
 
@@ -282,6 +286,7 @@ impl ClientConfig for TcpClientConfig {
     }
 }
 
+#[cfg(feature = "websocket")]
 impl ServerConfig for WebSocketServerConfig {
     type Server = crate::adapters::factories::WebSocketServerWrapper;
 
@@ -319,6 +324,7 @@ impl ServerConfig for WebSocketServerConfig {
     }
 }
 
+#[cfg(feature = "websocket")]
 impl ClientConfig for WebSocketClientConfig {
     type Connection = crate::adapters::websocket::WebSocketAdapter<WebSocketClientConfig>;
 
@@ -352,6 +358,7 @@ impl ClientConfig for WebSocketClientConfig {
     }
 }
 
+#[cfg(feature = "quic")]
 impl ServerConfig for QuicServerConfig {
     type Server = crate::adapters::factories::QuicServerWrapper;
 
@@ -387,6 +394,7 @@ impl ServerConfig for QuicServerConfig {
     }
 }
 
+#[cfg(feature = "quic")]
 impl ClientConfig for QuicClientConfig {
     type Connection = crate::adapters::quic::QuicAdapter<QuicClientConfig>;
 

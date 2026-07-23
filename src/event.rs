@@ -132,6 +132,7 @@ impl TransportEvent {
 }
 
 /// TCP protocol specific events
+#[cfg(feature = "tcp")]
 #[derive(Debug, Clone)]
 pub enum TcpEvent {
     ListenerBound { addr: SocketAddr },
@@ -139,6 +140,7 @@ pub enum TcpEvent {
     ConnectionTimeout { session_id: SessionId },
 }
 
+#[cfg(feature = "tcp")]
 impl ProtocolEvent for TcpEvent {
     fn into_transport_event(self) -> TransportEvent {
         match self {
@@ -172,6 +174,7 @@ impl ProtocolEvent for TcpEvent {
 }
 
 /// WebSocket protocol specific events
+#[cfg(feature = "websocket")]
 #[derive(Debug, Clone)]
 pub enum WebSocketEvent {
     HandshakeCompleted {
@@ -189,6 +192,7 @@ pub enum WebSocketEvent {
     },
 }
 
+#[cfg(feature = "websocket")]
 impl ProtocolEvent for WebSocketEvent {
     fn into_transport_event(self) -> TransportEvent {
         match self {
@@ -235,6 +239,7 @@ impl ProtocolEvent for WebSocketEvent {
 }
 
 /// QUIC protocol specific events
+#[cfg(feature = "quic")]
 #[derive(Debug, Clone)]
 pub enum QuicEvent {
     StreamOpened {
@@ -254,6 +259,7 @@ pub enum QuicEvent {
     },
 }
 
+#[cfg(feature = "quic")]
 impl ProtocolEvent for QuicEvent {
     fn into_transport_event(self) -> TransportEvent {
         match self {

@@ -74,7 +74,13 @@ impl From<SessionId> for u64 {
 // Re-export core types
 pub use command::{ConnectionInfo, TransportCommand, TransportStats};
 pub use error::{CloseReason, TransportError};
-pub use event::{ClientEvent, QuicEvent, RespondOutcome, TcpEvent, TransportEvent, WebSocketEvent};
+#[cfg(feature = "quic")]
+pub use event::QuicEvent;
+#[cfg(feature = "tcp")]
+pub use event::TcpEvent;
+#[cfg(feature = "websocket")]
+pub use event::WebSocketEvent;
+pub use event::{ClientEvent, RespondOutcome, TransportEvent};
 pub use packet::{FramePolicy, Packet, PacketError, PacketType};
 pub use stream::{ClientEvents, EventStream, PacketStream};
 
@@ -84,10 +90,13 @@ pub use transport::{
     TransportConfig, TransportContext, TransportServer, TransportServerBuilder,
 };
 
-pub use protocol::{
-    ClientConfig, QuicClientConfig, QuicServerConfig, ServerConfig, TcpClientConfig,
-    TcpServerConfig, WebSocketClientConfig, WebSocketServerConfig,
-};
+pub use protocol::{ClientConfig, ServerConfig};
+#[cfg(feature = "quic")]
+pub use protocol::{QuicClientConfig, QuicServerConfig};
+#[cfg(feature = "tcp")]
+pub use protocol::{TcpClientConfig, TcpServerConfig};
+#[cfg(feature = "websocket")]
+pub use protocol::{WebSocketClientConfig, WebSocketServerConfig};
 // Re-export new abstractions
 pub use connection::{Connection, ConnectionFactory, Server};
 

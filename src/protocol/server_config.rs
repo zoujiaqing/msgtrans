@@ -1,11 +1,16 @@
 //! Server configuration module - Separated server configuration implementation
 
+#[cfg(any(feature = "tcp", feature = "websocket", feature = "quic"))]
 use crate::protocol::adapter::DynProtocolConfig;
+#[cfg(any(feature = "tcp", feature = "websocket", feature = "quic"))]
 use crate::protocol::{ConfigError, ProtocolConfig};
+#[cfg(any(feature = "tcp", feature = "websocket", feature = "quic"))]
 use serde::{Deserialize, Serialize};
+#[cfg(any(feature = "tcp", feature = "websocket", feature = "quic"))]
 use std::time::Duration;
 
 /// TCP server configuration
+#[cfg(feature = "tcp")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TcpServerConfig {
     /// Bind address
@@ -22,6 +27,7 @@ pub struct TcpServerConfig {
     pub(crate) reuse_addr: bool,
 }
 
+#[cfg(feature = "tcp")]
 impl Default for TcpServerConfig {
     fn default() -> Self {
         Self {
@@ -35,6 +41,7 @@ impl Default for TcpServerConfig {
     }
 }
 
+#[cfg(feature = "tcp")]
 impl ProtocolConfig for TcpServerConfig {
     fn validate(&self) -> Result<(), ConfigError> {
         Ok(())
@@ -57,6 +64,7 @@ impl ProtocolConfig for TcpServerConfig {
     }
 }
 
+#[cfg(feature = "tcp")]
 impl DynProtocolConfig for TcpServerConfig {
     fn protocol_name(&self) -> &'static str {
         "tcp"
@@ -76,6 +84,7 @@ impl DynProtocolConfig for TcpServerConfig {
 }
 
 /// [CONFIG] New: Implement server-specific configuration
+#[cfg(feature = "tcp")]
 impl crate::protocol::adapter::DynServerConfig for TcpServerConfig {
     fn build_server_dyn(
         &self,
@@ -102,6 +111,7 @@ impl crate::protocol::adapter::DynServerConfig for TcpServerConfig {
     }
 }
 
+#[cfg(feature = "tcp")]
 impl TcpServerConfig {
     /// Create new TCP server configuration
     pub fn new(bind_address: &str) -> Result<Self, ConfigError> {
@@ -168,6 +178,7 @@ impl TcpServerConfig {
 }
 
 /// WebSocket server configuration
+#[cfg(feature = "websocket")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebSocketServerConfig {
     /// Bind address
@@ -188,6 +199,7 @@ pub struct WebSocketServerConfig {
     pub(crate) idle_timeout: Option<Duration>,
 }
 
+#[cfg(feature = "websocket")]
 impl Default for WebSocketServerConfig {
     fn default() -> Self {
         Self {
@@ -203,6 +215,7 @@ impl Default for WebSocketServerConfig {
     }
 }
 
+#[cfg(feature = "websocket")]
 impl ProtocolConfig for WebSocketServerConfig {
     fn validate(&self) -> Result<(), ConfigError> {
         Ok(())
@@ -226,6 +239,7 @@ impl ProtocolConfig for WebSocketServerConfig {
     }
 }
 
+#[cfg(feature = "websocket")]
 impl DynProtocolConfig for WebSocketServerConfig {
     fn protocol_name(&self) -> &'static str {
         "websocket"
@@ -245,6 +259,7 @@ impl DynProtocolConfig for WebSocketServerConfig {
 }
 
 /// [CONFIG] New: Implement WebSocket server-specific configuration
+#[cfg(feature = "websocket")]
 impl crate::protocol::adapter::DynServerConfig for WebSocketServerConfig {
     fn build_server_dyn(
         &self,
@@ -271,6 +286,7 @@ impl crate::protocol::adapter::DynServerConfig for WebSocketServerConfig {
     }
 }
 
+#[cfg(feature = "websocket")]
 impl WebSocketServerConfig {
     /// Create new WebSocket server configuration
     pub fn new(bind_address: &str) -> Result<Self, ConfigError> {
@@ -355,6 +371,7 @@ impl WebSocketServerConfig {
 }
 
 /// QUIC server configuration
+#[cfg(feature = "quic")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuicServerConfig {
     /// Bind address
@@ -377,6 +394,7 @@ pub struct QuicServerConfig {
     pub(crate) send_window: u32,
 }
 
+#[cfg(feature = "quic")]
 impl Default for QuicServerConfig {
     fn default() -> Self {
         Self {
@@ -393,6 +411,7 @@ impl Default for QuicServerConfig {
     }
 }
 
+#[cfg(feature = "quic")]
 impl ProtocolConfig for QuicServerConfig {
     fn validate(&self) -> Result<(), ConfigError> {
         Ok(())
@@ -416,6 +435,7 @@ impl ProtocolConfig for QuicServerConfig {
     }
 }
 
+#[cfg(feature = "quic")]
 impl DynProtocolConfig for QuicServerConfig {
     fn protocol_name(&self) -> &'static str {
         "quic"
@@ -435,6 +455,7 @@ impl DynProtocolConfig for QuicServerConfig {
 }
 
 /// 🔧 New addition: Implement QUIC server-specific configuration
+#[cfg(feature = "quic")]
 impl crate::protocol::adapter::DynServerConfig for QuicServerConfig {
     fn build_server_dyn(
         &self,
@@ -461,6 +482,7 @@ impl crate::protocol::adapter::DynServerConfig for QuicServerConfig {
     }
 }
 
+#[cfg(feature = "quic")]
 impl QuicServerConfig {
     /// Create new QUIC server configuration
     pub fn new(bind_address: &str) -> Result<Self, ConfigError> {

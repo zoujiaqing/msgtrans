@@ -46,14 +46,26 @@ fn from_bytes_oversized_declared_len_does_not_panic() {
 }
 
 #[test]
-fn from_bytes_after_concatenation_reads_first_packet_only() {
-    // Coalesced ("sticky") packets: from_bytes decodes exactly the first packet's
-    // declared length and ignores trailing bytes, so a reader can split a stream.
+fn concatenated_packets_split_via_decode_one_and_fail_decode_exact() {
+    // 2.0 contract: from_bytes/decode_exact refuse trailing bytes (a framed
+    // message carrying extra bytes is malformed); coalesced ("sticky") byte
+    // streams are split with decode_one, which reports the consumed length.
     let a = Packet::request(1, b"first".to_vec()).to_bytes();
     let b = Packet::request(2, b"second".to_vec()).to_bytes();
     let mut joined = a.to_vec();
     joined.extend_from_slice(&b);
-    let decoded = Packet::from_bytes(&joined).expect("first packet decodes");
-    assert_eq!(decoded.message_id(), 1);
-    assert_eq!(decoded.payload, b"first".to_vec());
+
+    assert!(
+        Packet::from_bytes(&joined).is_err(),
+        "exact decode must reject trailing bytes"
+    );
+
+    let (first, used) = Packet::decode_one(&joined)
+        .expect("valid stream")
+        .expect("complete first packet");
+    assert_eq!(first.message_id(), 1);
+    assert_eq!(first.payload, b"first".to_vec());
+    let second = Packet::from_bytes(&joined[used..]).expect("second packet is exact");
+    assert_eq!(second.message_id(), 2);
+    assert_eq!(second.payload, b"second".to_vec());
 }

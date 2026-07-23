@@ -363,7 +363,7 @@ impl<C> QuicAdapter<C> {
         let (send_queue_tx, send_queue_rx) = mpsc::channel(SEND_QUEUE_CAPACITY);
         let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel();
         let frame_policy = Arc::new(std::sync::atomic::AtomicU8::new(
-            crate::packet::FramePolicy::Lenient as u8,
+            crate::packet::FramePolicy::default() as u8,
         ));
 
         // Start event loop

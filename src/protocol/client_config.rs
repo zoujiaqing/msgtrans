@@ -1,15 +1,20 @@
+#[cfg(any(feature = "tcp", feature = "websocket", feature = "quic"))]
 use crate::protocol::adapter::DynProtocolConfig;
+#[cfg(any(feature = "tcp", feature = "websocket", feature = "quic"))]
 use crate::protocol::{ConfigError, ProtocolConfig};
+#[cfg(any(feature = "tcp", feature = "websocket", feature = "quic"))]
 use serde::{Deserialize, Serialize};
 /// 客户端协议配置
 ///
 /// 专门用于客户端的协议配置，与服务端配置完全分离
+#[cfg(any(feature = "tcp", feature = "websocket", feature = "quic"))]
 use std::time::Duration;
 
 use crate::{transport::transport::Transport, SessionId, TransportError};
 use std::sync::Arc;
 
 /// TCP客户端配置
+#[cfg(feature = "tcp")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TcpClientConfig {
     /// 目标服务器地址
@@ -24,6 +29,7 @@ pub struct TcpClientConfig {
     pub(crate) local_bind_address: Option<std::net::SocketAddr>,
 }
 
+#[cfg(feature = "tcp")]
 impl Default for TcpClientConfig {
     fn default() -> Self {
         Self {
@@ -35,6 +41,7 @@ impl Default for TcpClientConfig {
         }
     }
 }
+#[cfg(feature = "tcp")]
 impl ProtocolConfig for TcpClientConfig {
     fn validate(&self) -> Result<(), ConfigError> {
         Ok(())
@@ -64,6 +71,7 @@ impl ProtocolConfig for TcpClientConfig {
     }
 }
 
+#[cfg(feature = "tcp")]
 impl TcpClientConfig {
     /// 创建新的TCP客户端配置
     pub fn new(target_address: &str) -> Result<Self, ConfigError> {
@@ -156,6 +164,7 @@ impl TcpClientConfig {
 }
 
 /// WebSocket客户端配置
+#[cfg(feature = "websocket")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebSocketClientConfig {
     /// 目标服务器URL
@@ -178,6 +187,7 @@ pub struct WebSocketClientConfig {
     pub(crate) verify_tls: bool,
 }
 
+#[cfg(feature = "websocket")]
 impl Default for WebSocketClientConfig {
     fn default() -> Self {
         Self {
@@ -194,6 +204,7 @@ impl Default for WebSocketClientConfig {
     }
 }
 
+#[cfg(feature = "websocket")]
 impl ProtocolConfig for WebSocketClientConfig {
     fn validate(&self) -> Result<(), ConfigError> {
         if !self.target_url.starts_with("ws://") && !self.target_url.starts_with("wss://") {
@@ -262,6 +273,7 @@ impl ProtocolConfig for WebSocketClientConfig {
     }
 }
 
+#[cfg(feature = "websocket")]
 impl WebSocketClientConfig {
     /// 创建新的WebSocket客户端配置
     pub fn new(target_url: &str) -> Result<Self, ConfigError> {
@@ -383,6 +395,7 @@ impl WebSocketClientConfig {
 }
 
 /// QUIC客户端配置
+#[cfg(feature = "quic")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuicClientConfig {
     /// 目标服务器地址
@@ -407,6 +420,7 @@ pub struct QuicClientConfig {
     pub(crate) local_bind_address: Option<std::net::SocketAddr>,
 }
 
+#[cfg(feature = "quic")]
 impl Default for QuicClientConfig {
     fn default() -> Self {
         Self {
@@ -424,6 +438,7 @@ impl Default for QuicClientConfig {
     }
 }
 
+#[cfg(feature = "quic")]
 impl ProtocolConfig for QuicClientConfig {
     fn validate(&self) -> Result<(), ConfigError> {
         if self.max_concurrent_streams == 0 {
@@ -477,6 +492,7 @@ impl ProtocolConfig for QuicClientConfig {
     }
 }
 
+#[cfg(feature = "quic")]
 impl QuicClientConfig {
     /// 创建新的QUIC客户端配置
     pub fn new(target_address: &str) -> Result<Self, ConfigError> {
@@ -610,6 +626,7 @@ impl QuicClientConfig {
     }
 }
 
+#[cfg(feature = "quic")]
 impl DynProtocolConfig for QuicClientConfig {
     fn protocol_name(&self) -> &'static str {
         "quic"
@@ -629,6 +646,7 @@ impl DynProtocolConfig for QuicClientConfig {
 }
 
 /// 🔧 新增：实现 WebSocket 客户端专用配置
+#[cfg(feature = "websocket")]
 impl crate::protocol::adapter::DynClientConfig for WebSocketClientConfig {
     fn build_connection_dyn(
         &self,
@@ -656,6 +674,7 @@ impl crate::protocol::adapter::DynClientConfig for WebSocketClientConfig {
 }
 
 /// 🔧 新增：实现 TCP 客户端专用配置
+#[cfg(feature = "tcp")]
 impl crate::protocol::adapter::DynClientConfig for TcpClientConfig {
     fn build_connection_dyn(
         &self,
@@ -683,6 +702,7 @@ impl crate::protocol::adapter::DynClientConfig for TcpClientConfig {
 }
 
 /// 🔧 新增：实现 QUIC 客户端专用配置
+#[cfg(feature = "quic")]
 impl crate::protocol::adapter::DynClientConfig for QuicClientConfig {
     fn build_connection_dyn(
         &self,
@@ -709,6 +729,7 @@ impl crate::protocol::adapter::DynClientConfig for QuicClientConfig {
     }
 }
 
+#[cfg(feature = "tcp")]
 impl DynProtocolConfig for TcpClientConfig {
     fn protocol_name(&self) -> &'static str {
         "tcp"
@@ -727,6 +748,7 @@ impl DynProtocolConfig for TcpClientConfig {
     }
 }
 
+#[cfg(feature = "websocket")]
 impl DynProtocolConfig for WebSocketClientConfig {
     fn protocol_name(&self) -> &'static str {
         "websocket"
@@ -750,6 +772,7 @@ pub trait ConnectableConfig {
     async fn connect(self, transport: Arc<Transport>) -> Result<SessionId, TransportError>;
 }
 
+#[cfg(feature = "tcp")]
 impl ConnectableConfig for TcpClientConfig {
     async fn connect(self, transport: Arc<Transport>) -> Result<SessionId, TransportError> {
         tracing::info!("🔌 TCP 客户端开始连接到 {}", self.target_address);
@@ -768,6 +791,7 @@ impl ConnectableConfig for TcpClientConfig {
     }
 }
 
+#[cfg(feature = "websocket")]
 impl ConnectableConfig for WebSocketClientConfig {
     async fn connect(self, transport: Arc<Transport>) -> Result<SessionId, TransportError> {
         tracing::info!("🔌 WebSocket 客户端开始连接到 {}", self.target_url);
@@ -786,6 +810,7 @@ impl ConnectableConfig for WebSocketClientConfig {
     }
 }
 
+#[cfg(feature = "quic")]
 impl ConnectableConfig for QuicClientConfig {
     async fn connect(self, transport: Arc<Transport>) -> Result<SessionId, TransportError> {
         tracing::info!("🔌 QUIC 客户端开始连接到 {}", self.target_address);

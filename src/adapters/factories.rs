@@ -1,27 +1,38 @@
+#[cfg(feature = "tcp")]
 use crate::adapters::tcp;
+#[cfg(feature = "quic")]
+use crate::protocol::{QuicClientConfig, QuicServerConfig};
+#[cfg(feature = "tcp")]
+use crate::protocol::{TcpClientConfig, TcpServerConfig};
+#[cfg(feature = "websocket")]
+use crate::protocol::{WebSocketClientConfig, WebSocketServerConfig};
+use crate::TransportError;
+#[cfg(any(feature = "tcp", feature = "websocket", feature = "quic"))]
 use crate::{
     connection::{Connection, Server},
-    protocol::{
-        ProtocolFactory, QuicClientConfig, QuicServerConfig, TcpClientConfig, TcpServerConfig,
-        WebSocketClientConfig, WebSocketServerConfig,
-    },
-    TransportError,
+    protocol::ProtocolFactory,
 };
+#[cfg(any(feature = "tcp", feature = "websocket", feature = "quic"))]
 use async_trait::async_trait;
+#[cfg(any(feature = "tcp", feature = "websocket", feature = "quic"))]
 use std::any::Any;
+#[cfg(any(feature = "tcp", feature = "websocket", feature = "quic"))]
 use std::collections::HashMap;
 
 /// TCP server Server wrapper
+#[cfg(feature = "tcp")]
 pub struct TcpServerWrapper {
     inner: tcp::TcpServer,
 }
 
+#[cfg(feature = "tcp")]
 impl TcpServerWrapper {
     pub fn new(server: tcp::TcpServer) -> Self {
         Self { inner: server }
     }
 }
 
+#[cfg(feature = "tcp")]
 #[async_trait]
 impl Server for TcpServerWrapper {
     async fn accept(&mut self) -> Result<Box<dyn Connection>, TransportError> {
@@ -45,14 +56,17 @@ impl Server for TcpServerWrapper {
 }
 
 /// TCP protocol factory
+#[cfg(feature = "tcp")]
 pub struct TcpFactory;
 
+#[cfg(feature = "tcp")]
 impl TcpFactory {
     pub fn new() -> Self {
         Self
     }
 }
 
+#[cfg(feature = "tcp")]
 #[async_trait]
 impl ProtocolFactory for TcpFactory {
     fn protocol_name(&self) -> &'static str {
@@ -152,18 +166,22 @@ impl ProtocolFactory for TcpFactory {
 }
 
 /// WebSocket factory
+#[cfg(feature = "websocket")]
 pub struct WebSocketFactory;
 
+#[cfg(feature = "websocket")]
 impl WebSocketFactory {
     pub fn new() -> Self {
         Self
     }
 }
 
+#[cfg(feature = "websocket")]
 pub struct WebSocketServerWrapper {
     inner: crate::adapters::websocket::WebSocketServer<crate::protocol::WebSocketServerConfig>,
 }
 
+#[cfg(feature = "websocket")]
 impl WebSocketServerWrapper {
     pub fn new(
         server: crate::adapters::websocket::WebSocketServer<crate::protocol::WebSocketServerConfig>,
@@ -172,6 +190,7 @@ impl WebSocketServerWrapper {
     }
 }
 
+#[cfg(feature = "websocket")]
 #[async_trait]
 impl Server for WebSocketServerWrapper {
     async fn accept(&mut self) -> Result<Box<dyn Connection>, TransportError> {
@@ -197,6 +216,7 @@ impl Server for WebSocketServerWrapper {
     }
 }
 
+#[cfg(feature = "websocket")]
 #[async_trait]
 impl ProtocolFactory for WebSocketFactory {
     fn protocol_name(&self) -> &'static str {
@@ -313,24 +333,29 @@ impl ProtocolFactory for WebSocketFactory {
 }
 
 /// QUIC factory
+#[cfg(feature = "quic")]
 pub struct QuicFactory;
 
+#[cfg(feature = "quic")]
 impl QuicFactory {
     pub fn new() -> Self {
         Self
     }
 }
 
+#[cfg(feature = "quic")]
 pub struct QuicServerWrapper {
     inner: crate::adapters::quic::QuicServer,
 }
 
+#[cfg(feature = "quic")]
 impl QuicServerWrapper {
     pub fn new(server: crate::adapters::quic::QuicServer) -> Self {
         Self { inner: server }
     }
 }
 
+#[cfg(feature = "quic")]
 #[async_trait]
 impl Server for QuicServerWrapper {
     async fn accept(&mut self) -> Result<Box<dyn Connection>, TransportError> {
@@ -356,6 +381,7 @@ impl Server for QuicServerWrapper {
     }
 }
 
+#[cfg(feature = "quic")]
 #[async_trait]
 impl ProtocolFactory for QuicFactory {
     fn protocol_name(&self) -> &'static str {
@@ -444,8 +470,11 @@ pub async fn create_standard_registry() -> Result<crate::protocol::ProtocolRegis
 {
     let registry = crate::protocol::ProtocolRegistry::new();
 
+    #[cfg(feature = "tcp")]
     registry.register(TcpFactory::new()).await?;
+    #[cfg(feature = "websocket")]
     registry.register(WebSocketFactory::new()).await?;
+    #[cfg(feature = "quic")]
     registry.register(QuicFactory::new()).await?;
 
     Ok(registry)

@@ -155,7 +155,7 @@ impl TransportServer {
             ),
             session_handler: handler,
             actor_buffer_size: buffer_size.unwrap_or(DEFAULT_ACTOR_BUFFER_SIZE),
-            frame_policy: crate::packet::FramePolicy::Lenient,
+            frame_policy: crate::packet::FramePolicy::default(),
             connection_permits: Arc::new(tokio::sync::Semaphore::new(
                 tokio::sync::Semaphore::MAX_PERMITS,
             )),

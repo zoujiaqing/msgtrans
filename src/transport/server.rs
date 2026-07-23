@@ -26,7 +26,7 @@ impl TransportServerBuilder {
             transport_config: TransportConfig::default(),
             protocol_configs: std::collections::HashMap::new(),
             actor_buffer_size: None,
-            frame_policy: crate::packet::FramePolicy::Lenient,
+            frame_policy: crate::packet::FramePolicy::default(),
             max_connections: None,
         }
     }

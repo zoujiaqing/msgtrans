@@ -73,9 +73,12 @@ fn list_bin_fixtures() -> Vec<PathBuf> {
 }
 
 fn build_packet_from_spec(spec: &FixtureJson) -> Packet {
-    let mut p = Packet::new(PacketType::from(spec.packet_type), spec.message_id);
+    let mut p = Packet::new(
+        PacketType::try_from(spec.packet_type).expect("fixture packet_type"),
+        spec.message_id,
+    );
     p.set_biz_type(spec.biz_type);
-    p.set_compression(CompressionType::from(spec.compression));
+    p.set_compression(CompressionType::try_from(spec.compression).expect("fixture compression"));
     p.set_ext_header(hex_decode(&spec.ext_header_hex));
     p.set_payload(hex_decode(&spec.payload_hex));
     p.header.reserved = ReservedFlags::from_raw(spec.reserved);

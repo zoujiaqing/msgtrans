@@ -23,13 +23,19 @@ impl PacketType {
     pub const Data: PacketType = PacketType::OneWay;
 }
 
-impl From<u8> for PacketType {
-    fn from(value: u8) -> Self {
+impl TryFrom<u8> for PacketType {
+    type Error = PacketError;
+    /// Strict wire decoding: an unknown packet type is a protocol error, not
+    /// a silent OneWay. (The 1.x `From<u8>` fallback let corrupt or foreign
+    /// frames masquerade as valid messages.)
+    fn try_from(value: u8) -> Result<Self, PacketError> {
         match value {
-            0 => PacketType::OneWay,
-            1 => PacketType::Request,
-            2 => PacketType::Response,
-            _ => PacketType::OneWay, // Default value
+            0 => Ok(PacketType::OneWay),
+            1 => Ok(PacketType::Request),
+            2 => Ok(PacketType::Response),
+            other => Err(PacketError::InvalidHeader(format!(
+                "invalid packet_type: {other}"
+            ))),
         }
     }
 }
@@ -49,13 +55,18 @@ pub enum CompressionType {
     Zlib = 2,
 }
 
-impl From<u8> for CompressionType {
-    fn from(value: u8) -> Self {
+impl TryFrom<u8> for CompressionType {
+    type Error = PacketError;
+    /// Strict wire decoding: an unknown compression id is a protocol error,
+    /// not a silent None (which would deliver undecompressed garbage).
+    fn try_from(value: u8) -> Result<Self, PacketError> {
         match value {
-            0 => CompressionType::None,
-            1 => CompressionType::Zstd,
-            2 => CompressionType::Zlib,
-            _ => CompressionType::None,
+            0 => Ok(CompressionType::None),
+            1 => Ok(CompressionType::Zstd),
+            2 => Ok(CompressionType::Zlib),
+            other => Err(PacketError::InvalidHeader(format!(
+                "invalid compression: {other}"
+            ))),
         }
     }
 }
@@ -68,17 +79,20 @@ impl From<CompressionType> for u8 {
 
 /// How a protocol adapter treats a frame it cannot decode as a msgtrans packet.
 ///
-/// The default is `Lenient`, preserving the historical WebSocket/QUIC behavior
-/// of delivering undecodable bytes as a raw one-way message. `Strict` treats
-/// such frames as a protocol error and closes the connection (matching how the
-/// TCP adapter already handles a malformed first packet).
+/// The default is `Strict` (2.0): undecodable frames — including WebSocket
+/// text frames — are a protocol error and close the connection, matching how
+/// the TCP adapter has always handled a malformed first packet and matching
+/// the TypeScript SDK's defaults. `Lenient` preserves the 1.x WebSocket/QUIC
+/// behavior of delivering undecodable bytes as a raw one-way message and is
+/// opt-in for debugging/legacy peers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum FramePolicy {
-    /// Deliver undecodable bytes as a raw one-way message (default).
-    #[default]
+    /// Deliver undecodable bytes as a raw one-way message (1.x behavior).
     Lenient = 0,
-    /// Treat undecodable frames as a protocol error and close the connection.
+    /// Treat undecodable frames as a protocol error and close the connection
+    /// (default).
+    #[default]
     Strict = 1,
 }
 
@@ -225,8 +239,8 @@ impl FixedHeader {
             return Err(PacketError::UnsupportedVersion(version));
         }
 
-        let compression = CompressionType::from(bytes[1]);
-        let packet_type = PacketType::from(bytes[2]);
+        let compression = CompressionType::try_from(bytes[1])?;
+        let packet_type = PacketType::try_from(bytes[2])?;
         let biz_type = bytes[3];
 
         let message_id = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
@@ -468,47 +482,74 @@ impl Packet {
     }
 
     /// Deserialize from byte array
+    /// Decode exactly one packet: the buffer must contain one complete packet
+    /// and NOTHING else. Trailing bytes are a protocol error — a datagram or
+    /// message frame carrying extra bytes is malformed, not "a packet plus
+    /// noise to ignore". Framed transports (WebSocket messages, QUIC length-
+    /// prefixed frames) use this; byte streams use [`Self::decode_one`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, PacketError> {
+        Self::decode_exact(bytes)
+    }
+
+    /// See [`Self::from_bytes`] (alias with the explicit 2.0 name).
+    pub fn decode_exact(bytes: &[u8]) -> Result<Self, PacketError> {
+        match Self::decode_one(bytes)? {
+            Some((packet, consumed)) => {
+                if consumed != bytes.len() {
+                    return Err(PacketError::InvalidPacket(format!(
+                        "trailing bytes after packet: consumed {consumed} of {}",
+                        bytes.len()
+                    )));
+                }
+                Ok(packet)
+            }
+            None => Err(PacketError::InvalidPacket(format!(
+                "packet incomplete: {} bytes",
+                bytes.len()
+            ))),
+        }
+    }
+
+    /// Try to decode ONE packet from the front of a byte stream.
+    ///
+    /// - `Ok(Some((packet, consumed)))` — a complete packet was decoded from
+    ///   `bytes[..consumed]`; the caller advances its buffer by `consumed`.
+    /// - `Ok(None)` — not enough bytes yet for a complete packet (need more).
+    /// - `Err(..)` — the front of the buffer is not a valid packet (bad
+    ///   version / packet_type / compression); the stream is unrecoverable.
+    pub fn decode_one(bytes: &[u8]) -> Result<Option<(Self, usize)>, PacketError> {
         if bytes.len() < 16 {
-            return Err(PacketError::InvalidPacket("Packet too short".to_string()));
+            return Ok(None);
         }
 
-        // Parse fixed header
+        // Parse fixed header (validates version, packet_type, compression).
         let header = FixedHeader::from_bytes(&bytes[0..16])?;
 
-        let mut offset = 16;
+        let ext_end = 16usize + header.ext_header_len as usize;
+        let total = ext_end + header.payload_len as usize;
+        if bytes.len() < total {
+            return Ok(None);
+        }
 
-        // Parse extension header
         let ext_header = if header.ext_header_len > 0 {
-            let end = offset + header.ext_header_len as usize;
-            if bytes.len() < end {
-                return Err(PacketError::InvalidPacket(
-                    "Extended header incomplete".to_string(),
-                ));
-            }
-            let ext_header = bytes[offset..end].to_vec();
-            offset = end;
-            ext_header
+            bytes[16..ext_end].to_vec()
         } else {
             Vec::new()
         };
-
-        // Parse payload
         let payload = if header.payload_len > 0 {
-            let end = offset + header.payload_len as usize;
-            if bytes.len() < end {
-                return Err(PacketError::InvalidPacket("Payload incomplete".to_string()));
-            }
-            Bytes::copy_from_slice(&bytes[offset..end])
+            Bytes::copy_from_slice(&bytes[ext_end..total])
         } else {
             Bytes::new()
         };
 
-        Ok(Self {
-            header,
-            ext_header,
-            payload,
-        })
+        Ok(Some((
+            Self {
+                header,
+                ext_header,
+                payload,
+            },
+            total,
+        )))
     }
 
     /// Get packet type
@@ -649,9 +690,12 @@ mod tests {
         assert_eq!(u8::from(PacketType::Request), 1);
         assert_eq!(u8::from(PacketType::Response), 2);
 
-        assert_eq!(PacketType::from(0), PacketType::OneWay);
-        assert_eq!(PacketType::from(1), PacketType::Request);
-        assert_eq!(PacketType::from(2), PacketType::Response);
+        assert_eq!(PacketType::try_from(0).unwrap(), PacketType::OneWay);
+        assert_eq!(PacketType::try_from(1).unwrap(), PacketType::Request);
+        assert_eq!(PacketType::try_from(2).unwrap(), PacketType::Response);
+        // Strict: unknown values are protocol errors, never a silent OneWay.
+        assert!(PacketType::try_from(3).is_err());
+        assert!(PacketType::try_from(255).is_err());
     }
 
     #[test]
@@ -660,9 +704,57 @@ mod tests {
         assert_eq!(u8::from(CompressionType::Zstd), 1);
         assert_eq!(u8::from(CompressionType::Zlib), 2);
 
-        assert_eq!(CompressionType::from(0), CompressionType::None);
-        assert_eq!(CompressionType::from(1), CompressionType::Zstd);
-        assert_eq!(CompressionType::from(2), CompressionType::Zlib);
+        assert_eq!(CompressionType::try_from(0).unwrap(), CompressionType::None);
+        assert_eq!(CompressionType::try_from(1).unwrap(), CompressionType::Zstd);
+        assert_eq!(CompressionType::try_from(2).unwrap(), CompressionType::Zlib);
+        // Strict: unknown values are protocol errors, never a silent None.
+        assert!(CompressionType::try_from(3).is_err());
+        assert!(CompressionType::try_from(255).is_err());
+    }
+
+    #[test]
+    fn decode_one_streams_and_reports_incomplete() {
+        let a = Packet::one_way(1, b"aa".to_vec());
+        let b = Packet::request(2, b"bbb".to_vec());
+        let mut stream = a.to_bytes().to_vec();
+        stream.extend_from_slice(&b.to_bytes());
+
+        let (p1, used1) = Packet::decode_one(&stream).unwrap().expect("first");
+        assert_eq!(p1.message_id(), 1);
+        let (p2, used2) = Packet::decode_one(&stream[used1..])
+            .unwrap()
+            .expect("second");
+        assert_eq!(p2.message_id(), 2);
+        assert_eq!(used1 + used2, stream.len());
+
+        // Truncated tail: incomplete, not an error.
+        assert!(
+            Packet::decode_one(&stream[..used1 + 5]).unwrap().is_none()
+                || Packet::decode_one(&stream[used1..used1 + 5])
+                    .unwrap()
+                    .is_none()
+        );
+        assert!(Packet::decode_one(&[]).unwrap().is_none());
+    }
+
+    #[test]
+    fn decode_exact_rejects_trailing_bytes_and_bad_headers() {
+        let p = Packet::one_way(7, b"payload".to_vec());
+        let mut bytes = p.to_bytes().to_vec();
+        assert_eq!(Packet::decode_exact(&bytes).unwrap().message_id(), 7);
+
+        bytes.push(0xFF); // trailing garbage
+        assert!(Packet::decode_exact(&bytes).is_err());
+
+        // Invalid packet_type on the wire is an error end-to-end.
+        let mut bad = p.to_bytes().to_vec();
+        bad[2] = 9;
+        assert!(Packet::decode_exact(&bad).is_err());
+        assert!(Packet::decode_one(&bad).is_err());
+        // Invalid compression id likewise.
+        let mut bad = p.to_bytes().to_vec();
+        bad[1] = 9;
+        assert!(Packet::decode_exact(&bad).is_err());
     }
 
     #[test]

@@ -18,6 +18,7 @@ use crate::{
 use crate::adapters::outbound::SEND_QUEUE_CAPACITY;
 
 /// WebSocket message processing result
+#[derive(Debug)]
 enum MessageProcessResult {
     /// Received data packet
     Packet(Packet),
@@ -106,7 +107,7 @@ impl<C> WebSocketAdapter<C> {
             shutdown_sender: shutdown_tx,
             event_loop_handle: None,
             frame_policy: Arc::new(std::sync::atomic::AtomicU8::new(
-                crate::packet::FramePolicy::Lenient as u8,
+                crate::packet::FramePolicy::default() as u8,
             )),
         }
     }
@@ -125,7 +126,7 @@ impl<C> WebSocketAdapter<C> {
         let state =
             crate::adapters::core::ConnState::new(crate::adapters::core::ConnStatus::Connected);
         let frame_policy = Arc::new(std::sync::atomic::AtomicU8::new(
-            crate::packet::FramePolicy::Lenient as u8,
+            crate::packet::FramePolicy::default() as u8,
         ));
 
         // Create communication channels
@@ -377,7 +378,17 @@ impl<C> WebSocketAdapter<C> {
                 }
             }
             Message::Text(text) => {
-                // [SUCCESS] Text message creates data packet directly (usually for debugging)
+                // msgtrans is a binary protocol: a text frame is a protocol
+                // violation under Strict (matches the TypeScript SDK default).
+                // Lenient keeps the 1.x debugging behavior of wrapping the
+                // text bytes in a raw one-way packet.
+                if strict {
+                    tracing::debug!(
+                        "[RECV] WebSocket text frame rejected under strict policy ({} bytes)",
+                        text.len()
+                    );
+                    return MessageProcessResult::Error(WebSocketError::InvalidMessageType);
+                }
                 tracing::debug!(
                     "[RECV] WebSocket received text message: {} bytes",
                     text.len()
@@ -605,5 +616,73 @@ impl<C> WebSocketClientBuilder<C> {
 
         // Create WebSocket adapter
         WebSocketAdapter::new_with_stream(config, ws_stream).await
+    }
+}
+
+#[cfg(test)]
+mod frame_policy_tests {
+    use super::*;
+    use crate::packet::FramePolicy;
+
+    fn classify<C: Send + Sync + 'static>(
+        message: Message,
+        policy: FramePolicy,
+    ) -> MessageProcessResult {
+        WebSocketAdapter::<C>::process_websocket_message(message, policy)
+    }
+
+    /// msgtrans is a binary protocol: under the (default) strict policy a
+    /// text frame is a protocol error, matching the TypeScript SDK default.
+    #[test]
+    fn strict_rejects_text_frames() {
+        assert_eq!(FramePolicy::default(), FramePolicy::Strict);
+        let r = classify::<()>(Message::Text("hello".into()), FramePolicy::Strict);
+        assert!(matches!(r, MessageProcessResult::Error(_)));
+    }
+
+    #[test]
+    fn lenient_wraps_text_frames_as_raw_oneway() {
+        let r = classify::<()>(Message::Text("hello".into()), FramePolicy::Lenient);
+        match r {
+            MessageProcessResult::Packet(p) => {
+                assert_eq!(p.payload.as_ref(), b"hello");
+                assert_eq!(p.header.packet_type, crate::packet::PacketType::OneWay);
+            }
+            other => panic!("expected lenient wrap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strict_rejects_undecodable_binary_and_lenient_wraps_it() {
+        let junk = bytes::Bytes::from_static(b"not a packet");
+        let r = classify::<()>(Message::Binary(junk.clone()), FramePolicy::Strict);
+        assert!(matches!(r, MessageProcessResult::Error(_)));
+        let r = classify::<()>(Message::Binary(junk), FramePolicy::Lenient);
+        assert!(matches!(r, MessageProcessResult::Packet(_)));
+    }
+
+    /// A well-formed frame with an invalid packet_type byte is rejected under
+    /// strict (TryFrom), not silently delivered as a OneWay.
+    #[test]
+    fn strict_rejects_invalid_packet_type_byte() {
+        let mut bytes = Packet::one_way(1, b"x".to_vec()).to_bytes().to_vec();
+        bytes[2] = 9; // invalid packet_type
+        let r = classify::<()>(
+            Message::Binary(bytes::Bytes::from(bytes)),
+            FramePolicy::Strict,
+        );
+        assert!(matches!(r, MessageProcessResult::Error(_)));
+    }
+
+    #[test]
+    fn valid_packets_pass_both_policies() {
+        for policy in [FramePolicy::Strict, FramePolicy::Lenient] {
+            let bytes = Packet::request(3, b"req".to_vec()).to_bytes();
+            let r = classify::<()>(Message::Binary(bytes), policy);
+            match r {
+                MessageProcessResult::Packet(p) => assert_eq!(p.message_id(), 3),
+                other => panic!("expected packet under {policy:?}, got {other:?}"),
+            }
+        }
     }
 }

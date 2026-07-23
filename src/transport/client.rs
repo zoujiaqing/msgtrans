@@ -72,7 +72,7 @@ impl TransportClientBuilder {
             retry_config: RetryConfig::default(),
             transport_config: TransportConfig::default(),
             protocol_config: None,
-            frame_policy: crate::packet::FramePolicy::Lenient,
+            frame_policy: crate::packet::FramePolicy::default(),
         }
     }
 
@@ -261,6 +261,7 @@ impl TransportClient {
 
             // Connect according to protocol type
             match protocol_config.protocol_name() {
+                #[cfg(feature = "tcp")]
                 "tcp" => {
                     if let Some(tcp_config) = protocol_config
                         .as_any()
@@ -284,6 +285,7 @@ impl TransportClient {
                         ));
                     }
                 }
+                #[cfg(feature = "websocket")]
                 "websocket" => {
                     if let Some(ws_config) = protocol_config
                         .as_any()
@@ -307,6 +309,7 @@ impl TransportClient {
                         ));
                     }
                 }
+                #[cfg(feature = "quic")]
                 "quic" => {
                     if let Some(quic_config) = protocol_config
                         .as_any()
