@@ -97,12 +97,14 @@ pub use transport::{
 };
 
 pub use protocol::{ClientConfig, ServerConfig};
+#[cfg(feature = "websocket")]
+pub use protocol::{
+    ClientTls, WebSocketClientConfig, WebSocketServerConfig, WS_SUBPROTOCOL_MSGTRANS,
+};
 #[cfg(feature = "quic")]
 pub use protocol::{QuicClientConfig, QuicServerConfig};
 #[cfg(feature = "tcp")]
 pub use protocol::{TcpClientConfig, TcpServerConfig};
-#[cfg(feature = "websocket")]
-pub use protocol::{WebSocketClientConfig, WebSocketServerConfig};
 // Re-export new abstractions
 pub use connection::{Connection, ConnectionFactory, Server};
 

@@ -155,12 +155,63 @@ fn generate_self_signed_cert() -> (CertificateDer<'static>, PrivatePkcs8KeyDer<'
     )
 }
 
+/// Explicit rustls crypto provider for every TLS config this adapter builds.
+/// Never rely on the process-level default: it panics at runtime when the
+/// consuming binary links more than one provider (ring + aws-lc).
+fn ring_client_builder() -> rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier> {
+    rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .expect("ring provider supports default TLS versions")
+}
+
+fn ring_server_builder(
+) -> rustls::ConfigBuilder<rustls::ServerConfig, rustls::server::WantsServerCert> {
+    rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .expect("ring provider supports default TLS versions")
+        .with_no_client_auth()
+}
+
+/// The msgtrans QUIC ALPN identifier. Set on BOTH sides so a msgtrans
+/// endpoint only completes a handshake with another msgtrans endpoint —
+/// foreign QUIC clients are rejected at the TLS layer instead of feeding
+/// garbage to the framer.
+pub(crate) const ALPN_MSGTRANS: &[u8] = b"msgtrans/1";
+
+/// Apply the server transport parameters FROM THE CONFIG — previously the
+/// receive window was hardcoded (1500*100) and send_window/initial_rtt/
+/// max_concurrent_streams were silently ignored on the server side.
+fn apply_server_transport(
+    config: &QuicServerConfig,
+    server_config: &mut ServerConfig,
+) -> Result<(), QuicError> {
+    let transport_config =
+        Arc::get_mut(&mut server_config.transport).expect("server transport config not yet shared");
+    transport_config.receive_window(quinn::VarInt::from_u32(config.receive_window));
+    transport_config.send_window(config.send_window as u64);
+    transport_config.max_idle_timeout(Some(
+        config
+            .max_idle_timeout
+            .try_into()
+            .map_err(|e| QuicError::Config(format!("Invalid idle timeout: {}", e)))?,
+    ));
+    if let Some(keep_alive) = config.keep_alive_interval {
+        transport_config.keep_alive_interval(Some(keep_alive));
+    }
+    transport_config.initial_rtt(config.initial_rtt);
+    let max_streams = config.max_concurrent_streams.min(u32::MAX as u64) as u32;
+    transport_config.max_concurrent_uni_streams(max_streams.into());
+    transport_config.max_concurrent_bidi_streams(max_streams.into());
+    Ok(())
+}
+
 /// Configure client without certificate verification (insecure for development)
 fn configure_client_insecure() -> ClientConfig {
-    let crypto = rustls::ClientConfig::builder()
+    let mut crypto = ring_client_builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
         .with_no_client_auth();
+    crypto.alpn_protocols = vec![ALPN_MSGTRANS.to_vec()];
 
     let mut client_config = ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(crypto).unwrap(),
@@ -201,7 +252,7 @@ fn configure_client_with_config(config: &QuicClientConfig) -> Result<ClientConfi
             tracing::debug!("[SECURITY] Using system root certificates for QUIC client certificate verification");
         }
 
-        rustls::ClientConfig::builder()
+        ring_client_builder()
             .with_root_certificates(root_store)
             .with_no_client_auth()
     } else {
@@ -209,12 +260,14 @@ fn configure_client_with_config(config: &QuicClientConfig) -> Result<ClientConfi
         tracing::warn!(
             "[SECURITY] QUIC client skipping certificate verification; this is insecure"
         );
-        rustls::ClientConfig::builder()
+        ring_client_builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
             .with_no_client_auth()
     };
 
+    let mut crypto = crypto;
+    crypto.alpn_protocols = vec![ALPN_MSGTRANS.to_vec()];
     let mut client_config = ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
             .map_err(|e| QuicError::Config(format!("QUIC client config error: {}", e)))?,
@@ -251,14 +304,16 @@ fn configure_server_insecure_with_config(
 ) -> (ServerConfig, CertificateDer<'static>) {
     let (cert, key) = generate_self_signed_cert();
 
-    let mut server_config = ServerConfig::with_single_cert(vec![cert.clone()], key.into()).unwrap();
+    let mut server_crypto = ring_server_builder()
+        .with_single_cert(vec![cert.clone()], key.into())
+        .expect("self-signed cert is valid");
+    server_crypto.alpn_protocols = vec![ALPN_MSGTRANS.to_vec()];
+    let mut server_config = ServerConfig::with_crypto(Arc::new(
+        quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
+            .expect("self-signed crypto config is valid"),
+    ));
 
-    let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
-    transport_config.receive_window((1500u32 * 100).into());
-    transport_config.max_idle_timeout(Some(config.max_idle_timeout.try_into().unwrap()));
-    if let Some(keep_alive) = config.keep_alive_interval {
-        transport_config.keep_alive_interval(Some(keep_alive));
-    }
+    apply_server_transport(config, &mut server_config).expect("valid default transport config");
 
     (server_config, cert)
 }
@@ -297,24 +352,17 @@ fn configure_server_with_pem(
     let first_cert = certs[0].clone();
 
     // Create server crypto configuration
-    let server_crypto = rustls::ServerConfig::builder()
-        .with_no_client_auth()
+    let mut server_crypto = ring_server_builder()
         .with_single_cert(certs, key)
         .map_err(|e| QuicError::Config(format!("TLS configuration error: {}", e)))?;
+    server_crypto.alpn_protocols = vec![ALPN_MSGTRANS.to_vec()];
 
     // Create QUIC server configuration
     let quic_server_config = quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
         .map_err(|e| QuicError::Config(format!("QUIC configuration error: {}", e)))?;
 
     let mut server_config = ServerConfig::with_crypto(Arc::new(quic_server_config));
-
-    // Configure transport parameters
-    let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
-    transport_config.receive_window((1500u32 * 100).into());
-    transport_config.max_idle_timeout(Some(config.max_idle_timeout.try_into().unwrap()));
-    if let Some(keep_alive) = config.keep_alive_interval {
-        transport_config.keep_alive_interval(Some(keep_alive));
-    }
+    apply_server_transport(config, &mut server_config)?;
 
     Ok((server_config, first_cert))
 }

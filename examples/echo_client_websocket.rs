@@ -21,7 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .pong_timeout(Duration::from_secs(10))
         .max_frame_size(8192)
         .max_message_size(65536)
-        .verify_tls(false); // Test environment
+        .tls(msgtrans::ClientTls::Insecure); // Test environment
 
     // [TARGET] Build TransportClient
     let mut transport = TransportClientBuilder::new()

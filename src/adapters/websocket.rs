@@ -5,9 +5,14 @@ use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{
-    accept_async, connect_async,
-    tungstenite::{error, protocol::Message, Error as TungsteniteError},
-    MaybeTlsStream, WebSocketStream,
+    accept_hdr_async_with_config, connect_async_tls_with_config,
+    tungstenite::{
+        error,
+        handshake::server::{ErrorResponse, Request, Response},
+        protocol::{Message, WebSocketConfig},
+        Error as TungsteniteError,
+    },
+    Connector, MaybeTlsStream, WebSocketStream,
 };
 
 use crate::{
@@ -28,6 +33,146 @@ enum MessageProcessResult {
     PeerClosed,
     /// Processing error
     Error(WebSocketError),
+}
+
+/// Ping/pong + idle enforcement parameters, extracted from either config side.
+#[derive(Debug, Clone, Copy, Default)]
+struct WsKeepalive {
+    ping_interval: Option<std::time::Duration>,
+    pong_timeout: std::time::Duration,
+    idle_timeout: Option<std::time::Duration>,
+}
+
+fn ws_keepalive_of<C: std::any::Any>(config: &C) -> WsKeepalive {
+    let any = config as &dyn std::any::Any;
+    if let Some(c) = any.downcast_ref::<crate::protocol::WebSocketServerConfig>() {
+        return WsKeepalive {
+            ping_interval: c.ping_interval,
+            pong_timeout: c.pong_timeout,
+            idle_timeout: c.idle_timeout,
+        };
+    }
+    if let Some(c) = any.downcast_ref::<crate::protocol::WebSocketClientConfig>() {
+        return WsKeepalive {
+            ping_interval: c.ping_interval,
+            pong_timeout: c.pong_timeout,
+            idle_timeout: None,
+        };
+    }
+    WsKeepalive::default()
+}
+
+/// Frame/message caps for the tungstenite protocol layer, from the config.
+fn ws_protocol_config(max_message_size: usize, max_frame_size: usize) -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_message_size(Some(max_message_size))
+        .max_frame_size(Some(max_frame_size))
+}
+
+/// Build the TLS connector for wss:// per the configured [`ClientTls`]
+/// behavior. ws:// connections ignore it.
+fn build_tls_connector(
+    tls: &crate::protocol::client_config::ClientTls,
+) -> Result<Connector, WebSocketError> {
+    use crate::protocol::client_config::ClientTls;
+    // Explicit crypto provider: never rely on the process-level default,
+    // which panics when a downstream links more than one rustls provider.
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = || {
+        rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .expect("ring provider supports default TLS versions")
+    };
+    let crypto = match tls {
+        ClientTls::SystemRoots => {
+            let mut roots = rustls::RootCertStore::empty();
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth()
+        }
+        ClientTls::CustomCa(pem) => {
+            let mut roots = rustls::RootCertStore::empty();
+            let certs = rustls_pemfile::certs(&mut std::io::Cursor::new(pem.as_bytes()))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| WebSocketError::Config(format!("Invalid CA PEM: {e}")))?;
+            if certs.is_empty() {
+                return Err(WebSocketError::Config(
+                    "CA PEM contains no certificates".to_string(),
+                ));
+            }
+            for cert in certs {
+                roots
+                    .add(cert)
+                    .map_err(|e| WebSocketError::Config(format!("Invalid CA certificate: {e}")))?;
+            }
+            builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth()
+        }
+        ClientTls::Insecure => {
+            tracing::warn!(
+                "[SECURITY] WebSocket client skipping certificate verification; this is insecure"
+            );
+            builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(SkipWsServerVerification::new()))
+                .with_no_client_auth()
+        }
+    };
+    Ok(Connector::Rustls(Arc::new(crypto)))
+}
+
+/// Certificate verifier that accepts anything — [`ClientTls::Insecure`] only.
+#[derive(Debug)]
+struct SkipWsServerVerification(Arc<rustls::crypto::CryptoProvider>);
+
+impl SkipWsServerVerification {
+    fn new() -> Self {
+        Self(Arc::new(rustls::crypto::ring::default_provider()))
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for SkipWsServerVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -116,7 +261,10 @@ impl<C> WebSocketAdapter<C> {
     pub async fn new_with_stream(
         config: C,
         stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
-    ) -> Result<Self, WebSocketError> {
+    ) -> Result<Self, WebSocketError>
+    where
+        C: std::any::Any,
+    {
         let mut connection_info = ConnectionInfo::default();
         connection_info.protocol = "websocket".to_string();
         connection_info.state = ConnectionState::Connected;
@@ -137,6 +285,10 @@ impl<C> WebSocketAdapter<C> {
         let (event_pipe, event_pipe_rx) =
             crate::adapters::events::event_pipe(crate::adapters::events::default_pipe_capacity());
 
+        // Keepalive/idle enforcement parameters from the config (previously
+        // declared but never enforced).
+        let keepalive = ws_keepalive_of(&config);
+
         // Start event loop
         let event_loop_handle = Self::start_event_loop(
             stream,
@@ -145,6 +297,7 @@ impl<C> WebSocketAdapter<C> {
             shutdown_rx,
             event_pipe,
             frame_policy.clone(),
+            keepalive,
         )
         .await;
 
@@ -169,6 +322,7 @@ impl<C> WebSocketAdapter<C> {
         mut shutdown_signal: mpsc::UnboundedReceiver<()>,
         event_pipe: crate::adapters::events::EventPipe,
         frame_policy: Arc<std::sync::atomic::AtomicU8>,
+        keepalive: WsKeepalive,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let current_session_id = state.session_id();
@@ -177,15 +331,61 @@ impl<C> WebSocketAdapter<C> {
                 current_session_id
             );
 
+            // Keepalive/idle state: any traffic in either direction counts as
+            // activity; an unanswered ping past pong_timeout is a dead peer.
+            let mut last_activity = tokio::time::Instant::now();
+            let mut next_ping =
+                tokio::time::Instant::now() + keepalive.ping_interval.unwrap_or_default();
+            let mut ping_sent_at: Option<tokio::time::Instant> = None;
+
             loop {
                 // Get current session ID
                 let current_session_id = state.session_id();
 
                 tokio::select! {
+                    // [IDLE] No traffic in either direction for the configured
+                    // duration closes the connection.
+                    _ = tokio::time::sleep_until(last_activity + keepalive.idle_timeout.unwrap_or_default()), if keepalive.idle_timeout.is_some() => {
+                        tracing::info!("[IDLE] WebSocket connection idle for {:?}, closing (session: {})", keepalive.idle_timeout.unwrap(), current_session_id);
+                        event_pipe.close(crate::error::CloseReason::Timeout);
+                        state.set_status(crate::adapters::core::ConnStatus::Closed);
+                        break;
+                    }
+
+                    // [PING] Initiate pings at the configured interval and
+                    // fail a peer whose pong never arrives within pong_timeout.
+                    _ = tokio::time::sleep_until(next_ping), if keepalive.ping_interval.is_some() => {
+                        if let Some(sent_at) = ping_sent_at {
+                            if sent_at.elapsed() >= keepalive.pong_timeout {
+                                tracing::info!("[PING] WebSocket pong timeout ({:?}), closing (session: {})", keepalive.pong_timeout, current_session_id);
+                                event_pipe.close(crate::error::CloseReason::Timeout);
+                                state.set_status(crate::adapters::core::ConnStatus::Closed);
+                                break;
+                            }
+                        }
+                        if let Err(e) = stream.send(Message::Ping(Bytes::new())).await {
+                            tracing::debug!("[PING] WebSocket ping send failed: {:?} (session: {})", e, current_session_id);
+                            event_pipe.close(crate::error::CloseReason::Error(format!("{:?}", e)));
+                            state.set_status(crate::adapters::core::ConnStatus::Closed);
+                            break;
+                        }
+                        if ping_sent_at.is_none() {
+                            ping_sent_at = Some(tokio::time::Instant::now());
+                        }
+                        // Re-arm: check again at the earlier of the next
+                        // interval or the pong deadline.
+                        let interval = keepalive.ping_interval.unwrap();
+                        next_ping = tokio::time::Instant::now() + interval.min(keepalive.pong_timeout);
+                    }
+
                     // [RECV] Handle incoming data
                     read_result = stream.next() => {
                         match read_result {
                             Some(Ok(message)) => {
+                                last_activity = tokio::time::Instant::now();
+                                if matches!(message, Message::Pong(_)) {
+                                    ping_sent_at = None;
+                                }
                                 let policy = crate::packet::FramePolicy::from(
                                     frame_policy.load(std::sync::atomic::Ordering::Relaxed),
                                 );
@@ -269,6 +469,7 @@ impl<C> WebSocketAdapter<C> {
                             ).await;
                             match write {
                                 Ok(Ok(_)) => {
+                                    last_activity = tokio::time::Instant::now();
                                     tracing::debug!("[SEND] WebSocket send successful: {} bytes (session: {})", packet.payload.len(), current_session_id);
                                     if let Some(completion) = completion {
                                         completion.complete(Ok(()));
@@ -546,9 +747,56 @@ impl<C: 'static> WebSocketServer<C> {
             let (tcp_stream, addr) = listener.accept().await?;
             tracing::debug!("[ACCEPT] WebSocket server accepted connection: {}", addr);
 
-            // Perform WebSocket handshake
+            // Handshake with the configured contract enforced (previously the
+            // path, subprotocols and frame caps in the config were ignored):
+            // - request path must match config.path (404 otherwise)
+            // - a client-offered subprotocol is negotiated and echoed when it
+            //   matches; peers that offer none are accepted (not required)
+            // - tungstenite enforces the configured message/frame caps
+            let ws_cfg = (&self.config as &dyn std::any::Any)
+                .downcast_ref::<crate::protocol::WebSocketServerConfig>()
+                .cloned()
+                .unwrap_or_default();
+            let expected_path = ws_cfg.path.clone();
+            let supported: Vec<String> = ws_cfg.subprotocols.clone();
+            let callback = move |req: &Request, mut resp: Response| {
+                let path = req.uri().path();
+                if path != expected_path {
+                    tracing::debug!(
+                        "[ACCEPT] WebSocket path {} rejected (expected {})",
+                        path,
+                        expected_path
+                    );
+                    let mut rejection = ErrorResponse::new(Some("Not Found".to_string()));
+                    *rejection.status_mut() =
+                        tokio_tungstenite::tungstenite::http::StatusCode::NOT_FOUND;
+                    return Err(rejection);
+                }
+                if let Some(offered) = req.headers().get("Sec-WebSocket-Protocol") {
+                    if let Ok(offered) = offered.to_str() {
+                        if let Some(chosen) = offered
+                            .split(',')
+                            .map(str::trim)
+                            .find(|o| supported.iter().any(|sp| sp == o))
+                        {
+                            if let Ok(value) = chosen.parse() {
+                                resp.headers_mut().insert("Sec-WebSocket-Protocol", value);
+                            }
+                        }
+                    }
+                }
+                Ok(resp)
+            };
             let maybe_tls_stream = MaybeTlsStream::Plain(tcp_stream);
-            let ws_stream = accept_async(maybe_tls_stream).await?;
+            let ws_stream = accept_hdr_async_with_config(
+                maybe_tls_stream,
+                callback,
+                Some(ws_protocol_config(
+                    ws_cfg.max_message_size,
+                    ws_cfg.max_frame_size,
+                )),
+            )
+            .await?;
 
             // Create WebSocket adapter
             WebSocketAdapter::new_with_stream(self.config.clone(), ws_stream).await
@@ -598,19 +846,61 @@ impl<C> WebSocketClientBuilder<C> {
             .config
             .ok_or_else(|| WebSocketError::Config("Missing WebSocket client config".to_string()))?;
 
-        // Get connection URL from configuration
-        let url = if let Some(ws_config) =
-            (&config as &dyn std::any::Any).downcast_ref::<crate::protocol::WebSocketClientConfig>()
-        {
-            ws_config.target_url.clone()
-        } else {
-            "ws://127.0.0.1:8080".to_string()
-        };
+        let ws_cfg = (&config as &dyn std::any::Any)
+            .downcast_ref::<crate::protocol::WebSocketClientConfig>()
+            .cloned()
+            .unwrap_or_default();
+        let url = ws_cfg.target_url.clone();
 
         tracing::debug!("[CONNECT] WebSocket client connecting to: {}", url);
 
-        // Connect to WebSocket server
-        let (ws_stream, _) = connect_async(&url).await?;
+        // Build the handshake request with the configured headers and
+        // subprotocol offer (previously both were silently ignored).
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut request = url
+            .as_str()
+            .into_client_request()
+            .map_err(WebSocketError::Tungstenite)?;
+        for (key, value) in &ws_cfg.headers {
+            let name: tokio_tungstenite::tungstenite::http::HeaderName = key
+                .parse()
+                .map_err(|e| WebSocketError::Config(format!("Invalid header name {key}: {e}")))?;
+            let value: tokio_tungstenite::tungstenite::http::HeaderValue =
+                value.parse().map_err(|e| {
+                    WebSocketError::Config(format!("Invalid header value for {key}: {e}"))
+                })?;
+            request.headers_mut().insert(name, value);
+        }
+        if !ws_cfg.subprotocols.is_empty() {
+            let offer = ws_cfg.subprotocols.join(", ");
+            request.headers_mut().insert(
+                "Sec-WebSocket-Protocol",
+                offer
+                    .parse()
+                    .map_err(|e| WebSocketError::Config(format!("Invalid subprotocol: {e}")))?,
+            );
+        }
+
+        // TLS behavior per config (only consulted for wss://).
+        let connector = build_tls_connector(&ws_cfg.tls)?;
+
+        let connect = connect_async_tls_with_config(
+            request,
+            Some(ws_protocol_config(
+                ws_cfg.max_message_size,
+                ws_cfg.max_frame_size,
+            )),
+            false,
+            Some(connector),
+        );
+        // Bounded connect (previously connect_timeout was ignored).
+        let (ws_stream, _) = if ws_cfg.connect_timeout > std::time::Duration::ZERO {
+            tokio::time::timeout(ws_cfg.connect_timeout, connect)
+                .await
+                .map_err(|_| WebSocketError::Config("WebSocket connect timeout".to_string()))??
+        } else {
+            connect.await?
+        };
 
         tracing::debug!("[SUCCESS] WebSocket client connected to: {}", url);
 

@@ -19,8 +19,6 @@ pub struct TcpServerConfig {
     pub(crate) nodelay: bool,
     /// Keepalive time
     pub(crate) keepalive: Option<Duration>,
-    /// Server accept timeout
-    pub(crate) accept_timeout: Duration,
     /// Connection idle timeout
     pub(crate) idle_timeout: Option<Duration>,
     /// Whether to allow address reuse
@@ -34,7 +32,6 @@ impl Default for TcpServerConfig {
             bind_address: "127.0.0.1:8080".parse().unwrap(),
             nodelay: true,
             keepalive: Some(Duration::from_secs(60)),
-            accept_timeout: Duration::from_secs(30),
             idle_timeout: Some(Duration::from_secs(300)),
             reuse_addr: true,
         }
@@ -152,12 +149,6 @@ impl TcpServerConfig {
         self
     }
 
-    /// Set accept timeout
-    pub fn accept_timeout(mut self, timeout: Duration) -> Self {
-        self.accept_timeout = timeout;
-        self
-    }
-
     /// Set connection idle timeout
     pub fn idle_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.idle_timeout = timeout;
@@ -205,7 +196,7 @@ impl Default for WebSocketServerConfig {
         Self {
             bind_address: "127.0.0.1:8080".parse().unwrap(),
             path: "/".to_string(),
-            subprotocols: vec![],
+            subprotocols: vec![crate::protocol::client_config::WS_SUBPROTOCOL_MSGTRANS.to_string()],
             max_frame_size: 16 * 1024 * 1024,   // 16MB
             max_message_size: 64 * 1024 * 1024, // 64MB
             ping_interval: Some(Duration::from_secs(30)),

@@ -20,6 +20,8 @@ pub use client_config::QuicClientConfig;
 pub use client_config::TcpClientConfig;
 #[cfg(feature = "websocket")]
 pub use client_config::WebSocketClientConfig;
+#[cfg(feature = "websocket")]
+pub use client_config::{ClientTls, WS_SUBPROTOCOL_MSGTRANS};
 #[cfg(feature = "quic")]
 pub use server_config::QuicServerConfig;
 #[cfg(feature = "tcp")]

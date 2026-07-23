@@ -183,8 +183,31 @@ pub struct WebSocketClientConfig {
     pub(crate) ping_interval: Option<Duration>,
     /// pong超时
     pub(crate) pong_timeout: Duration,
-    /// TLS验证
-    pub(crate) verify_tls: bool,
+    /// TLS 行为(仅对 wss:// 生效)
+    pub(crate) tls: ClientTls,
+}
+
+/// The msgtrans WebSocket subprotocol identifier: offered by the client and
+/// echoed by the server when present. Not required from foreign peers.
+#[cfg(feature = "websocket")]
+pub const WS_SUBPROTOCOL_MSGTRANS: &str = "msgtrans.v1";
+
+/// TLS behavior for `wss://` WebSocket connections.
+///
+/// Replaces the 1.x `verify_tls: bool`, which was never wired (the client
+/// could not even establish TLS). All variants are now real.
+#[cfg(feature = "websocket")]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ClientTls {
+    /// Verify the server certificate against the bundled webpki roots
+    /// (default).
+    #[default]
+    SystemRoots,
+    /// Verify against a custom CA bundle (PEM text) instead of the system
+    /// roots — for self-signed / private-PKI deployments.
+    CustomCa(String),
+    /// Skip certificate verification entirely. Development only.
+    Insecure,
 }
 
 #[cfg(feature = "websocket")]
@@ -194,12 +217,15 @@ impl Default for WebSocketClientConfig {
             target_url: "ws://localhost:80/".to_string(),
             connect_timeout: Duration::from_secs(10),
             headers: std::collections::HashMap::new(),
-            subprotocols: vec![],
-            max_frame_size: 64 * 1024,
-            max_message_size: 1024 * 1024,
+            subprotocols: vec![WS_SUBPROTOCOL_MSGTRANS.to_string()],
+            // Match the limits that were actually in effect before these
+            // knobs were wired (tungstenite's defaults) — wiring must make
+            // the options real, not silently tighten them.
+            max_frame_size: 16 * 1024 * 1024,
+            max_message_size: 64 * 1024 * 1024,
             ping_interval: Some(Duration::from_secs(30)),
             pong_timeout: Duration::from_secs(10),
-            verify_tls: true,
+            tls: ClientTls::default(),
         }
     }
 }
@@ -266,8 +292,8 @@ impl ProtocolConfig for WebSocketClientConfig {
         if other.pong_timeout != Duration::from_secs(10) {
             self.pong_timeout = other.pong_timeout;
         }
-        if !other.verify_tls {
-            self.verify_tls = other.verify_tls;
+        if other.tls != ClientTls::default() {
+            self.tls = other.tls.clone();
         }
         self
     }
@@ -352,8 +378,8 @@ impl WebSocketClientConfig {
     }
 
     /// 设置TLS验证
-    pub fn verify_tls(mut self, verify: bool) -> Self {
-        self.verify_tls = verify;
+    pub fn tls(mut self, tls: ClientTls) -> Self {
+        self.tls = tls;
         self
     }
 

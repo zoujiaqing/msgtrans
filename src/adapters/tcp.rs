@@ -360,7 +360,10 @@ pub struct TcpAdapter<C> {
 }
 
 impl<C> TcpAdapter<C> {
-    pub async fn new(stream: TcpStream, config: C, nodelay: bool) -> Result<Self, TcpError> {
+    pub async fn new(stream: TcpStream, config: C, nodelay: bool) -> Result<Self, TcpError>
+    where
+        C: std::any::Any,
+    {
         // Wired from the protocol config — previously hardcoded to true, which
         // made the nodelay option a lie.
         stream.set_nodelay(nodelay)?;
@@ -390,6 +393,11 @@ impl<C> TcpAdapter<C> {
         let frame_policy = Arc::new(std::sync::atomic::AtomicU8::new(
             crate::packet::FramePolicy::default() as u8,
         ));
+        // Idle timeout comes from the server config (client config has no such
+        // field); previously the option existed but nothing enforced it.
+        let idle_timeout = (&config as &dyn std::any::Any)
+            .downcast_ref::<TcpServerConfig>()
+            .and_then(|c| c.idle_timeout);
 
         let event_loop_handle = Self::start_event_loop(
             stream,
@@ -399,6 +407,7 @@ impl<C> TcpAdapter<C> {
             event_pipe,
             memory_pool,
             frame_policy.clone(),
+            idle_timeout,
         )
         .await;
 
@@ -415,6 +424,7 @@ impl<C> TcpAdapter<C> {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn start_event_loop(
         stream: TcpStream,
         state: crate::adapters::core::ConnState,
@@ -423,6 +433,7 @@ impl<C> TcpAdapter<C> {
         event_pipe: crate::adapters::events::EventPipe,
         memory_pool: Arc<OptimizedMemoryPool>,
         frame_policy: Arc<std::sync::atomic::AtomicU8>,
+        idle_timeout: Option<std::time::Duration>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let current_session_id = state.session_id();
@@ -433,12 +444,22 @@ impl<C> TcpAdapter<C> {
 
             let (mut read_half, mut write_half) = stream.into_split();
             let mut read_buffer = OptimizedReadBuffer::new_with_pool(8192, memory_pool);
+            // Any traffic in either direction counts as activity.
+            let mut last_activity = tokio::time::Instant::now();
 
             'event_loop: loop {
                 // Get current session ID
                 let current_session_id = state.session_id();
 
                 tokio::select! {
+                    // [IDLE] Enforce the configured idle timeout: a connection
+                    // with no traffic in either direction for the duration is
+                    // closed (previously the option was accepted and ignored).
+                    _ = tokio::time::sleep_until(last_activity + idle_timeout.unwrap_or_default()), if idle_timeout.is_some() => {
+                        tracing::info!("[IDLE] TCP connection idle for {:?}, closing (session: {})", idle_timeout.unwrap(), current_session_id);
+                        event_pipe.close(crate::error::CloseReason::Timeout);
+                        break;
+                    }
                     // [RECV] Handle receive data - using optimized buffer method
                     read_result = read_buffer.fill_from_stream(&mut read_half) => {
                         match read_result {
@@ -449,6 +470,7 @@ impl<C> TcpAdapter<C> {
                                 break;
                             }
                             Ok(_) => {
+                                last_activity = tokio::time::Instant::now();
                                 // Parse all complete packets currently in the buffer.
                                 let strict = crate::packet::FramePolicy::from(
                                     frame_policy.load(std::sync::atomic::Ordering::Relaxed),
@@ -502,6 +524,7 @@ impl<C> TcpAdapter<C> {
                             ).await;
                             match write {
                                 Ok(Ok(_)) => {
+                                    last_activity = tokio::time::Instant::now();
                                     tracing::debug!("[SEND] TCP send successful: {} bytes (session: {})", packet.payload.len(), current_session_id);
                                     // Write completion: the REAL result, after the write.
                                     if let Some(completion) = completion {
@@ -587,13 +610,29 @@ impl TcpAdapter<TcpClientConfig> {
     ) -> Result<Self, TcpError> {
         tracing::debug!("[CONNECT] TCP client connecting to: {}", addr);
 
+        // Optional local bind (previously silently ignored): connect through a
+        // TcpSocket so the source address/port can be pinned.
+        let connect = async {
+            match config.local_bind_address {
+                Some(local) => {
+                    let socket = if addr.is_ipv4() {
+                        tokio::net::TcpSocket::new_v4()?
+                    } else {
+                        tokio::net::TcpSocket::new_v6()?
+                    };
+                    socket.bind(local)?;
+                    socket.connect(addr).await
+                }
+                None => TcpStream::connect(addr).await,
+            }
+        };
         let stream = if config.connect_timeout != std::time::Duration::from_secs(0) {
-            tokio::time::timeout(config.connect_timeout, TcpStream::connect(addr))
+            tokio::time::timeout(config.connect_timeout, connect)
                 .await
                 .map_err(|_| TcpError::Timeout)?
                 .map_err(TcpError::Io)?
         } else {
-            TcpStream::connect(addr).await.map_err(TcpError::Io)?
+            connect.await.map_err(TcpError::Io)?
         };
 
         tracing::debug!("[SUCCESS] TCP connection established successfully");
@@ -706,7 +745,17 @@ impl TcpServerBuilder {
 
         tracing::debug!("[START] TCP server starting on: {}", bind_addr);
 
-        let listener = TcpListener::bind(bind_addr).await?;
+        // Bind through a TcpSocket so reuse_addr is actually honored
+        // (previously the config flag was silently ignored and tokio's
+        // default was whatever the platform picked).
+        let socket = if bind_addr.is_ipv4() {
+            tokio::net::TcpSocket::new_v4()?
+        } else {
+            tokio::net::TcpSocket::new_v6()?
+        };
+        socket.set_reuseaddr(self.config.reuse_addr)?;
+        socket.bind(bind_addr)?;
+        let listener = socket.listen(1024)?;
 
         tracing::info!(
             "[SUCCESS] TCP server successfully started on: {}",

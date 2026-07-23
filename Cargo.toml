@@ -13,7 +13,7 @@ description = "Support for a variety of communication protocols such as TCP / QU
 [features]
 default = ["tcp", "websocket", "quic"]
 tcp = []
-websocket = ["dep:tokio-tungstenite"]
+websocket = ["dep:tokio-tungstenite", "dep:rustls", "dep:rustls-pemfile", "dep:webpki-roots"]
 quic = ["dep:quinn", "dep:rustls", "dep:rustls-pemfile", "dep:rcgen", "dep:webpki-roots"]
 
 [dependencies]
@@ -40,7 +40,7 @@ sharded-slab = "0.1"
 flume = "0.12"
 
 # Protocol-specific dependencies
-tokio-tungstenite = { version = "0.30", optional = true }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"], optional = true }
 quinn = { version = "0.11", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
 rustls-pemfile = { version = "2.0", optional = true }
@@ -64,6 +64,14 @@ socket2 = "0.6"
 tracing-subscriber = "0.3"
 toml = "1"
 criterion = "0.8"
+# Raw-protocol peers for config behavior tests (foreign ALPN, non-ponging
+# WS peer, TLS WS server, handshake header assertions).
+tokio-tungstenite = "0.30"
+tokio-rustls = "0.26"
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.14"
+futures-util = "0.3"
 
 [[bench]]
 name = "packet_codec"
@@ -121,3 +129,7 @@ required-features = ["tcp", "websocket"]
 [[test]]
 name = "write_deadline"
 required-features = ["tcp"]
+
+[[test]]
+name = "config_truthfulness"
+required-features = ["tcp", "websocket", "quic"]
