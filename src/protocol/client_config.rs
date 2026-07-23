@@ -472,18 +472,38 @@ impl Default for QuicClientConfig {
     }
 }
 
+/// RFC 9000 §4.6: stream count transport parameters must not exceed 2^60 —
+/// a peer receiving a larger value MUST close the connection. (QUIC varints
+/// go up to 2^62-1, so a varint-range check alone is NOT sufficient.)
+#[cfg(feature = "quic")]
+pub(crate) const QUIC_MAX_STREAM_COUNT: u64 = 1 << 60;
+
+/// Shared 1..=2^60 validator for the client and server QUIC configs.
+#[cfg(feature = "quic")]
+pub(crate) fn validate_quic_stream_count(value: u64) -> Result<(), ConfigError> {
+    if value == 0 {
+        return Err(ConfigError::InvalidValue {
+            field: "max_concurrent_streams".to_string(),
+            value: "0".to_string(),
+            reason: "a QUIC connection with zero streams cannot carry data".to_string(),
+            suggestion: "use at least 1".to_string(),
+        });
+    }
+    if value > QUIC_MAX_STREAM_COUNT {
+        return Err(ConfigError::InvalidValue {
+            field: "max_concurrent_streams".to_string(),
+            value: value.to_string(),
+            reason: "RFC 9000 limits stream count transport parameters to 2^60".to_string(),
+            suggestion: "use a value of at most 2^60".to_string(),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(feature = "quic")]
 impl ProtocolConfig for QuicClientConfig {
     fn validate(&self) -> Result<(), ConfigError> {
-        if self.max_concurrent_streams == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "max_concurrent_streams".to_string(),
-                value: "0".to_string(),
-                reason: "must be > 0".to_string(),
-                suggestion: "set a positive value".to_string(),
-            });
-        }
-
+        validate_quic_stream_count(self.max_concurrent_streams)?;
         Ok(())
     }
 

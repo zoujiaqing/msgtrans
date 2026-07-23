@@ -597,3 +597,29 @@ async fn factories_validate_configs_before_building() {
         .await
         .is_ok());
 }
+
+/// The factory uri is authoritative: a stale INVALID target_url left in the
+/// config must not reject a call that provided a valid uri (validation runs
+/// after the override).
+#[tokio::test(flavor = "multi_thread")]
+async fn ws_factory_uri_override_wins_over_stale_invalid_config_url() {
+    use msgtrans::adapters::WebSocketFactory;
+    use msgtrans::protocol::ProtocolFactory;
+
+    let addr = "127.0.0.1:29025";
+    let server = TransportServerBuilder::new()
+        .protocol(WebSocketServerConfig::new(addr).expect("cfg"))
+        .build(Arc::new(Echo))
+        .await
+        .expect("server");
+    serve(&server).await;
+
+    let stale = WebSocketClientConfig::default().target_url("this is not a url at all");
+    let conn = WebSocketFactory::new()
+        .create_connection(&format!("ws://{addr}/"), Some(Box::new(stale)))
+        .await
+        .expect("valid factory uri must win over the stale invalid config url");
+    assert!(conn.is_connected());
+    drop(conn);
+    let _ = server.shutdown_with_timeout(Duration::from_secs(5)).await;
+}

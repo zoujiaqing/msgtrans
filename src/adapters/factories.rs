@@ -249,14 +249,16 @@ impl ProtocolFactory for WebSocketFactory {
             WebSocketClientConfig::default()
         };
 
+        // The factory uri is authoritative: apply it BEFORE validating, so a
+        // stale/invalid target_url left in the config cannot reject a call
+        // that provided a valid uri.
+        let mut ws_config = ws_config;
+        ws_config.target_url = uri.to_string();
         ProtocolConfig::validate(&ws_config)
             .map_err(|e| TransportError::config_error("websocket", &e.to_string()))?;
 
-        // config() must precede target_url(): the override mutates the
-        // concrete config held by the builder.
         let adapter = crate::adapters::websocket::WebSocketClientBuilder::new()
             .config(ws_config)
-            .target_url(uri)
             .connect()
             .await
             .map_err(|e| {
@@ -291,14 +293,15 @@ impl ProtocolFactory for WebSocketFactory {
             WebSocketServerConfig::default()
         };
 
+        // Same ordering as create_connection: the factory bind address is
+        // authoritative and must be applied before validation.
+        let mut ws_config = ws_config;
+        ws_config.bind_address = addr;
         ProtocolConfig::validate(&ws_config)
             .map_err(|e| TransportError::config_error("websocket", &e.to_string()))?;
 
-        // config() must precede bind_address(): the override mutates the
-        // concrete config held by the builder.
         let server = crate::adapters::websocket::WebSocketServerBuilder::new()
             .config(ws_config)
-            .bind_address(addr)
             .build()
             .await
             .map_err(|e| TransportError::config_error("websocket", &e.to_string()))?;

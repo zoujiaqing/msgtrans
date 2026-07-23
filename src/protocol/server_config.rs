@@ -433,22 +433,7 @@ impl ProtocolConfig for QuicServerConfig {
                 suggestion: "use an idle timeout below ~2^62 milliseconds".to_string(),
             });
         }
-        if self.max_concurrent_streams == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "max_concurrent_streams".to_string(),
-                value: "0".to_string(),
-                reason: "a QUIC connection with zero streams cannot carry data".to_string(),
-                suggestion: "use at least 1".to_string(),
-            });
-        }
-        if quinn::VarInt::from_u64(self.max_concurrent_streams).is_err() {
-            return Err(ConfigError::InvalidValue {
-                field: "max_concurrent_streams".to_string(),
-                value: self.max_concurrent_streams.to_string(),
-                reason: "exceeds the QUIC varint range".to_string(),
-                suggestion: "use a value below 2^62".to_string(),
-            });
-        }
+        crate::protocol::client_config::validate_quic_stream_count(self.max_concurrent_streams)?;
         // A certificate without its key (or vice versa) is a configuration
         // mistake — previously it silently fell back to a self-signed cert.
         // Empty strings are the legacy spelling of "no PEM" (insecure()).
@@ -713,5 +698,31 @@ mod merge_and_validate_tests {
         let legacy = QuicServerConfig::insecure("127.0.0.1:0").expect("cfg");
         assert!(legacy.validate().is_ok(), "empty-PEM self-signed must pass");
         assert!(QuicServerConfig::default().validate().is_ok());
+    }
+
+    /// RFC 9000 caps stream-count transport parameters at 2^60. The varint
+    /// range goes to 2^62-1, so values in the gap used to pass validation and
+    /// then be rejected by the PEER during the handshake.
+    #[test]
+    fn quic_stream_count_cap_is_rfc9000_2_pow_60_on_both_sides() {
+        use crate::protocol::client_config::QuicClientConfig;
+        let cap = 1u64 << 60;
+
+        let at_cap = QuicServerConfig::default().max_concurrent_streams(cap);
+        assert!(at_cap.validate().is_ok(), "2^60 exactly is legal");
+        let over = QuicServerConfig::default().max_concurrent_streams(cap + 1);
+        assert!(over.validate().is_err(), "2^60+1 must be rejected");
+        let in_gap = QuicServerConfig::default().max_concurrent_streams(1u64 << 61);
+        assert!(
+            in_gap.validate().is_err(),
+            "varint-range-but-over-cap must be rejected"
+        );
+
+        // Client side shares the validator (previously it only checked zero).
+        let client_over = QuicClientConfig::default().max_concurrent_streams(cap + 1);
+        assert!(client_over.validate().is_err());
+        let client_zero = QuicClientConfig::default().max_concurrent_streams(0);
+        assert!(client_zero.validate().is_err());
+        assert!(QuicClientConfig::default().validate().is_ok());
     }
 }
