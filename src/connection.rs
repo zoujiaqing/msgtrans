@@ -9,22 +9,23 @@ pub trait Connection: Send + Sync + std::any::Any {
     /// Send packet
     async fn send(&mut self, packet: Packet) -> Result<(), TransportError>;
 
-    /// Enqueue with a WRITE receipt: the returned receiver resolves with the
-    /// REAL write result (written to the socket / OS buffer, or the write or
-    /// connection failed). Split from awaiting on purpose: callers reach this
-    /// method through a connection lock and must await the receipt AFTER
-    /// releasing it, or one slow write would serialize every other sender.
-    /// The default (for test doubles) performs an enqueue-only `send` and
-    /// resolves the receipt immediately; every real adapter overrides it.
-    async fn send_with_receipt(
+    /// Enqueue a packet carrying a write completion. REQUIRED — there is
+    /// deliberately no default, so an implementation cannot silently inherit
+    /// enqueue-only semantics for the confirmed tier.
+    ///
+    /// Contract: the completion must be resolved with the REAL write result —
+    /// `complete(Ok(()))` only after the bytes reached the socket (or its OS
+    /// buffer), `complete(Err(..))` when the write failed. An implementation
+    /// that can no longer write must DROP the completion (dropping reports
+    /// failure by construction); it must never invent an Ok. This method only
+    /// enqueues: callers reach it through a connection lock and await the
+    /// completion's observer AFTER releasing it, or one slow write would
+    /// serialize every other sender.
+    async fn send_with_completion(
         &mut self,
         packet: Packet,
-    ) -> Result<tokio::sync::oneshot::Receiver<Result<(), TransportError>>, TransportError> {
-        self.send(packet).await?;
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = tx.send(Ok(()));
-        Ok(rx)
-    }
+        completion: crate::adapters::outbound::WriteCompletion,
+    ) -> Result<(), TransportError>;
 
     /// Close connection
     async fn close(&mut self) -> Result<(), TransportError>;

@@ -15,27 +15,91 @@
 
 use crate::error::TransportError;
 use crate::packet::Packet;
+use crate::transport::request_registry::RespondClaim;
 use std::time::Duration;
 use tokio::sync::mpsc::{self, error::SendTimeoutError};
 use tokio::sync::oneshot;
 
-/// One outbound queue item: the packet, plus an optional write receipt.
+/// The completion of one confirmed write. Carried by the outbound queue item
+/// through to the write loop, which resolves it with the REAL write result.
 ///
-/// `ack: None` is the fire-and-forget tier (enqueue success is the only
-/// signal). `ack: Some` is the confirmed tier: the write loop sends the REAL
-/// write result after the socket write, and dropping the sender (connection
-/// died before the write) is observed by the caller as a connection error —
-/// "accepted for delivery" and "delivered to the socket" are no longer
-/// conflated.
+/// Resolution cannot be lost: `complete()` reports the write outcome to both
+/// the optional observer (a caller awaiting the receipt) and the optional
+/// [`RespondClaim`] (the registry's `Responding` entry). If the completion is
+/// dropped instead — queue entry discarded, connection died, enqueue future
+/// cancelled — the observer's channel closes (a connection error to the
+/// awaiter) and the claim's own drop guard records a send failure. Observers
+/// are therefore pure observers: cancelling the caller's future never strands
+/// registry state.
+#[derive(Debug)]
+pub struct WriteCompletion {
+    observer: Option<oneshot::Sender<Result<(), TransportError>>>,
+    claim: Option<RespondClaim>,
+}
+
+impl WriteCompletion {
+    pub(crate) fn new(
+        observer: Option<oneshot::Sender<Result<(), TransportError>>>,
+        claim: Option<RespondClaim>,
+    ) -> Self {
+        Self { observer, claim }
+    }
+
+    /// Resolve with the actual write outcome. Adapters MUST call this from the
+    /// write loop after the socket write; a completion they cannot write must
+    /// be dropped (which reports failure) — never completed with a made-up Ok.
+    pub fn complete(mut self, result: Result<(), TransportError>) {
+        if let Some(claim) = self.claim.take() {
+            claim.resolve(result.is_ok());
+        }
+        if let Some(tx) = self.observer.take() {
+            let _ = tx.send(result);
+        }
+    }
+}
+
+/// One outbound queue item: the packet, plus an optional write completion.
+///
+/// `completion: None` is the fire-and-forget tier (enqueue success is the only
+/// signal). `completion: Some` is the confirmed tier: the write loop resolves
+/// it with the REAL write result after the socket write — "accepted for
+/// delivery" and "delivered to the socket" are no longer conflated, and
+/// dropping the item anywhere along the way reports failure by construction.
 pub(crate) struct Outbound {
     pub packet: Packet,
-    pub ack: Option<oneshot::Sender<Result<(), TransportError>>>,
+    pub completion: Option<WriteCompletion>,
 }
 
 impl Outbound {
     pub fn fire_and_forget(packet: Packet) -> Self {
-        Self { packet, ack: None }
+        Self {
+            packet,
+            completion: None,
+        }
     }
+}
+
+/// How long a single socket write may take before the connection is declared
+/// dead. A peer that stops draining for this long has stalled the whole
+/// connection (the outbound queue is already full behind it); failing the
+/// write closes the connection and resolves every queued completion instead
+/// of blocking respond callers indefinitely.
+static WRITE_DEADLINE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(30_000);
+
+pub(crate) fn write_deadline() -> Duration {
+    Duration::from_millis(WRITE_DEADLINE_MS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Override the per-write deadline (clamped to [10ms, 10min]).
+///
+/// Test hook: lets stall tests use a deadline a test can actually wait out.
+/// Process-global — tests using it must serialize themselves and restore the
+/// default. Slated to become ServerLimits/ClientLimits configuration at the
+/// API freeze.
+#[doc(hidden)]
+pub fn set_write_deadline(deadline: Duration) {
+    let ms = deadline.as_millis().clamp(10, 600_000) as u64;
+    WRITE_DEADLINE_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Depth of each connection's outbound queue.
@@ -74,40 +138,28 @@ pub(crate) async fn send_bounded(
     .await
 }
 
-/// Enqueue a packet AND await the write loop's receipt: `Ok` means the packet
-/// was actually written to the socket (or its OS buffer), `Err` means the
-/// enqueue failed, the write failed, or the connection died before the write.
-pub(crate) async fn send_confirmed_bounded(
+/// Enqueue a packet carrying a write completion, WITHOUT awaiting anything.
+/// Callers that hold a lock for the enqueue must await their observer receipt
+/// after releasing it, or one slow write would serialize every other sender.
+/// On enqueue failure the completion is dropped with the rejected item, which
+/// reports the failure to its observer and claim by construction.
+pub(crate) async fn send_with_completion_bounded(
     queue: &mpsc::Sender<Outbound>,
     packet: Packet,
+    completion: WriteCompletion,
     queue_name: &'static str,
     closed_msg: &'static str,
 ) -> Result<(), TransportError> {
-    let rx = enqueue_with_receipt(queue, packet, queue_name, closed_msg).await?;
-    await_receipt(rx, closed_msg).await
-}
-
-/// Enqueue with a receipt WITHOUT awaiting it — callers that hold a lock for
-/// the enqueue must await the receipt after releasing it, or one slow write
-/// would serialize every other sender behind that lock.
-pub(crate) async fn enqueue_with_receipt(
-    queue: &mpsc::Sender<Outbound>,
-    packet: Packet,
-    queue_name: &'static str,
-    closed_msg: &'static str,
-) -> Result<oneshot::Receiver<Result<(), TransportError>>, TransportError> {
-    let (tx, rx) = oneshot::channel();
     send_item(
         queue,
         Outbound {
             packet,
-            ack: Some(tx),
+            completion: Some(completion),
         },
         queue_name,
         closed_msg,
     )
-    .await?;
-    Ok(rx)
+    .await
 }
 
 /// Await a write receipt; a dropped sender (connection ended before the
@@ -209,39 +261,43 @@ mod tests {
         );
     }
 
-    /// Confirmed tier: Ok only after the writer acks the actual write.
+    async fn send_confirmed_for_test(
+        tx: &mpsc::Sender<Outbound>,
+        p: Packet,
+    ) -> Result<(), TransportError> {
+        let (otx, orx) = oneshot::channel();
+        send_with_completion_bounded(tx, p, WriteCompletion::new(Some(otx), None), "q", "closed")
+            .await?;
+        await_receipt(orx, "closed").await
+    }
+
+    /// Confirmed tier: Ok only after the writer resolves the actual write.
     #[tokio::test]
     async fn confirmed_send_reports_the_write_result() {
         let (tx, mut rx) = mpsc::channel::<Outbound>(2);
         let writer = tokio::spawn(async move {
             let item = rx.recv().await.expect("item");
-            item.ack.expect("ack").send(Ok(())).unwrap();
+            item.completion.expect("completion").complete(Ok(()));
             let item = rx.recv().await.expect("item");
-            item.ack
-                .expect("ack")
-                .send(Err(TransportError::connection_error("write failed", false)))
-                .unwrap();
+            item.completion
+                .expect("completion")
+                .complete(Err(TransportError::connection_error("write failed", false)));
         });
-        assert!(send_confirmed_bounded(&tx, packet(1), "q", "closed")
-            .await
-            .is_ok());
-        assert!(send_confirmed_bounded(&tx, packet(2), "q", "closed")
-            .await
-            .is_err());
+        assert!(send_confirmed_for_test(&tx, packet(1)).await.is_ok());
+        assert!(send_confirmed_for_test(&tx, packet(2)).await.is_err());
         writer.await.unwrap();
     }
 
-    /// Writer dying before the write is a connection error, not silence.
+    /// Writer dying before the write is a connection error, not silence: the
+    /// dropped completion closes the observer channel by construction.
     #[tokio::test]
-    async fn confirmed_send_fails_when_writer_drops_the_ack() {
+    async fn confirmed_send_fails_when_writer_drops_the_completion() {
         let (tx, mut rx) = mpsc::channel::<Outbound>(1);
         let writer = tokio::spawn(async move {
             let item = rx.recv().await.expect("item");
-            drop(item.ack); // connection died before the write
+            drop(item.completion); // connection died before the write
         });
-        let err = send_confirmed_bounded(&tx, packet(1), "q", "conn closed")
-            .await
-            .unwrap_err();
+        let err = send_confirmed_for_test(&tx, packet(1)).await.unwrap_err();
         assert!(matches!(err, TransportError::Connection { .. }));
         writer.await.unwrap();
     }

@@ -118,28 +118,45 @@ impl SessionSender {
         self.transport.send(packet).await
     }
 
-    /// Send a response to a request
+    /// Send a response to a request, write-confirmed.
+    ///
+    /// `Ok(RespondOutcome::Written)` means the response bytes reached the
+    /// transport. Duplicate/late/unknown responses return
+    /// `Ok(RespondOutcome::AlreadyHandled)` without writing anything. The send
+    /// is bound to this session's generation: a response can never be written
+    /// onto a different connection than the request arrived on.
+    ///
+    /// Cancellation-safe: the respond claim travels with the queued write, so
+    /// wrapping this in `timeout`/`select!` cannot strand registry state.
     pub async fn respond(
         &self,
         message_id: u32,
         biz_type: u8,
         data: impl Into<bytes::Bytes>,
-    ) -> Result<(), crate::TransportError> {
+    ) -> Result<crate::event::RespondOutcome, crate::TransportError> {
         let data: bytes::Bytes = data.into();
-        // Claim the respond (Pending -> Responding): exactly one responder wins,
-        // duplicates/late responses are dropped. The claim is resolved below with
-        // the REAL write result, so `Ok(())` means the bytes were written to the
-        // transport, not merely queued.
-        if let Some(registry) = &self.inbound_registry {
-            if registry.begin_respond(Some(self.session_id), message_id) != MarkResult::Updated {
-                tracing::debug!(
-                    "[ACTOR] Skip duplicate/late/unknown response: session={}, id={}",
-                    self.session_id,
-                    message_id
-                );
-                return Ok(());
+        // Claim the respond (Pending -> Responding): exactly one responder
+        // wins. The claim is created in this same poll and handed to the send
+        // before any await, so every cancellation/failure path resolves it.
+        let claim = match &self.inbound_registry {
+            Some(registry) => {
+                if registry.begin_respond(Some(self.session_id), message_id) != MarkResult::Updated
+                {
+                    tracing::debug!(
+                        "[ACTOR] Skip duplicate/late/unknown response: session={}, id={}",
+                        self.session_id,
+                        message_id
+                    );
+                    return Ok(crate::event::RespondOutcome::AlreadyHandled);
+                }
+                Some(crate::transport::request_registry::RespondClaim::new(
+                    registry.clone(),
+                    Some(self.session_id),
+                    message_id,
+                ))
             }
-        }
+            None => None,
+        };
         let response_packet = Packet {
             header: crate::packet::FixedHeader {
                 version: 1,
@@ -154,14 +171,10 @@ impl SessionSender {
             ext_header: Vec::new(),
             payload: data,
         };
-        let result = self.transport.send_confirmed(response_packet).await;
-        if let Some(registry) = &self.inbound_registry {
-            // Resolve the claim with the write outcome. A failed send is counted
-            // (response_send_failed) inside finish_respond; a session that died
-            // mid-send already drained the entry via close_session (NotFound here).
-            registry.finish_respond(Some(self.session_id), message_id, result.is_ok());
-        }
-        result
+        self.transport
+            .send_confirmed_with(response_packet, Some(self.session_id), claim)
+            .await
+            .map(|()| crate::event::RespondOutcome::Written)
     }
 
     /// Get the session ID
@@ -226,7 +239,9 @@ impl Responder {
             payload: data,
         };
 
-        self.transport.send_confirmed(response_packet).await
+        self.transport
+            .send_confirmed_with(response_packet, Some(self.session_id), None)
+            .await
     }
 
     /// Get the session ID

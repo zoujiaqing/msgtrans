@@ -548,11 +548,32 @@ pub struct TransportContext {
     kind: TransportContextKind,
 }
 
-/// Responder that sends a response and reports the send result. Returns a boxed
-/// future so `respond` can spawn it fire-and-forget while `respond_checked` can
-/// await the outcome.
+/// What a respond call actually did.
+///
+/// `Ok(Written)` is the only value that means "the response bytes reached the
+/// socket". Duplicate/late/unknown responds report `AlreadyHandled` instead of
+/// a fake success, and real failures are `Err` — the three cases are never
+/// conflated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RespondOutcome {
+    /// The response was written to the transport (write-confirmed).
+    Written,
+    /// Nothing was written: another responder already claimed this request,
+    /// or the request is no longer tracked (late/unknown). Idempotent-skip.
+    AlreadyHandled,
+}
+
+/// Responder that sends a response and reports the send result. Receives the
+/// respond claim (when the request is registry-tracked) so completion
+/// ownership can travel with the queued write — the claim resolves the
+/// registry state no matter where the send is cancelled or fails. Returns a
+/// boxed future so `respond` can spawn it fire-and-forget while
+/// `respond_checked` can await the outcome.
 type ResponderFn = Arc<
-    dyn Fn(Bytes) -> futures::future::BoxFuture<'static, Result<(), crate::error::TransportError>>
+    dyn Fn(
+            Bytes,
+            Option<crate::transport::request_registry::RespondClaim>,
+        ) -> futures::future::BoxFuture<'static, Result<(), crate::error::TransportError>>
         + Send
         + Sync,
 >;
@@ -590,7 +611,18 @@ impl TransportContext {
         }
     }
 
-    /// Create request message context
+    /// Create request message context from a legacy synchronous callback.
+    ///
+    /// The callback cannot confirm a write, so a context built this way
+    /// reports `Written` as soon as the callback returns — it reflects the
+    /// callback's claim, NOT a confirmed socket write, and there is no
+    /// registry lifecycle. Kept only for external constructions; internal
+    /// paths use the registry-backed constructor.
+    #[deprecated(
+        since = "2.0.0",
+        note = "the synchronous callback cannot confirm a write; this constructor will be \
+                removed at the 2.0 API freeze"
+    )]
     pub fn new_request(
         peer: Option<SessionId>,
         message_id: u32,
@@ -599,10 +631,13 @@ impl TransportContext {
         data: impl Into<Bytes>,
         responder: Arc<dyn Fn(Bytes) + Send + Sync + 'static>,
     ) -> Self {
-        // Adapt the legacy fire-and-forget responder to the checked shape. The old
-        // Fn returns (), so the boxed future always reports success.
+        // Adapt the legacy fire-and-forget responder to the checked shape. The
+        // old Fn returns (), so the boxed future always reports success. No
+        // registry means no claim ever reaches this closure.
         let responder: ResponderFn = Arc::new(
-            move |data: Bytes| -> futures::future::BoxFuture<
+            move |data: Bytes,
+                  _claim: Option<crate::transport::request_registry::RespondClaim>|
+                  -> futures::future::BoxFuture<
                 'static,
                 Result<(), crate::error::TransportError>,
             > {
@@ -657,7 +692,11 @@ impl TransportContext {
         String::from_utf8_lossy(&self.data).to_string()
     }
 
-    /// Respond to request (only available for request type)
+    /// Respond to request, fire-and-forget (only available for request type).
+    ///
+    /// The send outcome is not observable here — use [`Self::respond_checked`]
+    /// to await the write-confirmed result. Registry state is still resolved
+    /// truthfully either way: the claim travels with the queued write.
     pub fn respond(mut self, response: impl Into<Bytes>) {
         let response: Bytes = response.into();
         match &mut self.kind {
@@ -667,9 +706,18 @@ impl TransportContext {
                 request_registry,
                 ..
             } => {
-                if let Some(registry) = request_registry {
-                    match registry.begin_respond(self.peer, self.message_id) {
-                        MarkResult::Updated => {}
+                // The claim is created in this same poll and immediately moved
+                // into the responder future, so no cancellation window exists
+                // between winning the claim and materializing its drop guard.
+                let claim = match request_registry {
+                    Some(registry) => match registry.begin_respond(self.peer, self.message_id) {
+                        MarkResult::Updated => {
+                            Some(crate::transport::request_registry::RespondClaim::new(
+                                registry.clone(),
+                                self.peer,
+                                self.message_id,
+                            ))
+                        }
                         MarkResult::Already(state) => {
                             tracing::debug!(
                                 "[RESPOND] Skip duplicate/late response: request_id={}, state={:?}",
@@ -686,24 +734,17 @@ impl TransportContext {
                             );
                             return;
                         }
-                    }
-                }
+                    },
+                    None => None,
+                };
 
                 if responded
                     .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok()
                 {
-                    let fut = responder(response);
-                    let registry = request_registry.clone();
-                    let peer = self.peer;
-                    let message_id = self.message_id;
+                    let fut = responder(response, claim);
                     tokio::spawn(async move {
-                        // Resolve the Responding claim with the real write result.
-                        let result = fut.await;
-                        if let Some(registry) = &registry {
-                            registry.finish_respond(peer, message_id, result.is_ok());
-                        }
-                        if let Err(e) = result {
+                        if let Err(e) = fut.await {
                             tracing::debug!(
                                 "[RESPOND] fire-and-forget response send failed: {:?}",
                                 e
@@ -731,36 +772,52 @@ impl TransportContext {
         self.respond(Bytes::copy_from_slice(response));
     }
 
-    /// Respond and await the send result, so the caller can observe delivery
-    /// failures. Additive counterpart to `respond` (which is fire-and-forget).
+    /// Respond and await the write-confirmed result. Counterpart to
+    /// [`Self::respond`] (which is fire-and-forget).
     ///
-    /// Returns `Ok(())` for duplicate/late/already-responded requests (idempotent);
-    /// one-way messages return a protocol error.
+    /// `Ok(RespondOutcome::Written)` means the response bytes reached the
+    /// socket. Duplicate/late/unknown requests return
+    /// `Ok(RespondOutcome::AlreadyHandled)` without writing anything — never a
+    /// fake `Written`. One-way messages return a protocol error.
+    ///
+    /// Cancellation-safe: once the internal claim is created it travels with
+    /// the queued write, so dropping this future (timeout/select/abort) can
+    /// never strand the registry entry — an unfinished send resolves as a send
+    /// failure.
     pub async fn respond_checked(
         mut self,
         response: impl Into<Bytes>,
-    ) -> Result<(), crate::error::TransportError> {
+    ) -> Result<RespondOutcome, crate::error::TransportError> {
         let response: Bytes = response.into();
-        let (fut, registry) = match &mut self.kind {
+        let fut = match &mut self.kind {
             TransportContextKind::Request {
                 responder,
                 responded,
                 request_registry,
                 ..
             } => {
-                if let Some(registry) = request_registry {
-                    match registry.begin_respond(self.peer, self.message_id) {
-                        MarkResult::Updated => {}
-                        _ => return Ok(()),
-                    }
-                }
+                // Same-poll claim: created and moved into the responder future
+                // with no await in between (see `respond`).
+                let claim = match request_registry {
+                    Some(registry) => match registry.begin_respond(self.peer, self.message_id) {
+                        MarkResult::Updated => {
+                            Some(crate::transport::request_registry::RespondClaim::new(
+                                registry.clone(),
+                                self.peer,
+                                self.message_id,
+                            ))
+                        }
+                        _ => return Ok(RespondOutcome::AlreadyHandled),
+                    },
+                    None => None,
+                };
                 if responded
                     .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok()
                 {
-                    (Some(responder(response)), request_registry.clone())
+                    Some(responder(response, claim))
                 } else {
-                    (None, None)
+                    None
                 }
             }
             TransportContextKind::OneWay => {
@@ -771,15 +828,8 @@ impl TransportContext {
             }
         };
         match fut {
-            Some(f) => {
-                let result = f.await;
-                if let Some(registry) = &registry {
-                    // Resolve the Responding claim with the real write result.
-                    registry.finish_respond(self.peer, self.message_id, result.is_ok());
-                }
-                result
-            }
-            None => Ok(()),
+            Some(f) => f.await.map(|()| RespondOutcome::Written),
+            None => Ok(RespondOutcome::AlreadyHandled),
         }
     }
 }
@@ -939,7 +989,14 @@ mod respond_checked_tests {
 
     #[tokio::test]
     async fn respond_checked_returns_ok_from_responder() {
-        let ok: ResponderFn = Arc::new(|_data| Box::pin(async { Ok(()) }));
+        let ok: ResponderFn = Arc::new(|_data, claim| {
+            Box::pin(async move {
+                if let Some(claim) = claim {
+                    claim.resolve(true);
+                }
+                Ok(())
+            })
+        });
         let ctx = TransportContext::new_request_with_registry(
             Some(SessionId(1)),
             42,
@@ -954,8 +1011,10 @@ mod respond_checked_tests {
 
     #[tokio::test]
     async fn respond_checked_propagates_send_error() {
-        let err: ResponderFn = Arc::new(|_data| {
+        let err: ResponderFn = Arc::new(|_data, _claim| {
             Box::pin(async {
+                // _claim drops here: a failed send resolves the registry
+                // entry as SendFailed by construction.
                 Err(crate::error::TransportError::connection_error(
                     "boom", false,
                 ))
@@ -977,5 +1036,103 @@ mod respond_checked_tests {
     async fn respond_checked_on_one_way_is_error() {
         let ctx = TransportContext::new_oneway(Some(SessionId(3)), 44, 0, None, b"data".to_vec());
         assert!(ctx.respond_checked(b"resp".to_vec()).await.is_err());
+    }
+
+    fn tracked_registry(sid: u64, id: u32) -> Arc<RequestRegistry> {
+        let registry = Arc::new(RequestRegistry::new());
+        registry.open_session(SessionId(sid));
+        assert!(registry.register(
+            id,
+            Some(SessionId(sid)),
+            0,
+            std::time::Duration::from_secs(5)
+        ));
+        registry
+    }
+
+    fn responder_with(fut_claim_hold: bool) -> ResponderFn {
+        // fut_claim_hold=true: hold the claim inside a never-completing future,
+        // modelling a send stuck in the outbound path.
+        Arc::new(move |_data, claim| {
+            if fut_claim_hold {
+                Box::pin(async move {
+                    let _hold = claim;
+                    std::future::pending::<()>().await;
+                    unreachable!()
+                })
+            } else {
+                Box::pin(async move {
+                    if let Some(claim) = claim {
+                        claim.resolve(true);
+                    }
+                    Ok(())
+                })
+            }
+        })
+    }
+
+    fn tracked_ctx(registry: &Arc<RequestRegistry>, responder: ResponderFn) -> TransportContext {
+        TransportContext::new_request_with_registry(
+            Some(SessionId(7)),
+            1,
+            0,
+            None,
+            b"req".to_vec(),
+            responder,
+            Some(registry.clone()),
+        )
+    }
+
+    /// Cancelling a checked respond mid-send must not strand the registry in
+    /// Responding: the claim travels with the responder future, so dropping
+    /// the caller's future resolves the entry as a send failure.
+    #[tokio::test]
+    async fn cancelled_respond_checked_resolves_the_claim() {
+        let registry = tracked_registry(7, 1);
+        let ctx = tracked_ctx(&registry, responder_with(true));
+
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            ctx.respond_checked(b"resp".to_vec()),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "send must still be in flight at timeout"
+        );
+        // The timeout dropped the respond future -> claim dropped -> resolved.
+        assert_eq!(
+            registry.get_state(
+                Some(SessionId(7)),
+                1,
+                crate::transport::request_registry::RequestDirection::Inbound
+            ),
+            None,
+            "cancelled respond must not leave a Responding entry"
+        );
+        let snapshot = registry.counters_snapshot();
+        assert_eq!(snapshot.pending_requests, 0);
+        assert_eq!(snapshot.response_send_failed_total, 1);
+        assert_eq!(registry.active_len(), 0);
+    }
+
+    /// The second respond reports AlreadyHandled — not a fake Written.
+    #[tokio::test]
+    async fn duplicate_respond_checked_reports_already_handled() {
+        let registry = tracked_registry(7, 1);
+        let first = tracked_ctx(&registry, responder_with(false));
+        let second = tracked_ctx(&registry, responder_with(false));
+
+        assert_eq!(
+            first.respond_checked(b"resp".to_vec()).await.unwrap(),
+            RespondOutcome::Written
+        );
+        assert_eq!(
+            second.respond_checked(b"resp".to_vec()).await.unwrap(),
+            RespondOutcome::AlreadyHandled
+        );
+        let snapshot = registry.counters_snapshot();
+        assert_eq!(snapshot.duplicate_response_total, 1);
+        assert_eq!(snapshot.response_send_failed_total, 0);
     }
 }

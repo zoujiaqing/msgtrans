@@ -632,12 +632,12 @@ impl<C> QuicAdapter<C> {
                     // Batch serialize all packets into write buffer
                     write_buf.clear();
                     let mut packet_ids = Vec::with_capacity(count);
-                    let mut acks = Vec::new();
+                    let mut completions = Vec::new();
 
                     for item in batch.drain(..) {
                         let packet = item.packet;
-                        if let Some(ack) = item.ack {
-                            acks.push(ack);
+                        if let Some(completion) = item.completion {
+                            completions.push(completion);
                         }
                         let packet_id = packet.header.message_id;
                         packet_ids.push(packet_id);
@@ -651,24 +651,35 @@ impl<C> QuicAdapter<C> {
                         write_buf.extend_from_slice(&data);
                     }
 
-                    // Single write for entire batch
-                    if let Err(e) = send_stream.write_all(&write_buf).await {
+                    // Single write for entire batch, bounded by the write
+                    // deadline: a stalled stream fails the batch instead of
+                    // blocking every queued sender indefinitely.
+                    let batch_write = tokio::time::timeout(
+                        crate::adapters::outbound::write_deadline(),
+                        send_stream.write_all(&write_buf),
+                    )
+                    .await;
+                    let batch_error = match batch_write {
+                        Ok(Ok(())) => None,
+                        Ok(Err(e)) => Some(format!("Write error: {:?}", e)),
+                        Err(_) => Some("QUIC write deadline exceeded".to_string()),
+                    };
+                    if let Some(reason) = batch_error {
                         tracing::error!(
-                            "[ERROR] Failed to write batch: {:?} (session: {})",
-                            e,
+                            "[ERROR] Failed to write batch: {} (session: {})",
+                            reason,
                             current_session_id
                         );
-                        // The whole batch failed: every receipt in it fails.
-                        for ack in acks {
-                            let _ = ack.send(Err(crate::error::TransportError::connection_error(
-                                "QUIC write failed",
-                                false,
-                            )));
+                        // The whole batch failed: every completion in it fails.
+                        for completion in completions {
+                            completion.complete(Err(
+                                crate::error::TransportError::connection_error(
+                                    "QUIC write failed",
+                                    false,
+                                ),
+                            ));
                         }
-                        write_event_pipe.close(crate::error::CloseReason::Error(format!(
-                            "Write error: {:?}",
-                            e
-                        )));
+                        write_event_pipe.close(crate::error::CloseReason::Error(reason));
                         break;
                     }
 
@@ -679,9 +690,9 @@ impl<C> QuicAdapter<C> {
                         current_session_id
                     );
 
-                    // Write receipts for the whole batch, then diagnostics.
-                    for ack in acks {
-                        let _ = ack.send(Ok(()));
+                    // Write completions for the whole batch, then diagnostics.
+                    for completion in completions {
+                        completion.complete(Ok(()));
                     }
                     for packet_id in packet_ids {
                         write_event_pipe.diagnostic(TransportEvent::MessageSent { packet_id });
@@ -793,13 +804,15 @@ impl<C: Send + Sync + 'static> Connection for QuicAdapter<C> {
         .await
     }
 
-    async fn send_with_receipt(
+    async fn send_with_completion(
         &mut self,
         packet: Packet,
-    ) -> Result<tokio::sync::oneshot::Receiver<Result<(), TransportError>>, TransportError> {
-        crate::adapters::outbound::enqueue_with_receipt(
+        completion: crate::adapters::outbound::WriteCompletion,
+    ) -> Result<(), TransportError> {
+        crate::adapters::outbound::send_with_completion_bounded(
             &self.send_queue,
             packet,
+            completion,
             "quic_outbound_queue",
             "QUIC connection closed",
         )

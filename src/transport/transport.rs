@@ -36,8 +36,11 @@ pub struct Transport {
     /// Client-facing event queue: bounded, single consumer (the client's
     /// forwarding task). Replaces the broadcast hop, whose one Lagged killed
     /// the forwarding task and silently ended all client event delivery.
-    client_events_tx: mpsc::Sender<TransportEvent>,
-    client_events_rx: Arc<Mutex<Option<mpsc::Receiver<TransportEvent>>>>,
+    /// Items carry the source generation's SessionId: consumers (the client's
+    /// request contexts in particular) must bind responses to the connection
+    /// the request arrived on, not to "whatever connection is current".
+    client_events_tx: mpsc::Sender<(SessionId, TransportEvent)>,
+    client_events_rx: Arc<Mutex<Option<mpsc::Receiver<(SessionId, TransportEvent)>>>>,
     request_registry: Arc<crate::transport::request_registry::RequestRegistry>,
     /// Monotonic connection generation. Each set_connection bumps it; the
     /// per-connection pipe consumer only acts while its epoch is current, so
@@ -49,6 +52,11 @@ pub struct Transport {
 /// enforced by the caller (tokio::time::timeout); this only bounds the entry if
 /// the caller forgets to remove it.
 const REQUEST_WAITER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Lifecycle deadline for inbound (peer-initiated) requests on the client
+/// side. Client transports run no timeout scanner, so this only labels the
+/// entry; actual cleanup is the respond itself or the session-close drain,
+/// which caps entry lifetime at the connection's lifetime.
+const INBOUND_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 impl Transport {
     /// Create Transport from a shared context (synchronous — no global singletons).
     pub fn with_context(config: TransportConfig, ctx: &TransportContext) -> Self {
@@ -88,21 +96,68 @@ impl Transport {
         }
     }
 
-    /// Send with a write receipt: resolves only once the packet was actually
+    /// Send with a write completion: resolves only once the packet was actually
     /// written (or the write/connection failed). The slot lock is held ONLY
-    /// for the bounded enqueue; the receipt is awaited after releasing it, so
+    /// for the bounded enqueue; the observer is awaited after releasing it, so
     /// a slow write cannot serialize other senders or block the close paths.
     pub(crate) async fn send_confirmed(&self, packet: Packet) -> Result<(), TransportError> {
-        let receipt = {
+        self.send_confirmed_with(packet, None, None).await
+    }
+
+    /// Confirmed send bound to a connection generation and (optionally) a
+    /// respond claim.
+    ///
+    /// - `expected_session`: validated against the CURRENT slot's generation
+    ///   under the slot lock, atomically with the enqueue. A response created
+    ///   against generation N can therefore never be written onto generation
+    ///   N+1 after a reconnect.
+    /// - `claim`: moved into the [`WriteCompletion`] in the same poll that
+    ///   created it, BEFORE the first await. From that point every path —
+    ///   cancellation of this future, enqueue rejection, connection death,
+    ///   the write itself — resolves the claim exactly once by construction.
+    pub(crate) async fn send_confirmed_with(
+        &self,
+        packet: Packet,
+        expected_session: Option<SessionId>,
+        claim: Option<crate::transport::request_registry::RespondClaim>,
+    ) -> Result<(), TransportError> {
+        let (observer_tx, observer_rx) = tokio::sync::oneshot::channel();
+        // Created before the first await: cancellation from here on drops the
+        // completion, which reports failure to the claim and the observer.
+        let completion = crate::adapters::outbound::WriteCompletion::new(Some(observer_tx), claim);
+        {
             let mut guard = self.slot.lock().await;
             match guard.as_mut() {
-                Some(slot) => slot.connection.send_with_receipt(packet).await?,
+                Some(slot) => {
+                    if let Some(expected) = expected_session {
+                        if slot.session_id != expected {
+                            // `completion` drops here: the stale respond is
+                            // recorded as a send failure, and crucially the
+                            // packet is NOT written to the new generation.
+                            return Err(TransportError::connection_error(
+                                "connection replaced since the request was received",
+                                false,
+                            ));
+                        }
+                    }
+                    slot.connection
+                        .send_with_completion(packet, completion)
+                        .await?
+                }
                 None => {
                     return Err(TransportError::connection_error("Not connected", false));
                 }
             }
-        };
-        crate::adapters::outbound::await_receipt(receipt, "connection closed before write").await
+        }
+        crate::adapters::outbound::await_receipt(observer_rx, "connection closed before write")
+            .await
+    }
+
+    /// The request registry shared by this transport's request/respond paths.
+    pub(crate) fn request_registry(
+        &self,
+    ) -> &Arc<crate::transport::request_registry::RequestRegistry> {
+        &self.request_registry
     }
 
     /// Apply a frame decode policy to the underlying connection (if connected).
@@ -414,10 +469,11 @@ impl Transport {
     }
 
     /// Take the client event queue (single consumer, once). The queue spans
-    /// reconnects: new connections' pipe consumers feed the same sender.
+    /// reconnects: new connections' pipe consumers feed the same sender, and
+    /// every item is tagged with the generation (SessionId) it came from.
     pub async fn get_event_stream(
         &self,
-    ) -> Option<tokio::sync::mpsc::Receiver<crate::event::TransportEvent>> {
+    ) -> Option<tokio::sync::mpsc::Receiver<(SessionId, crate::event::TransportEvent)>> {
         self.client_events_rx.lock().await.take()
     }
 
@@ -524,6 +580,7 @@ impl Transport {
                             tracing::warn!("[WARN] Response packet ID={} not found in request tracker, may be timeout or duplicate", id);
                             // Forward unmatched responses so higher layers can handle them.
                             self.forward_client_event(
+                                source_session,
                                 crate::event::TransportEvent::MessageReceived(packet),
                             )
                             .await;
@@ -534,14 +591,32 @@ impl Transport {
                         let id = packet.header.message_id;
                         tracing::debug!("[PROC] Received request packet, creating unified TransportContext: ID={}, type={:?}", id, packet.header.packet_type);
 
+                        // Register the inbound request under ITS generation so the
+                        // respond path gets the full claimed lifecycle (single
+                        // responder, duplicate refusal, drain on session close).
+                        // A refused registration (duplicate id from the peer) is
+                        // still forwarded; its respond will observe AlreadyHandled.
+                        if !self.request_registry.register(
+                            id,
+                            Some(source_session),
+                            packet.header.biz_type,
+                            INBOUND_REQUEST_TIMEOUT,
+                        ) {
+                            tracing::debug!(
+                                "[PROC] Inbound request not registered (duplicate or closing session): ID={}, session={}",
+                                id,
+                                source_session
+                            );
+                        }
                         // [TARGET] Send MessageReceived event directly, let ClientEvent handle Request logic during conversion
                         tracing::debug!(
                             "[SEND] Sending unified MessageReceived event (Request): ID={}",
                             id
                         );
-                        self.forward_client_event(crate::event::TransportEvent::MessageReceived(
-                            packet,
-                        ))
+                        self.forward_client_event(
+                            source_session,
+                            crate::event::TransportEvent::MessageReceived(packet),
+                        )
                         .await;
                     }
 
@@ -564,6 +639,7 @@ impl Transport {
 
                                 // [TARGET] Send user-friendly message event (maintain backward compatibility)
                                 self.forward_client_event(
+                                    source_session,
                                     crate::event::TransportEvent::MessageReceived(packet),
                                 )
                                 .await;
@@ -571,6 +647,7 @@ impl Transport {
                             Err(e) => {
                                 tracing::error!("[ERROR] Failed to unpack message data: {}", e);
                                 self.forward_client_event(
+                                    source_session,
                                     crate::event::TransportEvent::TransportError { error: e },
                                 )
                                 .await;
@@ -598,24 +675,26 @@ impl Transport {
                 // pipe teardown's retire remains as the idempotent fallback
                 // for abnormal endings that never produce this event.
                 self.retire_generation(source_session).await;
-                self.forward_client_event(crate::event::TransportEvent::ConnectionClosed {
-                    reason,
-                })
+                self.forward_client_event(
+                    source_session,
+                    crate::event::TransportEvent::ConnectionClosed { reason },
+                )
                 .await;
             }
             // Forward other events directly
             _ => {
                 tracing::trace!("[SEND] Forwarding other event: {:?}", event);
-                self.forward_client_event(event).await;
+                self.forward_client_event(source_session, event).await;
             }
         }
     }
 
-    /// Forward an event to the client's bounded queue. Backpressures the pipe
-    /// consumer (and through it the adapter and socket); if the client dropped
-    /// its receiver, events are discarded — there is no consumer to lose them.
-    async fn forward_client_event(&self, event: TransportEvent) {
-        let _ = self.client_events_tx.send(event).await;
+    /// Forward an event to the client's bounded queue, tagged with the source
+    /// generation. Backpressures the pipe consumer (and through it the adapter
+    /// and socket); if the client dropped its receiver, events are discarded —
+    /// there is no consumer to lose them.
+    async fn forward_client_event(&self, source_session: SessionId, event: TransportEvent) {
+        let _ = self.client_events_tx.send((source_session, event)).await;
     }
 
     /// Send data packet and wait for response (with options)
@@ -804,11 +883,22 @@ mod generation_tests {
     struct MockConn {
         closed: Arc<AtomicBool>,
         session_id: SessionId,
+        sent: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     #[async_trait::async_trait]
     impl Connection for MockConn {
         async fn send(&mut self, _packet: Packet) -> Result<(), TransportError> {
+            self.sent.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn send_with_completion(
+            &mut self,
+            packet: Packet,
+            completion: crate::adapters::outbound::WriteCompletion,
+        ) -> Result<(), TransportError> {
+            self.send(packet).await?;
+            completion.complete(Ok(()));
             Ok(())
         }
         async fn close(&mut self) -> Result<(), TransportError> {
@@ -836,9 +926,17 @@ mod generation_tests {
     }
 
     fn mock(closed: &Arc<AtomicBool>) -> Box<dyn Connection> {
+        mock_counting(closed, &Arc::new(std::sync::atomic::AtomicUsize::new(0)))
+    }
+
+    fn mock_counting(
+        closed: &Arc<AtomicBool>,
+        sent: &Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Box<dyn Connection> {
         Box::new(MockConn {
             closed: closed.clone(),
             session_id: SessionId::new(0),
+            sent: sent.clone(),
         })
     }
 
@@ -882,6 +980,64 @@ mod generation_tests {
             "current close must close its connection"
         );
         assert_eq!(transport.current_session_id().await, None);
+    }
+
+    /// A response created against generation N must never be written onto
+    /// generation N+1: send_confirmed_with validates the generation under the
+    /// slot lock, atomically with the enqueue, and resolves the claim as a
+    /// send failure without touching the new connection.
+    #[tokio::test]
+    async fn stale_generation_respond_is_refused_and_resolves_the_claim() {
+        let ctx = TransportContext::new().await.expect("ctx");
+        let transport = Arc::new(Transport::with_context(TransportConfig::default(), &ctx));
+        let closed = Arc::new(AtomicBool::new(false));
+        let sent2 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let id1 = transport.set_connection(mock(&closed)).await;
+        let id2 = transport
+            .set_connection(mock_counting(&closed, &sent2))
+            .await;
+
+        // A request arrived on generation 1 and its respond was claimed.
+        let registry = transport.request_registry().clone();
+        registry.open_session(id1);
+        assert!(registry.register(9, Some(id1), 0, std::time::Duration::from_secs(5)));
+        use crate::transport::request_registry::{MarkResult, RespondClaim};
+        assert_eq!(registry.begin_respond(Some(id1), 9), MarkResult::Updated);
+        let claim = RespondClaim::new(registry.clone(), Some(id1), 9);
+
+        // The respond runs after the reconnect: refused, nothing written.
+        let err = transport
+            .send_confirmed_with(
+                Packet::response(9, b"late".to_vec()),
+                Some(id1),
+                Some(claim),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TransportError::Connection { .. }));
+        assert_eq!(
+            sent2.load(Ordering::SeqCst),
+            0,
+            "stale respond must not reach the replacement connection"
+        );
+        // The claim resolved as a send failure — no immortal Responding entry.
+        assert_eq!(
+            registry.get_state(
+                Some(id1),
+                9,
+                crate::transport::request_registry::RequestDirection::Inbound
+            ),
+            None
+        );
+        assert_eq!(registry.counters_snapshot().response_send_failed_total, 1);
+
+        // The current generation still works, write-confirmed.
+        transport
+            .send_confirmed_with(Packet::response(10, b"ok".to_vec()), Some(id2), None)
+            .await
+            .expect("current generation must accept confirmed sends");
+        assert_eq!(sent2.load(Ordering::SeqCst), 1);
     }
 
     /// A stale response can only complete its own generation's waiter: request

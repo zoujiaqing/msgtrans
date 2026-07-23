@@ -671,7 +671,7 @@ impl TransportClient {
             let handle = tokio::spawn(async move {
                 tracing::debug!("[LOOP] TransportClient event forwarding task started");
 
-                while let Some(transport_event) = transport_events.recv().await {
+                while let Some((source_session, transport_event)) = transport_events.recv().await {
                     tracing::debug!("[RECV] TransportClient received Transport event");
 
                     // [TARGET] Special handling of Request packets in MessageReceived
@@ -682,11 +682,15 @@ impl TransportClient {
                             // Create TransportContext with real response functionality for Request packets
                             let transport = transport_for_response.clone();
                             let message_id = packet.header.message_id;
+                            let biz_type = packet.header.biz_type;
+                            let registry = transport_for_response
+                                .upgrade()
+                                .map(|t| t.request_registry().clone());
 
                             let context = crate::event::TransportContext::new_request_with_registry(
-                                None,
+                                Some(source_session),
                                 message_id,
-                                packet.header.biz_type,
+                                biz_type,
                                 if packet.ext_header.is_empty() {
                                     None
                                 } else {
@@ -694,7 +698,11 @@ impl TransportClient {
                                 },
                                 packet.payload.clone(),
                                 Arc::new(
-                                    move |response_data: bytes::Bytes| -> futures::future::BoxFuture<
+                                    move |response_data: bytes::Bytes,
+                                          claim: Option<
+                                        crate::transport::request_registry::RespondClaim,
+                                    >|
+                                          -> futures::future::BoxFuture<
                                         'static,
                                         Result<(), crate::error::TransportError>,
                                     > {
@@ -702,7 +710,9 @@ impl TransportClient {
                                         Box::pin(async move {
                                             // Upgrade only for the send: the
                                             // responder must not keep the
-                                            // Transport alive either.
+                                            // Transport alive either. Dropping
+                                            // `claim` on this path records the
+                                            // send failure.
                                             let Some(transport) = transport.upgrade() else {
                                                 return Err(
                                                     crate::error::TransportError::connection_error(
@@ -718,7 +728,7 @@ impl TransportClient {
                                                         crate::packet::CompressionType::None,
                                                     packet_type:
                                                         crate::packet::PacketType::Response,
-                                                    biz_type: 0,
+                                                    biz_type,
                                                     message_id,
                                                     ext_header_len: 0,
                                                     payload_len: response_data.len() as u32,
@@ -727,11 +737,22 @@ impl TransportClient {
                                                 ext_header: Vec::new(),
                                                 payload: response_data,
                                             };
-                                            transport.send_confirmed(response_packet).await
+                                            // Generation-bound: if the client
+                                            // reconnected since this request
+                                            // arrived, the stale response is
+                                            // refused instead of being written
+                                            // onto the new connection.
+                                            transport
+                                                .send_confirmed_with(
+                                                    response_packet,
+                                                    Some(source_session),
+                                                    claim,
+                                                )
+                                                .await
                                         })
                                     },
                                 ),
-                                None,
+                                registry,
                             );
 
                             let client_event = crate::event::ClientEvent::MessageReceived(context);

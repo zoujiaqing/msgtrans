@@ -123,6 +123,61 @@ pub enum MarkResult {
     NotFound,
 }
 
+/// A claimed respond (`Pending -> Responding`) whose resolution CANNOT be lost.
+///
+/// The claim is created in the same poll that wins `begin_respond` and then
+/// travels with the response through the outbound queue to the write loop.
+/// Whoever ends up owning it resolves it exactly once:
+///
+/// - `resolve(true)`  — the write reached the socket: `Responding -> Responded`.
+/// - `resolve(false)` — the write failed: `Responding -> SendFailed` (counted).
+/// - **Drop without resolve** — the carrying future was cancelled, the queue
+///   entry was discarded, or the connection died: resolved as a send failure.
+///
+/// This is what makes the `Responding` state cancellation-safe: completion
+/// ownership lives with the queued write, not with the caller's future, so a
+/// `timeout`/`select!`/abort around a respond can never strand the registry
+/// entry (the timeout wheel deliberately never touches `Responding`).
+#[derive(Debug)]
+pub(crate) struct RespondClaim {
+    registry: Arc<RequestRegistry>,
+    session_id: Option<SessionId>,
+    request_id: u32,
+    resolved: bool,
+}
+
+impl RespondClaim {
+    pub(crate) fn new(
+        registry: Arc<RequestRegistry>,
+        session_id: Option<SessionId>,
+        request_id: u32,
+    ) -> Self {
+        Self {
+            registry,
+            session_id,
+            request_id,
+            resolved: false,
+        }
+    }
+
+    pub(crate) fn resolve(mut self, write_confirmed: bool) {
+        self.resolved = true;
+        self.registry
+            .finish_respond(self.session_id, self.request_id, write_confirmed);
+    }
+}
+
+impl Drop for RespondClaim {
+    fn drop(&mut self) {
+        if !self.resolved {
+            // Abandoned mid-flight (cancelled future / dropped queue entry /
+            // dead connection): the write did not demonstrably happen.
+            self.registry
+                .finish_respond(self.session_id, self.request_id, false);
+        }
+    }
+}
+
 /// Returned by `try_register_waiter` when a live pending request already exists
 /// for the same (session_id, request_id). The new waiter is refused rather than
 /// silently replacing the old one (which would cancel the old receiver and could

@@ -473,27 +473,47 @@ impl<C> TcpAdapter<C> {
                     // [SEND] Handle send data
                     item = send_queue.recv() => {
                         if let Some(item) = item {
-                            let (packet, ack) = (item.packet, item.ack);
-                            match Self::write_packet_to_stream(&mut write_half, &packet).await {
-                                Ok(_) => {
+                            let (packet, completion) = (item.packet, item.completion);
+                            // A write that exceeds the deadline means the peer stopped
+                            // draining: the connection is declared dead rather than
+                            // blocking every queued sender behind it.
+                            let write = tokio::time::timeout(
+                                crate::adapters::outbound::write_deadline(),
+                                Self::write_packet_to_stream(&mut write_half, &packet),
+                            ).await;
+                            match write {
+                                Ok(Ok(_)) => {
                                     tracing::debug!("[SEND] TCP send successful: {} bytes (session: {})", packet.payload.len(), current_session_id);
-                                    // Write receipt: the REAL result, after the write.
-                                    if let Some(ack) = ack {
-                                        let _ = ack.send(Ok(()));
+                                    // Write completion: the REAL result, after the write.
+                                    if let Some(completion) = completion {
+                                        completion.complete(Ok(()));
                                     }
                                     // Diagnostic tier: droppable under load.
                                     event_pipe.diagnostic(TransportEvent::MessageSent { packet_id: packet.header.message_id });
                                 }
-                                Err(e) => {
+                                Ok(Err(e)) => {
                                     tracing::error!("[SEND] TCP send error: {:?} (session: {})", e, current_session_id);
-                                    if let Some(ack) = ack {
-                                        let _ = ack.send(Err(crate::error::TransportError::connection_error(
+                                    if let Some(completion) = completion {
+                                        completion.complete(Err(crate::error::TransportError::connection_error(
                                             "TCP write failed",
                                             false,
                                         )));
                                     }
                                     // Send error: notify upper layer of connection error for resource cleanup
                                     event_pipe.close(crate::error::CloseReason::Error(format!("{:?}", e)));
+                                    break;
+                                }
+                                Err(_) => {
+                                    tracing::error!("[SEND] TCP write deadline exceeded (session: {})", current_session_id);
+                                    if let Some(completion) = completion {
+                                        completion.complete(Err(crate::error::TransportError::connection_error(
+                                            "TCP write deadline exceeded",
+                                            false,
+                                        )));
+                                    }
+                                    event_pipe.close(crate::error::CloseReason::Error(
+                                        "TCP write deadline exceeded".to_string(),
+                                    ));
                                     break;
                                 }
                             }
@@ -580,13 +600,15 @@ impl<C: Send + Sync + 'static> Connection for TcpAdapter<C> {
         .await
     }
 
-    async fn send_with_receipt(
+    async fn send_with_completion(
         &mut self,
         packet: Packet,
-    ) -> Result<tokio::sync::oneshot::Receiver<Result<(), TransportError>>, TransportError> {
-        crate::adapters::outbound::enqueue_with_receipt(
+        completion: crate::adapters::outbound::WriteCompletion,
+    ) -> Result<(), TransportError> {
+        crate::adapters::outbound::send_with_completion_bounded(
             &self.send_queue,
             packet,
+            completion,
             "tcp_outbound_queue",
             "TCP connection closed",
         )

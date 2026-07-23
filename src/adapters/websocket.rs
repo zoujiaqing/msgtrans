@@ -255,30 +255,50 @@ impl<C> WebSocketAdapter<C> {
                     // [SEND] Handle outgoing data - zero-copy optimization
                     item = send_queue.recv() => {
                         if let Some(item) = item {
-                            let (packet, ack) = (item.packet, item.ack);
+                            let (packet, completion) = (item.packet, item.completion);
                             // tungstenite takes Bytes directly, so the packet's own
                             // Bytes buffer is handed over without another copy.
                             let message = Message::Binary(packet.to_bytes());
 
-                            match stream.send(message).await {
-                                Ok(_) => {
+                            // Deadline: a peer that stops draining kills the
+                            // connection instead of blocking queued senders.
+                            let write = tokio::time::timeout(
+                                crate::adapters::outbound::write_deadline(),
+                                stream.send(message),
+                            ).await;
+                            match write {
+                                Ok(Ok(_)) => {
                                     tracing::debug!("[SEND] WebSocket send successful: {} bytes (session: {})", packet.payload.len(), current_session_id);
-                                    if let Some(ack) = ack {
-                                        let _ = ack.send(Ok(()));
+                                    if let Some(completion) = completion {
+                                        completion.complete(Ok(()));
                                     }
                                     // Send send event
                                     event_pipe.diagnostic(TransportEvent::MessageSent { packet_id: packet.header.message_id });
                                 }
-                                Err(e) => {
+                                Ok(Err(e)) => {
                                     tracing::error!("[ERROR] WebSocket send error: {:?} (session: {})", e, current_session_id);
-                                    if let Some(ack) = ack {
-                                        let _ = ack.send(Err(crate::error::TransportError::connection_error(
+                                    if let Some(completion) = completion {
+                                        completion.complete(Err(crate::error::TransportError::connection_error(
                                             "WebSocket write failed",
                                             false,
                                         )));
                                     }
                                     // Send error: notify upper layer application of connection error for resource cleanup
                                     event_pipe.close(crate::error::CloseReason::Error(format!("{:?}", e)));
+                                    state.set_status(crate::adapters::core::ConnStatus::Closed);
+                                    break;
+                                }
+                                Err(_) => {
+                                    tracing::error!("[ERROR] WebSocket write deadline exceeded (session: {})", current_session_id);
+                                    if let Some(completion) = completion {
+                                        completion.complete(Err(crate::error::TransportError::connection_error(
+                                            "WebSocket write deadline exceeded",
+                                            false,
+                                        )));
+                                    }
+                                    event_pipe.close(crate::error::CloseReason::Error(
+                                        "WebSocket write deadline exceeded".to_string(),
+                                    ));
                                     state.set_status(crate::adapters::core::ConnStatus::Closed);
                                     break;
                                 }
@@ -394,13 +414,15 @@ impl<C: Send + Sync + 'static> Connection for WebSocketAdapter<C> {
         .await
     }
 
-    async fn send_with_receipt(
+    async fn send_with_completion(
         &mut self,
         packet: Packet,
-    ) -> Result<tokio::sync::oneshot::Receiver<Result<(), TransportError>>, TransportError> {
-        crate::adapters::outbound::enqueue_with_receipt(
+        completion: crate::adapters::outbound::WriteCompletion,
+    ) -> Result<(), TransportError> {
+        crate::adapters::outbound::send_with_completion_bounded(
             &self.send_queue,
             packet,
+            completion,
             "websocket_outbound_queue",
             "WebSocket connection closed",
         )
