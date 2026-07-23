@@ -425,14 +425,30 @@ impl TransportClient {
                 break;
             }
         }
-        // Formal join: instant, and idempotent across repeated shutdowns.
-        let handle = self
-            .teardown_task
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        if let Some(handle) = handle {
-            let _ = handle.await;
+        // Formal join, cancellation-proof: the handle is only TAKEN once it is
+        // already finished, so a cancellation landing on the await below can
+        // at worst drop a completed handle — which loses nothing. Until it is
+        // finished, ownership stays in the field for the next caller.
+        loop {
+            let finished = {
+                let slot = self.teardown_task.lock().unwrap_or_else(|e| e.into_inner());
+                match slot.as_ref() {
+                    Some(handle) => handle.is_finished(),
+                    None => break, // someone else already joined it
+                }
+            };
+            if finished {
+                let handle = self
+                    .teardown_task
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take();
+                if let Some(handle) = handle {
+                    let _ = handle.await;
+                }
+                break;
+            }
+            tokio::task::yield_now().await;
         }
         match self
             .teardown_err

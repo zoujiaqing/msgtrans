@@ -565,16 +565,30 @@ async fn outer_cancelled_server_shutdown_then_second_is_clean() {
 /// Cancelling the client shutdown FUTURE loses nothing either: the teardown
 /// task is owned in a field; a second shutdown observes its completion and
 /// performs the formal join.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test] // current_thread ON PURPOSE: the spawned teardown cannot run
+               // until we yield, so the first poll of shutdown() is DETERMINISTICALLY
+               // pending at its observation await — dropping it there is a guaranteed
+               // mid-flight cancellation, not a race.
 async fn outer_cancelled_client_shutdown_then_second_joins() {
     let addr = "127.0.0.1:28899";
     let server = start_server(addr).await;
     let mut client = connect(addr).await;
     assert!(echo_ok(&client).await);
 
-    // Cancel the first shutdown future almost immediately.
-    let _ = tokio::time::timeout(Duration::from_micros(1), client.shutdown()).await;
-    // Second call must resume/observe the owned teardown and fully join.
+    // Poll the shutdown future exactly once, assert it parked at its
+    // observation await (deterministic on current_thread: the spawned
+    // teardown cannot have run yet), then DROP it — a proven mid-flight
+    // cancellation, not a race.
+    {
+        let fut = client.shutdown();
+        tokio::pin!(fut);
+        let first = futures::poll!(fut.as_mut());
+        assert!(
+            first.is_pending(),
+            "first poll must park at the completion watch"
+        );
+    } // dropped here = cancelled
+      // Second call must resume/observe the owned teardown and fully join.
     client.shutdown().await.expect("resumed shutdown");
     assert!(
         client.connect().await.is_err(),

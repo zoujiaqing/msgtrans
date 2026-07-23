@@ -31,6 +31,23 @@ const PHASE_RUNNING: u8 = 2;
 const PHASE_SHUTTING_DOWN: u8 = 3;
 const PHASE_STOPPED: u8 = 4;
 
+/// Fail-fast guard carried by every infra task: if the task ends while the
+/// infra token is NOT cancelled, the exit is abnormal (cancellation is the
+/// only legitimate way out) — flag the failure and cancel the siblings so the
+/// server cannot keep running degraded.
+struct InfraFailFast {
+    cancel: tokio_util::sync::CancellationToken,
+    failed: Arc<std::sync::atomic::AtomicBool>,
+}
+impl Drop for InfraFailFast {
+    fn drop(&mut self) {
+        if !self.cancel.is_cancelled() {
+            self.failed.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.cancel.cancel();
+        }
+    }
+}
+
 const LISTENER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 const DEFAULT_REQUEST_LIFECYCLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -76,6 +93,15 @@ pub struct TransportServer {
     session_tracker: tokio_util::task::TaskTracker,
     /// Per-session cancel tokens (metadata only — no handles live here).
     session_cancels: Arc<dashmap::DashMap<SessionId, tokio_util::sync::CancellationToken>>,
+    /// SINGLE owner of the real listener/scanner tasks. serve() only spawns
+    /// into it and then OBSERVES — cancelling serve() cannot detach a
+    /// listener, because serve() never holds their ownership.
+    infra_tracker: tokio_util::task::TaskTracker,
+    /// Owned watcher that publishes Stopped only after the infra tracker has
+    /// ACTUALLY drained (real joins), never on a guess.
+    infra_supervisor: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Set by the fail-fast guard when any infra task ends abnormally.
+    infra_failed: Arc<std::sync::atomic::AtomicBool>,
     /// Admission gate: closed at shutdown start; add_session refuses (and a
     /// racer that slipped past the gate self-cancels on its re-check), so no
     /// session can be inserted after a shutdown report returns.
@@ -136,6 +162,9 @@ impl TransportServer {
             infra_cancel,
             session_tracker: tokio_util::task::TaskTracker::new(),
             session_cancels: Arc::new(dashmap::DashMap::new()),
+            infra_tracker: tokio_util::task::TaskTracker::new(),
+            infra_supervisor: Arc::new(std::sync::Mutex::new(None)),
+            infra_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             admission_open: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             server_phase: Arc::new(std::sync::atomic::AtomicU8::new(PHASE_IDLE)),
             phase_notify: Arc::new(tokio::sync::watch::channel(PHASE_IDLE).0),
@@ -584,13 +613,42 @@ impl TransportServer {
         let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
         {
             let server = self.clone();
+            let sup_cancel = child_cancel.clone();
             self.session_tracker.spawn(async move {
                 let _ = started_rx.await;
                 let _permit = permit;
-                if let Some(task) = actor_task {
-                    let _ = task.await;
+                // Observe BOTH children concurrently. A JoinError (panic or
+                // abort) from either one cancels the sibling immediately —
+                // otherwise a panicked actor would leave the pump reading the
+                // socket forever, pinning the session and its permit until a
+                // global shutdown.
+                let mut pump_task = pump_task;
+                if let Some(mut actor) = actor_task {
+                    tokio::select! {
+                        r = &mut actor => {
+                            if r.is_err() {
+                                tracing::warn!(
+                                    "[SUPERVISOR] Session {} actor ended abnormally; cancelling sibling",
+                                    session_id
+                                );
+                                sup_cancel.cancel();
+                            }
+                            let _ = pump_task.await;
+                        }
+                        r = &mut pump_task => {
+                            if r.is_err() {
+                                tracing::warn!(
+                                    "[SUPERVISOR] Session {} pump ended abnormally; cancelling sibling",
+                                    session_id
+                                );
+                                sup_cancel.cancel();
+                            }
+                            let _ = actor.await;
+                        }
+                    }
+                } else {
+                    let _ = pump_task.await;
                 }
-                let _ = pump_task.await;
                 let _ = server.remove_session(session_id).await;
                 server.session_cancels.remove(&session_id);
                 tracing::debug!("[SUPERVISOR] Session {} fully finalized", session_id);
@@ -975,18 +1033,13 @@ impl TransportServer {
             ));
         }
         let _ = self.phase_notify.send_replace(PHASE_STARTING);
-        // Whatever exit path serve takes, the phase must end at Stopped —
-        // shutdown's infra join waits for exactly this.
-        struct ServeGuard(TransportServer);
-        impl Drop for ServeGuard {
-            fn drop(&mut self) {
-                self.0.set_phase(PHASE_STOPPED);
-            }
-        }
-        let _serve_guard = ServeGuard(self.clone());
-
+        // No unconditional Stopped guard: publishing Stopped is the owned
+        // infra supervisor's job, AFTER real joins. Pre-infra failure paths
+        // set it explicitly (nothing was ever running). Cancelling this
+        // serve() future is harmless — it is an observer, not an owner.
         if self.protocol_configs.is_empty() {
             tracing::warn!("[WARN] No protocols configured, server cannot start listening");
+            self.set_phase(PHASE_STOPPED);
             return Err(TransportError::config_error(
                 "protocols",
                 "No protocols configured",
@@ -1017,6 +1070,7 @@ impl TransportServer {
                     tracing::error!("[ERROR] {} server build failed: {:?}", protocol_name, e);
                     // `built` drops here: every already-bound endpoint closes
                     // before serve() returns. No accept loop ever started.
+                    self.set_phase(PHASE_STOPPED);
                     return Err(e);
                 }
             }
@@ -1043,16 +1097,22 @@ impl TransportServer {
                         task.abort();
                         let _ = task.await;
                     }
+                    self.set_phase(PHASE_STOPPED);
                     return Err(e);
                 }
             }
         }
 
         listen_tasks.push(self.start_request_timeout_scanner());
+        // All infra tasks are now inside infra_tracker (the single owner);
+        // the local handles above exist only for phase-B failure aborts.
+        drop(listen_tasks);
+        self.infra_tracker.close();
+
         // CAS, not a blind store: a shutdown that raced us during Starting has
         // already published ShuttingDown, and Running must not resurrect the
-        // server past it (the listeners will observe is_running=false and
-        // exit; the guard still lands on Stopped).
+        // server past it (the cancellation token has already fired, so every
+        // infra task exits immediately; the supervisor still lands Stopped).
         if self
             .server_phase
             .compare_exchange(
@@ -1066,29 +1126,32 @@ impl TransportServer {
             let _ = self.phase_notify.send_replace(PHASE_RUNNING);
         }
 
+        // Owned infra supervisor: the ONLY publisher of Stopped, and only
+        // after the tracker has REALLY drained. Its handle lives in a field;
+        // cancelling serve() (a mere observer) cannot detach it.
+        {
+            let server = self.clone();
+            let handle = tokio::spawn(async move {
+                server.infra_tracker.wait().await;
+                server.set_phase(PHASE_STOPPED);
+                tracing::info!("[STOP] TransportServer infra fully joined");
+            });
+            *self
+                .infra_supervisor
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(handle);
+        }
+
         tracing::info!("[TARGET] All protocol servers started, waiting for connections...");
 
-        // Root join via JoinSet: completion/failure is observed in ARRIVAL
-        // order, so a later-started task failing first is seen immediately
-        // (sequential awaits would sit blind on task 0). On any failure the
-        // stop flag drops and the remaining siblings are still drained — no
-        // infra task can outlive serve().
-        let mut join_set = tokio::task::JoinSet::new();
-        for task in listen_tasks {
-            join_set.spawn(async move { task.await });
-        }
-        let mut failed = false;
-        while let Some(res) = join_set.join_next().await {
-            let inner = match res {
-                Ok(inner) => inner,
-                Err(e) => Err(e),
-            };
-            if let Err(e) = inner {
-                tracing::error!("[ERROR] Infra task failed: {:?}", e);
-                failed = true;
+        // Observe (cancel-safe): wait for the supervisor's Stopped.
+        let mut phase_rx = self.phase_notify.subscribe();
+        while self.phase() != PHASE_STOPPED {
+            if phase_rx.changed().await.is_err() {
+                break;
             }
         }
-        if failed {
+        if self.infra_failed.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(TransportError::config_error(
                 "server",
                 "an infrastructure task failed; all siblings were stopped and joined",
@@ -1107,7 +1170,11 @@ impl TransportServer {
     ) -> Result<tokio::task::JoinHandle<()>, TransportError> {
         let server_clone = self.clone();
 
-        let task = tokio::spawn(async move {
+        let task = self.infra_tracker.spawn(async move {
+            let _fail_fast = InfraFailFast {
+                cancel: server_clone.infra_cancel.clone(),
+                failed: server_clone.infra_failed.clone(),
+            };
             tracing::info!("[START] {} listener task started", protocol_name);
 
             let mut accept_count = 0u64;
@@ -1220,7 +1287,11 @@ impl TransportServer {
 
     fn start_request_timeout_scanner(&self) -> tokio::task::JoinHandle<()> {
         let server_clone = self.clone();
-        tokio::spawn(async move {
+        self.infra_tracker.spawn(async move {
+            let _fail_fast = InfraFailFast {
+                cancel: server_clone.infra_cancel.clone(),
+                failed: server_clone.infra_failed.clone(),
+            };
             let tick = server_clone.request_registry.tick_duration();
             tracing::info!(
                 "[START] request timeout scanner started (tick={}ms)",
@@ -1389,6 +1460,28 @@ impl TransportServer {
             }
         };
 
+        // Formal join of the infra supervisor: only taken once finished (a
+        // cancellation here could at worst drop a completed handle).
+        if infra_stopped {
+            let finished = self
+                .infra_supervisor
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .map(|h| h.is_finished())
+                .unwrap_or(false);
+            if finished {
+                let handle = self
+                    .infra_supervisor
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take();
+                if let Some(handle) = handle {
+                    let _ = handle.await;
+                }
+            }
+        }
+
         // Straggler drain: sessions racing the gate self-cancel on their
         // re-check; observe the tracker for the remaining budget.
         if !self.session_tracker.is_empty() {
@@ -1501,6 +1594,9 @@ impl Clone for TransportServer {
             infra_cancel: self.infra_cancel.clone(),
             session_tracker: self.session_tracker.clone(),
             session_cancels: self.session_cancels.clone(),
+            infra_tracker: self.infra_tracker.clone(),
+            infra_supervisor: self.infra_supervisor.clone(),
+            infra_failed: self.infra_failed.clone(),
             admission_open: self.admission_open.clone(),
             server_phase: self.server_phase.clone(),
             phase_notify: self.phase_notify.clone(),
