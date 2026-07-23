@@ -247,6 +247,11 @@ async fn clean_shutdown_completes_serve_and_frees_all_ports() {
     let report = server.shutdown_with_timeout(Duration::from_secs(10)).await;
     assert!(report.clean, "not clean: {:?}", report);
     assert!(report.infra_stopped);
+    assert_eq!(
+        server.live_session_tasks(),
+        0,
+        "clean=true must mean the task tracker is empty"
+    );
 
     // The moment clean=true returns, serve() must ALREADY be finished — no
     // waiting allowed, this is what infra_stopped claims to prove.
@@ -442,10 +447,13 @@ async fn partial_start_failure_frees_already_bound_ports() {
         "serve must fail with the TCP port occupied"
     );
 
-    // Whatever was bound before the failure must be released by now.
+    // Two-phase start: the WS endpoint bound in phase A was dropped before
+    // any accept loop ran, so it is free and no session ever existed.
     tokio::net::TcpListener::bind(ws)
         .await
         .expect("WS port must be free immediately after serve() failed");
+    assert_eq!(server.session_count().await, 0);
+    assert_eq!(server.live_session_tasks(), 0);
 }
 
 /// Fast connect/drop churn cannot leave stale supervisor entries: the
@@ -489,4 +497,131 @@ async fn connect_after_client_shutdown_is_rejected() {
         "a stopped client created a server session"
     );
     drop(client);
+}
+
+/// Cancelling the server shutdown FUTURE loses nothing: the session tasks are
+/// owned by the tracker, wait() is observation-only, so a second shutdown
+/// after unblocking finishes clean.
+#[tokio::test(flavor = "multi_thread")]
+async fn outer_cancelled_server_shutdown_then_second_is_clean() {
+    let addr = "127.0.0.1:28898";
+    let gate = Arc::new(Notify::new());
+    let open = Arc::new(AtomicBool::new(false));
+    let server = TransportServerBuilder::new()
+        .actor_buffer_size(4)
+        .protocol(TcpServerConfig::new(addr).expect("cfg"))
+        .build(Arc::new(GatedEcho {
+            gate: gate.clone(),
+            open: open.clone(),
+        }))
+        .await
+        .expect("server");
+    let bg = server.clone();
+    tokio::spawn(async move {
+        let _ = bg.serve().await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let client = connect(addr).await;
+    for i in 0..12u32 {
+        client
+            .send(format!("{}", i).as_bytes())
+            .await
+            .expect("send");
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Outer timeout CANCELS the shutdown future while the blocked session is
+    // still draining — the owned tracker must not lose the task.
+    let cancelled = tokio::time::timeout(
+        Duration::from_millis(300),
+        server.shutdown_with_timeout(Duration::from_secs(30)),
+    )
+    .await;
+    assert!(
+        cancelled.is_err(),
+        "outer timeout should cancel the shutdown"
+    );
+
+    open.store(true, Ordering::SeqCst);
+    gate.notify_waiters();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while server.live_session_tasks() != 0 {
+        gate.notify_waiters();
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "session task leaked"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let report = server.shutdown_with_timeout(Duration::from_secs(5)).await;
+    assert!(
+        report.clean,
+        "second shutdown after outer cancel: {:?}",
+        report
+    );
+    drop(client);
+}
+
+/// Cancelling the client shutdown FUTURE loses nothing either: the teardown
+/// task is owned in a field; a second shutdown observes its completion and
+/// performs the formal join.
+#[tokio::test(flavor = "multi_thread")]
+async fn outer_cancelled_client_shutdown_then_second_joins() {
+    let addr = "127.0.0.1:28899";
+    let server = start_server(addr).await;
+    let mut client = connect(addr).await;
+    assert!(echo_ok(&client).await);
+
+    // Cancel the first shutdown future almost immediately.
+    let _ = tokio::time::timeout(Duration::from_micros(1), client.shutdown()).await;
+    // Second call must resume/observe the owned teardown and fully join.
+    client.shutdown().await.expect("resumed shutdown");
+    assert!(
+        client.connect().await.is_err(),
+        "stopped client must refuse connect"
+    );
+    drop(client);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while server.session_count().await != 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "session not released"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// serve() racing shutdown() cannot resurrect the server: with the flag gone,
+/// listeners are cancellation-driven, and Running is only published from
+/// Starting. Whatever the interleave, the end state is stopped + refusing.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_serve_and_shutdown_cannot_resurrect() {
+    let addr = "127.0.0.1:28900";
+    let server = TransportServerBuilder::new()
+        .protocol(TcpServerConfig::new(addr).expect("cfg"))
+        .build(Arc::new(Echo))
+        .await
+        .expect("server");
+    let serve_handle = {
+        let s = server.clone();
+        tokio::spawn(async move { s.serve().await })
+    };
+    // Race shutdown against serve's startup.
+    let report = server.shutdown_with_timeout(Duration::from_secs(5)).await;
+    // serve() must terminate — no listener may keep running past shutdown.
+    let _ = tokio::time::timeout(Duration::from_secs(3), serve_handle)
+        .await
+        .expect("serve() must terminate after concurrent shutdown");
+    assert!(report.infra_stopped || server.live_session_tasks() == 0);
+    // And nothing accepts anymore.
+    let cfg = TcpClientConfig::new(addr).expect("cfg");
+    let mut c = TransportClientBuilder::new()
+        .protocol(cfg)
+        .build()
+        .await
+        .expect("client");
+    assert!(
+        c.connect().await.is_err(),
+        "no listener may survive the shutdown race"
+    );
 }

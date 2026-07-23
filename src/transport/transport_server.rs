@@ -48,7 +48,6 @@ pub struct TransportServer {
     session_handles: Arc<LockFreeHashMap<SessionId, SessionHandle>>,
     session_id_generator: Arc<std::sync::atomic::AtomicU64>,
     stats: Arc<LockFreeHashMap<SessionId, TransportStats>>,
-    is_running: Arc<std::sync::atomic::AtomicBool>,
     protocol_configs:
         std::collections::HashMap<String, Box<dyn crate::protocol::adapter::DynServerConfig>>,
     state_manager: ConnectionStateManager,
@@ -64,13 +63,19 @@ pub struct TransportServer {
     connection_permits: Arc<tokio::sync::Semaphore>,
     /// Configured cap, kept for logging only (the semaphore is the enforcer).
     max_connections: usize,
-    /// Root cancellation: shutdown cancels it; every session gets a child.
+    /// Root cancellation: shutdown cancels it; every session and the infra
+    /// token are children, so one cancel reaches everything.
     root_cancel: tokio_util::sync::CancellationToken,
-    /// One supervisor entry per live session: owns the session-supervisor
-    /// JoinHandle (which itself owns and joins the actor + pump handles and
-    /// releases the connection permit when both are done). Nothing session-
-    /// scoped is ever spawned detached.
-    session_supervisors: Arc<dashmap::DashMap<SessionId, SessionSupervisorEntry>>,
+    /// Infra (listeners + scanner) cancellation — child of root, so shutdown
+    /// stops it too, while stop() can stop accepting without killing sessions.
+    infra_cancel: tokio_util::sync::CancellationToken,
+    /// SINGLE owner of every session-supervisor task. Session handles never
+    /// enter a cancellable public future: shutdown only cancels and then
+    /// observes `tracker.wait()` (cancel-safe, repeatable). Tracker emptiness
+    /// IS the proof that every actor+pump ended and every permit returned.
+    session_tracker: tokio_util::task::TaskTracker,
+    /// Per-session cancel tokens (metadata only — no handles live here).
+    session_cancels: Arc<dashmap::DashMap<SessionId, tokio_util::sync::CancellationToken>>,
     /// Admission gate: closed at shutdown start; add_session refuses (and a
     /// racer that slipped past the gate self-cancels on its re-check), so no
     /// session can be inserted after a shutdown report returns.
@@ -80,23 +85,9 @@ pub struct TransportServer {
     /// only NOTIFIES phase changes; it is never the truth.
     server_phase: Arc<std::sync::atomic::AtomicU8>,
     phase_notify: Arc<tokio::sync::watch::Sender<u8>>,
-    /// Session-completion channel: supervisors send their id as their last
-    /// act; the reaper is the ONE owner that joins the finished supervisor
-    /// handle and removes the registry entry. Session tasks never remove
-    /// their own ownership.
-    reaper_tx: tokio::sync::mpsc::UnboundedSender<SessionId>,
-    /// The reaper's JoinHandle — owned here, not detached. It runs for the
-    /// server object's lifetime and exits when the last sender drops.
-    reaper_task: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// Serializes shutdown owners; concurrent/repeat shutdowns queue here and
     /// re-run the idempotent flow (instant once everything is drained).
     shutdown_lock: Arc<tokio::sync::Mutex<()>>,
-}
-
-/// Supervisor entry for one session (see `session_supervisors`).
-struct SessionSupervisorEntry {
-    cancel: tokio_util::sync::CancellationToken,
-    task: tokio::task::JoinHandle<()>,
 }
 
 impl TransportServer {
@@ -119,7 +110,8 @@ impl TransportServer {
         buffer_size: Option<usize>,
     ) -> Result<Self, TransportError> {
         let ctx = Arc::new(crate::transport::context::TransportContext::new().await?);
-        let (reaper_tx, reaper_rx) = tokio::sync::mpsc::unbounded_channel();
+        let root_cancel = tokio_util::sync::CancellationToken::new();
+        let infra_cancel = root_cancel.child_token();
 
         let server = Self {
             config,
@@ -128,7 +120,6 @@ impl TransportServer {
             session_handles: Arc::new(LockFreeHashMap::new()),
             session_id_generator: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             stats: Arc::new(LockFreeHashMap::new()),
-            is_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             protocol_configs,
             state_manager: ConnectionStateManager::new(),
             request_registry: Arc::new(
@@ -141,16 +132,15 @@ impl TransportServer {
                 tokio::sync::Semaphore::MAX_PERMITS,
             )),
             max_connections: usize::MAX,
-            root_cancel: tokio_util::sync::CancellationToken::new(),
-            session_supervisors: Arc::new(dashmap::DashMap::new()),
+            root_cancel,
+            infra_cancel,
+            session_tracker: tokio_util::task::TaskTracker::new(),
+            session_cancels: Arc::new(dashmap::DashMap::new()),
             admission_open: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             server_phase: Arc::new(std::sync::atomic::AtomicU8::new(PHASE_IDLE)),
             phase_notify: Arc::new(tokio::sync::watch::channel(PHASE_IDLE).0),
-            reaper_tx,
-            reaper_task: Arc::new(std::sync::Mutex::new(None)),
             shutdown_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
-        server.spawn_reaper(reaper_rx);
         Ok(server)
     }
 
@@ -583,15 +573,18 @@ impl TransportServer {
         // exactly when the whole session runtime is done, not earlier — and
         // removes its own entry. Shutdown joins whichever supervisors are
         // still running; normal session end needs no shutdown involvement.
-        // Registration barrier: the supervisor may not begin until its entry
-        // is registered, so "task completes before registration" cannot leave
-        // a stale entry. The supervisor never removes its own ownership; it
-        // signals completion (last statement) and the reaper — the one
-        // external owner — joins the handle and removes the entry.
+        // Registration barrier: the supervisor may not begin until its cancel
+        // token is registered, so "completes before registration" cannot
+        // strand metadata. OWNERSHIP: the supervisor task lives in the
+        // server's TaskTracker — the single owner. Its handle never enters a
+        // cancellable public future; shutdown only cancels tokens and then
+        // observes tracker.wait(). The task cleans the session maps and its
+        // own token entry (metadata only), and the permit drops exactly when
+        // it returns — which is exactly when the tracker stops counting it.
         let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
-        let supervisor = {
+        {
             let server = self.clone();
-            tokio::spawn(async move {
+            self.session_tracker.spawn(async move {
                 let _ = started_rx.await;
                 let _permit = permit;
                 if let Some(task) = actor_task {
@@ -599,17 +592,12 @@ impl TransportServer {
                 }
                 let _ = pump_task.await;
                 let _ = server.remove_session(session_id).await;
+                server.session_cancels.remove(&session_id);
                 tracing::debug!("[SUPERVISOR] Session {} fully finalized", session_id);
-                let _ = server.reaper_tx.send(session_id);
-            })
-        };
-        self.session_supervisors.insert(
-            session_id,
-            SessionSupervisorEntry {
-                cancel: child_cancel.clone(),
-                task: supervisor,
-            },
-        );
+            });
+        }
+        self.session_cancels
+            .insert(session_id, child_cancel.clone());
         let _ = started_tx.send(());
 
         // Admission re-check: a shutdown that started between the gate check
@@ -676,27 +664,6 @@ impl TransportServer {
 
     fn phase(&self) -> u8 {
         self.server_phase.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    /// The single external owner of finished session supervisors: receives a
-    /// completion signal (sent as the supervisor's last statement), joins the
-    /// handle — proving the task returned and its permit dropped — and only
-    /// then removes the registry entry. A shutdown that raced the completion
-    /// and holds the entry out simply wins; the reaper's remove is a no-op.
-    fn spawn_reaper(&self, mut rx: tokio::sync::mpsc::UnboundedReceiver<SessionId>) {
-        let supervisors = self.session_supervisors.clone();
-        let handle = tokio::spawn(async move {
-            while let Some(session_id) = rx.recv().await {
-                if let Some((_, entry)) = supervisors.remove(&session_id) {
-                    // The signal is sent just before return, so this join is
-                    // effectively instant — the reaper never blocks on a live
-                    // session. Ownership note: remove() is the arbiter — either
-                    // the reaper or a shutdown gets the entry, never both.
-                    let _ = entry.task.await;
-                }
-            }
-        });
-        *self.reaper_task.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
     }
 
     /// Handle one pumped transport event for a session: complete server-side
@@ -1017,13 +984,9 @@ impl TransportServer {
             }
         }
         let _serve_guard = ServeGuard(self.clone());
-        self.is_running
-            .store(true, std::sync::atomic::Ordering::SeqCst);
 
         if self.protocol_configs.is_empty() {
             tracing::warn!("[WARN] No protocols configured, server cannot start listening");
-            self.is_running
-                .store(false, std::sync::atomic::Ordering::SeqCst);
             return Err(TransportError::config_error(
                 "protocols",
                 "No protocols configured",
@@ -1035,75 +998,51 @@ impl TransportServer {
             self.protocol_configs.len()
         );
 
-        // Create vector of listen tasks
-        let mut listen_tasks = Vec::new();
-
-        // Start server for each protocol configuration
+        // TWO-PHASE start. Phase A binds every protocol endpoint WITHOUT
+        // starting any accept loop; a failure here just drops the already-
+        // bound servers (sockets close on drop — no task ever ran, so no
+        // session can have been admitted before a later bind fails). Phase B
+        // then starts all accept loops together.
+        let mut built = Vec::new();
         for (protocol_name, protocol_config) in &self.protocol_configs {
-            tracing::info!("[CONFIG] Processing protocol: {}", protocol_name);
-
             let address = self.get_protocol_bind_address(protocol_config);
             tracing::info!(
                 "[BIND] Protocol {} bind address: {}",
                 protocol_name,
                 address
             );
-
             match protocol_config.build_server_dyn().await {
-                Ok(server) => {
-                    match self
-                        .start_protocol_listener(server, protocol_name.clone())
-                        .await
-                    {
-                        Ok(listener_task) => {
-                            listen_tasks.push(listener_task);
-                            tracing::info!(
-                                "[SUCCESS] {} server started successfully: {}",
-                                protocol_name,
-                                address
-                            );
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                "[ERROR] {} listener task creation failed: {:?}",
-                                protocol_name,
-                                e
-                            );
-                            self.is_running
-                                .store(false, std::sync::atomic::Ordering::SeqCst);
-                            // Cancel siblings and JOIN them: a partial start
-                            // must release every already-bound endpoint before
-                            // this returns (Stopped is published by the guard).
-                            for task in listen_tasks {
-                                task.abort();
-                                let _ = task.await;
-                            }
-                            // Sessions admitted through the listeners that DID start
-                            // must not leak past this failure: close admission
-                            // and cancel the root — their supervisors cascade
-                            // and the reaper reaps them.
-                            self.admission_open
-                                .store(false, std::sync::atomic::Ordering::SeqCst);
-                            self.root_cancel.cancel();
-                            return Err(e);
-                        }
-                    }
-                }
+                Ok(server) => built.push((protocol_name.clone(), server)),
                 Err(e) => {
                     tracing::error!("[ERROR] {} server build failed: {:?}", protocol_name, e);
-                    self.is_running
+                    // `built` drops here: every already-bound endpoint closes
+                    // before serve() returns. No accept loop ever started.
+                    return Err(e);
+                }
+            }
+        }
+
+        let mut listen_tasks = Vec::new();
+        for (protocol_name, server) in built {
+            match self
+                .start_protocol_listener(server, protocol_name.clone())
+                .await
+            {
+                Ok(task) => {
+                    listen_tasks.push(task);
+                    tracing::info!("[SUCCESS] {} listener started", protocol_name);
+                }
+                Err(e) => {
+                    tracing::error!("[ERROR] {} listener start failed: {:?}", protocol_name, e);
+                    // Stop and JOIN the accept loops that did start, and tear
+                    // down anything they admitted in the window.
+                    self.admission_open
                         .store(false, std::sync::atomic::Ordering::SeqCst);
+                    self.root_cancel.cancel();
                     for task in listen_tasks {
                         task.abort();
                         let _ = task.await;
                     }
-                    // Sessions admitted through the listeners that DID start
-                    // must not leak past this failure: close admission
-                    // and cancel the root — their supervisors cascade
-                    // and the reaper reaps them.
-                    self.admission_open
-                        .store(false, std::sync::atomic::Ordering::SeqCst);
-                    self.root_cancel.cancel();
                     return Err(e);
                 }
             }
@@ -1147,8 +1086,6 @@ impl TransportServer {
             if let Err(e) = inner {
                 tracing::error!("[ERROR] Infra task failed: {:?}", e);
                 failed = true;
-                self.is_running
-                    .store(false, std::sync::atomic::Ordering::SeqCst);
             }
         }
         if failed {
@@ -1176,26 +1113,23 @@ impl TransportServer {
             let mut accept_count = 0u64;
 
             loop {
-                if !server_clone
-                    .is_running
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                {
-                    tracing::info!("[STOP] {} listener received stop signal", protocol_name);
-                    break;
-                }
-
                 tracing::debug!(
                     "[LOOP] {} waiting for connections... (accept count: {})",
                     protocol_name,
                     accept_count
                 );
 
-                match tokio::time::timeout(LISTENER_POLL_INTERVAL, server.accept()).await {
-                    Err(_) => {
-                        // Poll timeout, loop again and check stop flag.
-                        continue;
+                // Cancellation-driven, not flag-polled: there is no second
+                // truth source that a racing serve() could re-arm.
+                let accept_result = tokio::select! {
+                    _ = server_clone.infra_cancel.cancelled() => {
+                        tracing::info!("[STOP] {} listener cancelled", protocol_name);
+                        break;
                     }
-                    Ok(accept_result) => match accept_result {
+                    r = server.accept() => r,
+                };
+                {
+                    match accept_result {
                         Ok(mut connection) => {
                             accept_count += 1;
                             tracing::info!(
@@ -1254,10 +1188,7 @@ impl TransportServer {
                                 .await;
                         }
                         Err(e) => {
-                            if !server_clone
-                                .is_running
-                                .load(std::sync::atomic::Ordering::SeqCst)
-                            {
+                            if server_clone.infra_cancel.is_cancelled() {
                                 tracing::info!(
                                     "[STOP] {} listener stopping after accept exit: {:?}",
                                     protocol_name,
@@ -1273,7 +1204,7 @@ impl TransportServer {
                             tokio::time::sleep(LISTENER_POLL_INTERVAL).await;
                             continue;
                         }
-                    },
+                    }
                 }
             }
 
@@ -1297,14 +1228,10 @@ impl TransportServer {
             );
 
             loop {
-                if !server_clone
-                    .is_running
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                {
-                    break;
+                tokio::select! {
+                    _ = server_clone.infra_cancel.cancelled() => break,
+                    _ = tokio::time::sleep(tick) => {}
                 }
-
-                tokio::time::sleep(tick).await;
                 let timed_out = server_clone.request_registry.scan_timeout_bucket();
                 if timed_out > 0 {
                     tracing::warn!(
@@ -1326,14 +1253,12 @@ impl TransportServer {
         protocol_config.get_bind_address()
     }
 
-    /// [STOP] Stop server
-    ///
-    /// Only flips the accept flag; listeners exit on their next poll but
-    /// nothing is awaited. For a verifiable teardown use [`Self::shutdown`].
+    /// [STOP] Stop accepting new connections (listeners + scanner). Existing
+    /// sessions keep running; nothing is awaited. For a verifiable teardown
+    /// use [`Self::shutdown`].
     pub async fn stop(&self) {
-        tracing::info!("[STOP] Stopping TransportServer");
-        self.is_running
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+        tracing::info!("[STOP] Stopping TransportServer accept path");
+        self.infra_cancel.cancel();
     }
 
     /// Graceful, awaitable shutdown with a default 10s deadline.
@@ -1420,8 +1345,6 @@ impl TransportServer {
         // Phase 1: gate + stop infra.
         self.admission_open
             .store(false, std::sync::atomic::Ordering::SeqCst);
-        self.is_running
-            .store(false, std::sync::atomic::Ordering::SeqCst);
 
         // Phase 2: graceful offer, then cancel — both non-blocking, so no
         // session can stall this phase.
@@ -1433,48 +1356,20 @@ impl TransportServer {
             }
         }
         self.root_cancel.cancel();
+        // TaskTracker::wait completes only once the tracker is closed AND
+        // empty; close() is idempotent, and the admission gate already
+        // prevents meaningful new sessions.
+        self.session_tracker.close();
 
-        // Phase 3: join session supervisors within the budget. Joining the
-        // supervisor is the proof: actor + pump ended, maps cleaned, permit
-        // released. On timeout the entry is re-inserted — still owned.
-        let sids: Vec<SessionId> = self.session_supervisors.iter().map(|e| *e.key()).collect();
-        let mut sessions_closed = 0usize;
-        for sid in sids {
-            let Some((_, entry)) = self.session_supervisors.remove(&sid) else {
-                sessions_closed += 1; // reaper got there first
-                continue;
-            };
-            // Cancel-safety: if THIS shutdown future is dropped mid-join, the
-            // guard re-inserts the entry — the removed JoinHandle is never
-            // lost with the cancelled future.
-            struct Reinsert<'a> {
-                map: &'a dashmap::DashMap<SessionId, SessionSupervisorEntry>,
-                sid: SessionId,
-                entry: Option<SessionSupervisorEntry>,
-            }
-            impl Drop for Reinsert<'_> {
-                fn drop(&mut self) {
-                    if let Some(entry) = self.entry.take() {
-                        self.map.insert(self.sid, entry);
-                    }
-                }
-            }
-            let mut guard = Reinsert {
-                map: &self.session_supervisors,
-                sid,
-                entry: Some(entry),
-            };
-            let task = &mut guard.entry.as_mut().expect("present").task;
-            match tokio::time::timeout_at(deadline, task).await {
-                Ok(_) => {
-                    guard.entry.take(); // joined: consume, do not re-insert
-                    sessions_closed += 1;
-                }
-                Err(_) => {
-                    // Budget exhausted: guard's Drop re-inserts — still owned.
-                }
-            }
-        }
+        // Phase 3: observe completion through the single owner. The tracker
+        // owns every session-supervisor task; wait() is a pure observation —
+        // cancel-safe, repeatable, and it can never lose a handle because no
+        // handle is ever moved into this future. Tracker emptiness proves all
+        // actors and pumps ended and all permits returned.
+        let initial_sessions = self.session_tracker.len();
+        let _ = tokio::time::timeout_at(deadline, self.session_tracker.wait()).await;
+        let sessions_remaining = self.session_tracker.len();
+        let sessions_closed = initial_sessions.saturating_sub(sessions_remaining);
 
         // Phase 4: infra join — wait for serve()'s guard to publish Stopped,
         // which happens only after every listener and the scanner have been
@@ -1494,17 +1389,13 @@ impl TransportServer {
             }
         };
 
-        // Straggler drain: sessions racing the gate self-cancel; give their
-        // supervisors the remaining budget to finish.
-        while !self.session_supervisors.is_empty() && tokio::time::Instant::now() < deadline {
-            let pause = std::cmp::min(
-                deadline,
-                tokio::time::Instant::now() + std::time::Duration::from_millis(10),
-            );
-            tokio::time::sleep_until(pause).await;
+        // Straggler drain: sessions racing the gate self-cancel on their
+        // re-check; observe the tracker for the remaining budget.
+        if !self.session_tracker.is_empty() {
+            let _ = tokio::time::timeout_at(deadline, self.session_tracker.wait()).await;
         }
 
-        let sessions_remaining = self.session_supervisors.len().max(self.transports.len());
+        let sessions_remaining = self.session_tracker.len().max(self.transports.len());
         let permits_restored = self.max_connections == usize::MAX
             || self.connection_permits.available_permits() == self.max_connections;
         let clean = sessions_remaining == 0 && infra_stopped && permits_restored;
@@ -1533,7 +1424,7 @@ impl TransportServer {
         started: std::time::Instant,
         sessions_closed: usize,
     ) -> ShutdownReport {
-        let sessions_remaining = self.session_supervisors.len().max(self.transports.len());
+        let sessions_remaining = self.session_tracker.len().max(self.transports.len());
         let infra_stopped = self.phase() == PHASE_STOPPED;
         let permits_restored = self.max_connections == usize::MAX
             || self.connection_permits.available_permits() == self.max_connections;
@@ -1551,6 +1442,13 @@ impl TransportServer {
     #[doc(hidden)]
     pub fn available_permits(&self) -> usize {
         self.connection_permits.available_permits()
+    }
+
+    /// Test/introspection accessor: live session-supervisor tasks in the
+    /// tracker (the single owner). 0 when every session runtime has ended.
+    #[doc(hidden)]
+    pub fn live_session_tasks(&self) -> usize {
+        self.session_tracker.len()
     }
 }
 
@@ -1590,7 +1488,6 @@ impl Clone for TransportServer {
             transports: self.transports.clone(),
             session_id_generator: self.session_id_generator.clone(),
             stats: self.stats.clone(),
-            is_running: self.is_running.clone(),
             protocol_configs: cloned_configs,
             state_manager: self.state_manager.clone(),
             request_registry: self.request_registry.clone(),
@@ -1601,12 +1498,12 @@ impl Clone for TransportServer {
             connection_permits: self.connection_permits.clone(),
             max_connections: self.max_connections,
             root_cancel: self.root_cancel.clone(),
-            session_supervisors: self.session_supervisors.clone(),
+            infra_cancel: self.infra_cancel.clone(),
+            session_tracker: self.session_tracker.clone(),
+            session_cancels: self.session_cancels.clone(),
             admission_open: self.admission_open.clone(),
             server_phase: self.server_phase.clone(),
             phase_notify: self.phase_notify.clone(),
-            reaper_tx: self.reaper_tx.clone(),
-            reaper_task: self.reaper_task.clone(),
             shutdown_lock: self.shutdown_lock.clone(),
         }
     }

@@ -154,6 +154,12 @@ pub struct TransportClient {
     /// receiver is gone, so a new connection could never receive events and
     /// would be a half-alive lie.
     phase: Arc<AtomicU8>,
+    /// The owned teardown task (spawned once, handle stored HERE — never in a
+    /// cancellable public future). shutdown() only observes its completion
+    /// watch, so cancelling shutdown() loses nothing.
+    teardown_task: Arc<std::sync::Mutex<Option<JoinHandle<()>>>>,
+    teardown_done: Arc<tokio::sync::watch::Sender<bool>>,
+    teardown_err: Arc<std::sync::Mutex<Option<TransportError>>>,
 }
 
 const CLIENT_ACTIVE: u8 = 0;
@@ -183,6 +189,9 @@ impl TransportClient {
             event_forwarding_task: Arc::new(RwLock::new(None)),
             forwarding_abort: Arc::new(std::sync::Mutex::new(None)),
             phase: Arc::new(AtomicU8::new(CLIENT_ACTIVE)),
+            teardown_task: Arc::new(std::sync::Mutex::new(None)),
+            teardown_done: Arc::new(tokio::sync::watch::channel(false).0),
+            teardown_err: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -351,14 +360,13 @@ impl TransportClient {
     /// `connect()` again); `shutdown()` ends the client. After it returns, no
     /// background task of this client is running.
     pub async fn shutdown(&mut self) -> Result<(), TransportError> {
-        // Lifecycle gate: Stopped is done; Active transitions to
-        // ShuttingDown; a leftover ShuttingDown (a previous shutdown future
-        // was cancelled mid-flight) is RESUMED, not reported as success — the
-        // body below is idempotent, so re-running it finishes the teardown.
+        // Lifecycle gate: Active starts the teardown; ShuttingDown (including
+        // a shutdown future that was cancelled mid-flight) resumes by
+        // OBSERVING the owned task; Stopped is done.
         loop {
             match self.phase.load(Ordering::SeqCst) {
-                CLIENT_STOPPED => return Ok(()),
-                CLIENT_SHUTTING_DOWN => break, // resume interrupted teardown
+                CLIENT_STOPPED => break,
+                CLIENT_SHUTTING_DOWN => break,
                 _ => {
                     if self
                         .phase
@@ -375,26 +383,65 @@ impl TransportClient {
                 }
             }
         }
-        // Graceful disconnect; a failure while actually connected is real and
-        // must not be swallowed — but teardown continues regardless.
-        let was_connected = self.is_connected().await;
-        let disconnect_result = self.disconnect().await;
 
-        let handle = self.event_forwarding_task.write().await.take();
-        if let Some(handle) = handle {
-            handle.abort();
-            let _ = handle.await; // abort guarantees prompt completion
+        // Spawn the owned teardown exactly once. The task captures only Arcs;
+        // its handle lives in the field, so no caller cancellation can drop
+        // it. All the destructive work happens inside it.
+        {
+            let mut slot = self.teardown_task.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.is_none() && self.phase.load(Ordering::SeqCst) != CLIENT_STOPPED {
+                let transport = self.inner.clone();
+                let forwarding = self.event_forwarding_task.clone();
+                let abort_slot = self.forwarding_abort.clone();
+                let running = self.event_forwarding_running.clone();
+                let phase = self.phase.clone();
+                let done = self.teardown_done.clone();
+                let err_slot = self.teardown_err.clone();
+                *slot = Some(tokio::spawn(async move {
+                    let was_connected = transport.current_session_id().await.is_some();
+                    if let Err(e) = transport.disconnect().await {
+                        if was_connected {
+                            *err_slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+                        }
+                    }
+                    let handle = forwarding.write().await.take();
+                    if let Some(handle) = handle {
+                        handle.abort();
+                        let _ = handle.await; // abort guarantees completion
+                    }
+                    abort_slot.lock().unwrap_or_else(|p| p.into_inner()).take();
+                    running.store(false, Ordering::SeqCst);
+                    phase.store(CLIENT_STOPPED, Ordering::SeqCst);
+                    let _ = done.send_replace(true);
+                }));
+            }
         }
-        self.forwarding_abort
+
+        // Observe completion (repeatable and cancel-safe: this is a watch,
+        // not the task handle).
+        let mut done_rx = self.teardown_done.subscribe();
+        while !*done_rx.borrow() {
+            if done_rx.changed().await.is_err() {
+                break;
+            }
+        }
+        // Formal join: instant, and idempotent across repeated shutdowns.
+        let handle = self
+            .teardown_task
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
-        self.event_forwarding_running.store(false, Ordering::SeqCst);
-        self.phase.store(CLIENT_STOPPED, Ordering::SeqCst);
-
-        match disconnect_result {
-            Err(e) if was_connected => Err(e),
-            _ => Ok(()),
+        if let Some(handle) = handle {
+            let _ = handle.await;
+        }
+        match self
+            .teardown_err
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            Some(e) => Err(e),
+            None => Ok(()),
         }
     }
 
