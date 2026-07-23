@@ -102,6 +102,8 @@ pub struct TransportServer {
     infra_supervisor: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// Set by the fail-fast guard when any infra task ends abnormally.
     infra_failed: Arc<std::sync::atomic::AtomicBool>,
+    /// Startup error captured by the owned startup task for serve() to return.
+    serve_error: Arc<std::sync::Mutex<Option<TransportError>>>,
     /// Admission gate: closed at shutdown start; add_session refuses (and a
     /// racer that slipped past the gate self-cancels on its re-check), so no
     /// session can be inserted after a shutdown report returns.
@@ -165,6 +167,7 @@ impl TransportServer {
             infra_tracker: tokio_util::task::TaskTracker::new(),
             infra_supervisor: Arc::new(std::sync::Mutex::new(None)),
             infra_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            serve_error: Arc::new(std::sync::Mutex::new(None)),
             admission_open: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             server_phase: Arc::new(std::sync::atomic::AtomicU8::new(PHASE_IDLE)),
             phase_notify: Arc::new(tokio::sync::watch::channel(PHASE_IDLE).0),
@@ -1033,29 +1036,87 @@ impl TransportServer {
             ));
         }
         let _ = self.phase_notify.send_replace(PHASE_STARTING);
-        // No unconditional Stopped guard: publishing Stopped is the owned
-        // infra supervisor's job, AFTER real joins. Pre-infra failure paths
-        // set it explicitly (nothing was ever running). Cancelling this
-        // serve() future is harmless — it is an observer, not an owner.
-        if self.protocol_configs.is_empty() {
-            tracing::warn!("[WARN] No protocols configured, server cannot start listening");
-            self.set_phase(PHASE_STOPPED);
+
+        // The ENTIRE startup (bind, listener spawn, run, drain) lives in one
+        // OWNED task, installed synchronously before serve()'s first await —
+        // so cancelling serve() at ANY point, including during a slow protocol
+        // build, detaches nothing and cannot wedge the phase: the owned task
+        // (or its guard) always drives the phase to Stopped.
+        {
+            let server = self.clone();
+            let handle = tokio::spawn(async move {
+                server.startup_and_supervise().await;
+            });
+            *self
+                .infra_supervisor
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(handle);
+        }
+
+        // Observe (cancel-safe): wait for the owned task to publish Stopped.
+        let mut phase_rx = self.phase_notify.subscribe();
+        while self.phase() != PHASE_STOPPED {
+            if phase_rx.changed().await.is_err() {
+                break;
+            }
+        }
+        if let Some(e) = self
+            .serve_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            return Err(e);
+        }
+        if self.infra_failed.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(TransportError::config_error(
-                "protocols",
-                "No protocols configured",
+                "server",
+                "an infrastructure task failed; all siblings were stopped and joined",
             ));
         }
 
+        tracing::info!("[STOP] TransportServer stopped");
+        Ok(())
+    }
+
+    /// The OWNED startup + supervision body: binds every protocol (Phase A,
+    /// interruptible by root cancellation), starts all accept loops (Phase B),
+    /// publishes Running, waits for the infra tracker to drain, and publishes
+    /// Stopped. A guard guarantees Stopped (and sibling teardown) even on
+    /// panic — the phase can never wedge in Starting.
+    async fn startup_and_supervise(&self) {
+        struct StartupGuard(TransportServer);
+        impl Drop for StartupGuard {
+            fn drop(&mut self) {
+                if self.0.phase() != PHASE_STOPPED {
+                    self.0
+                        .admission_open
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                    self.0.root_cancel.cancel();
+                    self.0.set_phase(PHASE_STOPPED);
+                }
+            }
+        }
+        let guard = StartupGuard(self.clone());
+        let fail = |e: TransportError| {
+            *self.serve_error.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+        };
+
+        if self.protocol_configs.is_empty() {
+            tracing::warn!("[WARN] No protocols configured, server cannot start listening");
+            fail(TransportError::config_error(
+                "protocols",
+                "No protocols configured",
+            ));
+            return; // guard publishes Stopped
+        }
         tracing::info!(
             "[START] Starting {} protocol servers",
             self.protocol_configs.len()
         );
 
-        // TWO-PHASE start. Phase A binds every protocol endpoint WITHOUT
-        // starting any accept loop; a failure here just drops the already-
-        // bound servers (sockets close on drop — no task ever ran, so no
-        // session can have been admitted before a later bind fails). Phase B
-        // then starts all accept loops together.
+        // Phase A: bind every endpoint, no accept loop running. Interruptible:
+        // a shutdown during a slow build cancels the root token and we stop.
         let mut built = Vec::new();
         for (protocol_name, protocol_config) in &self.protocol_configs {
             let address = self.get_protocol_bind_address(protocol_config);
@@ -1064,18 +1125,28 @@ impl TransportServer {
                 protocol_name,
                 address
             );
-            match protocol_config.build_server_dyn().await {
+            let build = tokio::select! {
+                _ = self.root_cancel.cancelled() => {
+                    tracing::info!("[STOP] Startup cancelled during {} build", protocol_name);
+                    fail(TransportError::config_error(
+                        "server",
+                        "startup cancelled by shutdown",
+                    ));
+                    return; // built drops -> bound endpoints close; guard -> Stopped
+                }
+                r = protocol_config.build_server_dyn() => r,
+            };
+            match build {
                 Ok(server) => built.push((protocol_name.clone(), server)),
                 Err(e) => {
                     tracing::error!("[ERROR] {} server build failed: {:?}", protocol_name, e);
-                    // `built` drops here: every already-bound endpoint closes
-                    // before serve() returns. No accept loop ever started.
-                    self.set_phase(PHASE_STOPPED);
-                    return Err(e);
+                    fail(e);
+                    return; // built drops; guard -> Stopped
                 }
             }
         }
 
+        // Phase B: start all accept loops together (tracker-owned).
         let mut listen_tasks = Vec::new();
         for (protocol_name, server) in built {
             match self
@@ -1088,8 +1159,6 @@ impl TransportServer {
                 }
                 Err(e) => {
                     tracing::error!("[ERROR] {} listener start failed: {:?}", protocol_name, e);
-                    // Stop and JOIN the accept loops that did start, and tear
-                    // down anything they admitted in the window.
                     self.admission_open
                         .store(false, std::sync::atomic::Ordering::SeqCst);
                     self.root_cancel.cancel();
@@ -1097,22 +1166,18 @@ impl TransportServer {
                         task.abort();
                         let _ = task.await;
                     }
-                    self.set_phase(PHASE_STOPPED);
-                    return Err(e);
+                    fail(e);
+                    return; // guard -> Stopped
                 }
             }
         }
-
         listen_tasks.push(self.start_request_timeout_scanner());
-        // All infra tasks are now inside infra_tracker (the single owner);
-        // the local handles above exist only for phase-B failure aborts.
         drop(listen_tasks);
         self.infra_tracker.close();
 
         // CAS, not a blind store: a shutdown that raced us during Starting has
-        // already published ShuttingDown, and Running must not resurrect the
-        // server past it (the cancellation token has already fired, so every
-        // infra task exits immediately; the supervisor still lands Stopped).
+        // already published ShuttingDown; Running must not resurrect past it
+        // (the cancelled token makes every infra task exit immediately).
         if self
             .server_phase
             .compare_exchange(
@@ -1125,41 +1190,13 @@ impl TransportServer {
         {
             let _ = self.phase_notify.send_replace(PHASE_RUNNING);
         }
-
-        // Owned infra supervisor: the ONLY publisher of Stopped, and only
-        // after the tracker has REALLY drained. Its handle lives in a field;
-        // cancelling serve() (a mere observer) cannot detach it.
-        {
-            let server = self.clone();
-            let handle = tokio::spawn(async move {
-                server.infra_tracker.wait().await;
-                server.set_phase(PHASE_STOPPED);
-                tracing::info!("[STOP] TransportServer infra fully joined");
-            });
-            *self
-                .infra_supervisor
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = Some(handle);
-        }
-
         tracing::info!("[TARGET] All protocol servers started, waiting for connections...");
 
-        // Observe (cancel-safe): wait for the supervisor's Stopped.
-        let mut phase_rx = self.phase_notify.subscribe();
-        while self.phase() != PHASE_STOPPED {
-            if phase_rx.changed().await.is_err() {
-                break;
-            }
-        }
-        if self.infra_failed.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(TransportError::config_error(
-                "server",
-                "an infrastructure task failed; all siblings were stopped and joined",
-            ));
-        }
-
-        tracing::info!("[STOP] TransportServer stopped");
-        Ok(())
+        // Supervise: Stopped only after the tracker has REALLY drained.
+        self.infra_tracker.wait().await;
+        self.set_phase(PHASE_STOPPED);
+        tracing::info!("[STOP] TransportServer infra fully joined");
+        drop(guard); // already Stopped: guard is a no-op
     }
 
     /// [START] Start protocol listener - generic method
@@ -1597,6 +1634,7 @@ impl Clone for TransportServer {
             infra_tracker: self.infra_tracker.clone(),
             infra_supervisor: self.infra_supervisor.clone(),
             infra_failed: self.infra_failed.clone(),
+            serve_error: self.serve_error.clone(),
             admission_open: self.admission_open.clone(),
             server_phase: self.server_phase.clone(),
             phase_notify: self.phase_notify.clone(),

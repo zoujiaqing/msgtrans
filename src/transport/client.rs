@@ -398,6 +398,24 @@ impl TransportClient {
                 let done = self.teardown_done.clone();
                 let err_slot = self.teardown_err.clone();
                 *slot = Some(tokio::spawn(async move {
+                    // Completion guard: even if any teardown step below
+                    // PANICS, the phase still reaches Stopped and the watch
+                    // still fires — shutdown() observers can never wait
+                    // forever on a dead task.
+                    struct TeardownDone {
+                        phase: Arc<AtomicU8>,
+                        done: Arc<tokio::sync::watch::Sender<bool>>,
+                    }
+                    impl Drop for TeardownDone {
+                        fn drop(&mut self) {
+                            self.phase.store(CLIENT_STOPPED, Ordering::SeqCst);
+                            let _ = self.done.send_replace(true);
+                        }
+                    }
+                    let _done_guard = TeardownDone {
+                        phase: phase.clone(),
+                        done: done.clone(),
+                    };
                     let was_connected = transport.current_session_id().await.is_some();
                     if let Err(e) = transport.disconnect().await {
                         if was_connected {

@@ -253,13 +253,16 @@ async fn clean_shutdown_completes_serve_and_frees_all_ports() {
         "clean=true must mean the task tracker is empty"
     );
 
-    // The moment clean=true returns, serve() must ALREADY be finished — no
-    // waiting allowed, this is what infra_stopped claims to prove.
-    assert!(
-        serve_handle.is_finished(),
-        "clean=true but serve() had not returned"
-    );
-    let _ = serve_handle.await;
+    // Ownership semantics: infra_stopped proves the OWNED infra actually
+    // joined (Stopped is published by the owning task after tracker.wait()).
+    // serve() is a pure observer now, so its future completing is a separate
+    // scheduler wakeup — assert the REAL invariant at the instant (ports
+    // free, below) and give the observer a short bound to be scheduled.
+    tokio::time::timeout(Duration::from_secs(1), serve_handle)
+        .await
+        .expect("serve() observer must complete promptly after Stopped")
+        .expect("join")
+        .ok();
 
     // All three endpoints are free: a new server binds the SAME addresses and
     // actually serves.
@@ -638,4 +641,118 @@ async fn concurrent_serve_and_shutdown_cannot_resurrect() {
         c.connect().await.is_err(),
         "no listener may survive the shutdown race"
     );
+}
+
+/// PERMANENT regression (previously failed for real): aborting serve() at
+/// runtime detaches nothing — the infra is owned elsewhere — so a subsequent
+/// shutdown is honest and the port is immediately rebindable.
+#[tokio::test(flavor = "multi_thread")]
+async fn aborting_serve_at_runtime_frees_ports_via_shutdown() {
+    let addr = "127.0.0.1:28901";
+    let server = TransportServerBuilder::new()
+        .protocol(TcpServerConfig::new(addr).expect("cfg"))
+        .build(Arc::new(Echo))
+        .await
+        .expect("server");
+    let serve_handle = {
+        let s = server.clone();
+        tokio::spawn(async move { s.serve().await })
+    };
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let client = connect(addr).await;
+    assert!(echo_ok(&client).await);
+    drop(client);
+
+    serve_handle.abort();
+    let _ = serve_handle.await;
+
+    let report = server.shutdown_with_timeout(Duration::from_secs(10)).await;
+    assert!(report.clean, "shutdown after serve abort: {:?}", report);
+    tokio::net::TcpListener::bind(addr)
+        .await
+        .expect("port must be free after clean shutdown");
+}
+
+/// PERMANENT regression (previously failed for real): shutdown during
+/// STARTUP cannot wedge the phase — the owned startup task (or its guard)
+/// always drives Stopped, so shutdown reports infra_stopped and the port is
+/// free even when serve() is cancelled/raced at its earliest moments.
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_racing_startup_cannot_wedge_the_phase() {
+    let addr = "127.0.0.1:28902";
+    let server = TransportServerBuilder::new()
+        .protocol(TcpServerConfig::new(addr).expect("cfg"))
+        .build(Arc::new(Echo))
+        .await
+        .expect("server");
+    let serve_handle = {
+        let s = server.clone();
+        tokio::spawn(async move { s.serve().await })
+    };
+    // No sleep: race shutdown directly against startup (Phase A/B window).
+    let report = server.shutdown_with_timeout(Duration::from_secs(5)).await;
+    assert!(
+        report.infra_stopped,
+        "startup must never wedge the phase: {:?}",
+        report
+    );
+    let _ = tokio::time::timeout(Duration::from_secs(3), serve_handle)
+        .await
+        .expect("serve() must terminate");
+    tokio::net::TcpListener::bind(addr)
+        .await
+        .expect("port must be free after the startup race");
+}
+
+/// PERMANENT regression (previously failed for real): a panicking handler
+/// must not pin its session — the supervisor cancels the sibling and the
+/// permit returns, all WITHOUT any shutdown.
+struct PanicOnce;
+
+#[async_trait]
+impl SessionHandler for PanicOnce {
+    async fn on_message(&self, _s: SessionId, _p: Packet, _tx: SessionSender) {
+        panic!("handler exploded on purpose");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn handler_panic_releases_session_and_permit() {
+    let addr = "127.0.0.1:28903";
+    const CAP: usize = 1;
+    let server = TransportServerBuilder::new()
+        .max_connections(CAP)
+        .protocol(TcpServerConfig::new(addr).expect("cfg"))
+        .build(Arc::new(PanicOnce))
+        .await
+        .expect("server");
+    let bg = server.clone();
+    tokio::spawn(async move {
+        let _ = bg.serve().await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let client = connect(addr).await;
+    client.send(b"boom".as_slice()).await.expect("send");
+
+    // The panic must cascade: session gone, permit back — no shutdown needed.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while server.session_count().await != 0
+        || server.available_permits() != CAP
+        || server.live_session_tasks() != 0
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "panic pinned the session: sessions={} permits={} tasks={}",
+            server.session_count().await,
+            server.available_permits(),
+            server.live_session_tasks()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    drop(client);
+    // The freed permit is genuinely usable: a new client gets served... or in
+    // this fixture, at least admitted (the handler panics per message).
+    let c2 = connect(addr).await;
+    drop(c2);
 }
