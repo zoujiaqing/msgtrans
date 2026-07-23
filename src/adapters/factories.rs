@@ -1,5 +1,7 @@
 #[cfg(feature = "tcp")]
 use crate::adapters::tcp;
+#[cfg(any(feature = "tcp", feature = "websocket", feature = "quic"))]
+use crate::protocol::ProtocolConfig;
 #[cfg(feature = "quic")]
 use crate::protocol::{QuicClientConfig, QuicServerConfig};
 #[cfg(feature = "tcp")]
@@ -94,6 +96,9 @@ impl ProtocolFactory for TcpFactory {
             TcpClientConfig::default()
         };
 
+        ProtocolConfig::validate(&tcp_config)
+            .map_err(|e| TransportError::config_error("tcp", &e.to_string()))?;
+
         let adapter = tcp::TcpAdapter::connect(addr, tcp_config)
             .await
             .map_err(|e| {
@@ -121,6 +126,9 @@ impl ProtocolFactory for TcpFactory {
         } else {
             TcpServerConfig::default()
         };
+
+        ProtocolConfig::validate(&tcp_config)
+            .map_err(|e| TransportError::config_error("tcp", &e.to_string()))?;
 
         let server = tcp::TcpServerBuilder::new()
             .bind_address(addr)
@@ -241,6 +249,9 @@ impl ProtocolFactory for WebSocketFactory {
             WebSocketClientConfig::default()
         };
 
+        ProtocolConfig::validate(&ws_config)
+            .map_err(|e| TransportError::config_error("websocket", &e.to_string()))?;
+
         // config() must precede target_url(): the override mutates the
         // concrete config held by the builder.
         let adapter = crate::adapters::websocket::WebSocketClientBuilder::new()
@@ -279,6 +290,9 @@ impl ProtocolFactory for WebSocketFactory {
         } else {
             WebSocketServerConfig::default()
         };
+
+        ProtocolConfig::validate(&ws_config)
+            .map_err(|e| TransportError::config_error("websocket", &e.to_string()))?;
 
         // config() must precede bind_address(): the override mutates the
         // concrete config held by the builder.
@@ -408,6 +422,9 @@ impl ProtocolFactory for QuicFactory {
             Box::new(QuicClientConfig::default())
         };
 
+        ProtocolConfig::validate(&*config)
+            .map_err(|e| TransportError::config_error("quic", &e.to_string()))?;
+
         let (addr, _) = self.parse_uri(uri)?;
 
         let adapter = crate::adapters::quic::QuicAdapter::connect(addr, *config)
@@ -432,6 +449,12 @@ impl ProtocolFactory for QuicFactory {
                 "QUIC server config is required",
             ));
         };
+
+        // The factory is a second public construction path: it must enforce
+        // the same validation as the builder path (a zero-stream config used
+        // to slip through here).
+        ProtocolConfig::validate(&*config)
+            .map_err(|e| TransportError::config_error("quic", &e.to_string()))?;
 
         let bind_addr: std::net::SocketAddr = bind_addr
             .parse()

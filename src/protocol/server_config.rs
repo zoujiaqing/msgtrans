@@ -441,6 +441,14 @@ impl ProtocolConfig for QuicServerConfig {
                 suggestion: "use at least 1".to_string(),
             });
         }
+        if quinn::VarInt::from_u64(self.max_concurrent_streams).is_err() {
+            return Err(ConfigError::InvalidValue {
+                field: "max_concurrent_streams".to_string(),
+                value: self.max_concurrent_streams.to_string(),
+                reason: "exceeds the QUIC varint range".to_string(),
+                suggestion: "use a value below 2^62".to_string(),
+            });
+        }
         // A certificate without its key (or vice versa) is a configuration
         // mistake — previously it silently fell back to a self-signed cert.
         // Empty strings are the legacy spelling of "no PEM" (insecure()).

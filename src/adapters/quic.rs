@@ -199,9 +199,15 @@ fn apply_server_transport(
         transport_config.keep_alive_interval(Some(keep_alive));
     }
     transport_config.initial_rtt(config.initial_rtt);
-    let max_streams = config.max_concurrent_streams.min(u32::MAX as u64) as u32;
-    transport_config.max_concurrent_uni_streams(max_streams.into());
-    transport_config.max_concurrent_bidi_streams(max_streams.into());
+    // Full QUIC varint range, no silent truncation (see the client side).
+    let max_streams = quinn::VarInt::from_u64(config.max_concurrent_streams).map_err(|_| {
+        QuicError::Config(format!(
+            "max_concurrent_streams {} exceeds the QUIC varint range",
+            config.max_concurrent_streams
+        ))
+    })?;
+    transport_config.max_concurrent_uni_streams(max_streams);
+    transport_config.max_concurrent_bidi_streams(max_streams);
     Ok(())
 }
 
@@ -288,10 +294,16 @@ fn configure_client_with_config(config: &QuicClientConfig) -> Result<ClientConfi
 
     transport_config.initial_rtt(config.initial_rtt);
 
-    // Convert u64 to u32 for VarInt (VarInt only supports From<u32>)
-    let max_streams = config.max_concurrent_streams.min(u32::MAX as u64) as u32;
-    transport_config.max_concurrent_uni_streams(max_streams.into());
-    transport_config.max_concurrent_bidi_streams(max_streams.into());
+    // Full QUIC varint range, no silent truncation: an out-of-range value
+    // is a configuration error, not a clamp.
+    let max_streams = quinn::VarInt::from_u64(config.max_concurrent_streams).map_err(|_| {
+        QuicError::Config(format!(
+            "max_concurrent_streams {} exceeds the QUIC varint range",
+            config.max_concurrent_streams
+        ))
+    })?;
+    transport_config.max_concurrent_uni_streams(max_streams);
+    transport_config.max_concurrent_bidi_streams(max_streams);
 
     client_config.transport_config(Arc::new(transport_config));
 

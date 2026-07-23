@@ -564,3 +564,36 @@ async fn ws_factory_honors_bind_addr_and_uri() {
     );
     drop(conn);
 }
+
+/// The public factory is a second construction path and must enforce the
+/// same validation as the builder path: an invalid config is rejected
+/// instead of building a server that cannot carry data.
+#[tokio::test(flavor = "multi_thread")]
+async fn factories_validate_configs_before_building() {
+    use msgtrans::adapters::{QuicFactory, WebSocketFactory};
+    use msgtrans::protocol::ProtocolFactory;
+
+    let bad_quic = QuicServerConfig::new("127.0.0.1:29022")
+        .expect("cfg")
+        .max_concurrent_streams(0);
+    let result = QuicFactory::new()
+        .create_server("127.0.0.1:29022", Some(Box::new(bad_quic)))
+        .await;
+    assert!(
+        result.is_err(),
+        "factory must reject a zero-stream QUIC config like the builder does"
+    );
+
+    // Valid config still builds.
+    let ok_quic = QuicServerConfig::new("127.0.0.1:29023").expect("cfg");
+    assert!(QuicFactory::new()
+        .create_server("127.0.0.1:29023", Some(Box::new(ok_quic)))
+        .await
+        .is_ok());
+
+    // WS factory path validates too (trivially Ok for the default config).
+    assert!(WebSocketFactory::new()
+        .create_server("127.0.0.1:29024", None)
+        .await
+        .is_ok());
+}
