@@ -451,3 +451,116 @@ async fn quic_custom_transport_parameters_smoke() {
     let _ = client.shutdown().await;
     let _ = server.shutdown_with_timeout(Duration::from_secs(5)).await;
 }
+
+/// A healthy connection pings at ping_interval, NOT at pong_timeout: with
+/// interval 300ms / pong_timeout 100ms over ~1.05s a correct client sends
+/// ~3 pings; the collapsed-cadence bug sent ~10.
+#[tokio::test(flavor = "multi_thread")]
+async fn ws_ping_cadence_follows_interval_not_pong_timeout() {
+    let addr = "127.0.0.1:29019";
+    let ping_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = ping_count.clone();
+    // Raw WS peer that polls (so tungstenite auto-pongs) and counts pings.
+    let listener = tokio::net::TcpListener::bind(addr).await.expect("bind");
+    tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.expect("accept");
+        let mut ws = tokio_tungstenite::accept_async(tcp).await.expect("hs");
+        while let Some(Ok(msg)) = ws.next().await {
+            if matches!(msg, tokio_tungstenite::tungstenite::Message::Ping(_)) {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    });
+
+    let mut client = TransportClientBuilder::new()
+        .protocol(
+            WebSocketClientConfig::new(&format!("ws://{addr}/"))
+                .expect("cfg")
+                .subprotocols(vec![])
+                .ping_interval(Some(Duration::from_millis(300)))
+                .pong_timeout(Duration::from_millis(100)),
+        )
+        .build()
+        .await
+        .expect("client");
+    client.connect().await.expect("connect");
+    tokio::time::sleep(Duration::from_millis(1050)).await;
+    let pings = ping_count.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        (2..=5).contains(&pings),
+        "expected ~3 interval-paced pings in 1.05s, got {pings}"
+    );
+    let _ = client.shutdown().await;
+}
+
+/// Plain ws:// must not consult the TLS configuration at all: a garbage
+/// CustomCa neither blocks the connection nor is parsed.
+#[tokio::test(flavor = "multi_thread")]
+async fn plain_ws_ignores_tls_configuration() {
+    let addr = "127.0.0.1:29020";
+    let server = TransportServerBuilder::new()
+        .protocol(WebSocketServerConfig::new(addr).expect("cfg"))
+        .build(Arc::new(Echo))
+        .await
+        .expect("server");
+    serve(&server).await;
+
+    let mut client = TransportClientBuilder::new()
+        .protocol(
+            WebSocketClientConfig::new(&format!("ws://{addr}/"))
+                .expect("cfg")
+                .tls(ClientTls::CustomCa("not a pem at all".to_string())),
+        )
+        .build()
+        .await
+        .expect("client");
+    client
+        .connect()
+        .await
+        .expect("ws:// must ignore TLS configuration entirely");
+    assert!(client.is_connected().await);
+    let _ = client.shutdown().await;
+    let _ = server.shutdown_with_timeout(Duration::from_secs(5)).await;
+}
+
+/// The public WebSocket factory must honor the requested bind address and
+/// target uri instead of the config defaults (both were silently ignored).
+#[tokio::test(flavor = "multi_thread")]
+async fn ws_factory_honors_bind_addr_and_uri() {
+    use msgtrans::adapters::WebSocketFactory;
+    use msgtrans::protocol::ProtocolFactory;
+
+    let factory = WebSocketFactory::new();
+    // No config given: the default config binds 127.0.0.1:8080 and targets
+    // ws://localhost:80/ — the factory arguments must win over both. The
+    // server binds lazily on accept, so the proof is behavioral: a handshake
+    // against the REQUESTED address completes end-to-end.
+    let addr = "127.0.0.1:29021";
+    let mut server = factory
+        .create_server(addr, None)
+        .await
+        .expect("create_server");
+    let accept_task = tokio::spawn(async move {
+        let conn = server.accept().await;
+        (server, conn)
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let uri = format!("ws://{addr}/");
+    let conn = factory
+        .create_connection(&uri, None)
+        .await
+        .expect("factory uri must override the config default");
+    assert!(conn.is_connected());
+    let (server, accepted) = accept_task.await.expect("accept task");
+    assert!(
+        accepted.is_ok(),
+        "server bound to the requested address must accept the connection"
+    );
+    assert_eq!(
+        server.local_addr().expect("local addr").to_string(),
+        addr,
+        "factory bind_addr must override the config default"
+    );
+    drop(conn);
+}

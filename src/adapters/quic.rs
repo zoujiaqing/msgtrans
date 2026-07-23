@@ -301,7 +301,7 @@ fn configure_client_with_config(config: &QuicClientConfig) -> Result<ClientConfi
 /// Configure server with self-signed certificate
 fn configure_server_insecure_with_config(
     config: &QuicServerConfig,
-) -> (ServerConfig, CertificateDer<'static>) {
+) -> Result<(ServerConfig, CertificateDer<'static>), QuicError> {
     let (cert, key) = generate_self_signed_cert();
 
     let mut server_crypto = ring_server_builder()
@@ -313,15 +313,17 @@ fn configure_server_insecure_with_config(
             .expect("self-signed crypto config is valid"),
     ));
 
-    apply_server_transport(config, &mut server_config).expect("valid default transport config");
+    // The transport parameters come from USER configuration: propagate
+    // instead of expecting (an oversized idle timeout used to panic here).
+    apply_server_transport(config, &mut server_config)?;
 
-    (server_config, cert)
+    Ok((server_config, cert))
 }
 
 /// Configure server with self-signed certificate (legacy function for backward compatibility)
 fn configure_server_insecure() -> (ServerConfig, CertificateDer<'static>) {
     let default_config = QuicServerConfig::default();
-    configure_server_insecure_with_config(&default_config)
+    configure_server_insecure_with_config(&default_config).expect("default QUIC config is valid")
 }
 
 /// Configure server with PEM certificate and key
@@ -945,20 +947,28 @@ impl QuicServerBuilder {
             .bind_address
             .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0)));
 
-        // Choose certificate mode based on configuration
-        let server_config = match (&self.config.cert_pem, &self.config.key_pem) {
-            (Some(cert_pem), Some(key_pem)) if !cert_pem.is_empty() && !key_pem.is_empty() => {
-                // Use provided PEM certificate and private key
+        // Choose certificate mode based on configuration. Empty strings are
+        // the legacy spelling of "self-signed" (QuicServerConfig::insecure());
+        // a PARTIAL pair is a configuration error (validate() rejects it too —
+        // this is defense in depth, replacing the old silent fallback).
+        let cert_opt = self.config.cert_pem.as_deref().filter(|s| !s.is_empty());
+        let key_opt = self.config.key_pem.as_deref().filter(|s| !s.is_empty());
+        let server_config = match (cert_opt, key_opt) {
+            (Some(cert_pem), Some(key_pem)) => {
                 tracing::debug!("[SECURITY] Starting QUIC server with provided PEM certificate");
                 let (server_config, _cert) =
                     configure_server_with_pem(cert_pem, key_pem, &self.config)?;
                 server_config
             }
-            _ => {
-                // Use self-signed certificate
+            (None, None) => {
                 tracing::debug!("[SECURITY] Starting QUIC server with self-signed certificate");
-                let (server_config, _cert) = configure_server_insecure_with_config(&self.config);
+                let (server_config, _cert) = configure_server_insecure_with_config(&self.config)?;
                 server_config
+            }
+            _ => {
+                return Err(QuicError::Config(
+                    "cert_pem and key_pem must be provided together".to_string(),
+                ));
             }
         };
 

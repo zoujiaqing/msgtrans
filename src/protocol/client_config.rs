@@ -267,32 +267,40 @@ impl ProtocolConfig for WebSocketClientConfig {
         Self::default()
     }
 
+    // Overlay semantics: a field from `other` wins only when it differs from
+    // the type's CURRENT default (computed, never hardcoded — the 1.x version
+    // compared against stale literal defaults and mis-merged after defaults
+    // changed). KNOWN LIMIT: a field explicitly set to its default value (or
+    // an Option explicitly set to its default Some/None) cannot be expressed;
+    // the #24 API freeze either deletes merge() or replaces it with an
+    // Option-per-field overlay type.
     fn merge(mut self, other: Self) -> Self {
-        if other.target_url != "ws://localhost:80/" {
+        let def = Self::default();
+        if other.target_url != def.target_url {
             self.target_url = other.target_url;
         }
-        if other.connect_timeout != Duration::from_secs(10) {
+        if other.connect_timeout != def.connect_timeout {
             self.connect_timeout = other.connect_timeout;
         }
-        if !other.headers.is_empty() {
+        if other.headers != def.headers {
             self.headers = other.headers;
         }
-        if !other.subprotocols.is_empty() {
+        if other.subprotocols != def.subprotocols {
             self.subprotocols = other.subprotocols;
         }
-        if other.max_frame_size != 64 * 1024 {
+        if other.max_frame_size != def.max_frame_size {
             self.max_frame_size = other.max_frame_size;
         }
-        if other.max_message_size != 1024 * 1024 {
+        if other.max_message_size != def.max_message_size {
             self.max_message_size = other.max_message_size;
         }
-        if other.ping_interval.is_some() {
+        if other.ping_interval != def.ping_interval {
             self.ping_interval = other.ping_interval;
         }
-        if other.pong_timeout != Duration::from_secs(10) {
+        if other.pong_timeout != def.pong_timeout {
             self.pong_timeout = other.pong_timeout;
         }
-        if other.tls != ClientTls::default() {
+        if other.tls != def.tls {
             self.tls = other.tls.clone();
         }
         self

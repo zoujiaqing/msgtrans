@@ -241,9 +241,11 @@ impl ProtocolFactory for WebSocketFactory {
             WebSocketClientConfig::default()
         };
 
+        // config() must precede target_url(): the override mutates the
+        // concrete config held by the builder.
         let adapter = crate::adapters::websocket::WebSocketClientBuilder::new()
-            .target_url(uri)
             .config(ws_config)
+            .target_url(uri)
             .connect()
             .await
             .map_err(|e| {
@@ -278,9 +280,11 @@ impl ProtocolFactory for WebSocketFactory {
             WebSocketServerConfig::default()
         };
 
+        // config() must precede bind_address(): the override mutates the
+        // concrete config held by the builder.
         let server = crate::adapters::websocket::WebSocketServerBuilder::new()
-            .bind_address(addr)
             .config(ws_config)
+            .bind_address(addr)
             .build()
             .await
             .map_err(|e| TransportError::config_error("websocket", &e.to_string()))?;

@@ -352,16 +352,22 @@ impl<C> WebSocketAdapter<C> {
                         break;
                     }
 
-                    // [PING] Initiate pings at the configured interval and
-                    // fail a peer whose pong never arrives within pong_timeout.
-                    _ = tokio::time::sleep_until(next_ping), if keepalive.ping_interval.is_some() => {
-                        if let Some(sent_at) = ping_sent_at {
-                            if sent_at.elapsed() >= keepalive.pong_timeout {
-                                tracing::info!("[PING] WebSocket pong timeout ({:?}), closing (session: {})", keepalive.pong_timeout, current_session_id);
-                                event_pipe.close(crate::error::CloseReason::Timeout);
-                                state.set_status(crate::adapters::core::ConnStatus::Closed);
-                                break;
-                            }
+                    // [PING] Two separate deadlines share this arm: while a
+                    // ping is outstanding the wake-up is its pong deadline
+                    // (dead-peer detection); otherwise it is the next
+                    // interval-scheduled ping. A healthy connection therefore
+                    // pings exactly once per ping_interval — the pong_timeout
+                    // never shortens the cadence.
+                    _ = tokio::time::sleep_until(match ping_sent_at {
+                        Some(sent_at) => sent_at + keepalive.pong_timeout,
+                        None => next_ping,
+                    }), if keepalive.ping_interval.is_some() => {
+                        if ping_sent_at.is_some() {
+                            // Pong deadline elapsed without a pong.
+                            tracing::info!("[PING] WebSocket pong timeout ({:?}), closing (session: {})", keepalive.pong_timeout, current_session_id);
+                            event_pipe.close(crate::error::CloseReason::Timeout);
+                            state.set_status(crate::adapters::core::ConnStatus::Closed);
+                            break;
                         }
                         if let Err(e) = stream.send(Message::Ping(Bytes::new())).await {
                             tracing::debug!("[PING] WebSocket ping send failed: {:?} (session: {})", e, current_session_id);
@@ -369,13 +375,8 @@ impl<C> WebSocketAdapter<C> {
                             state.set_status(crate::adapters::core::ConnStatus::Closed);
                             break;
                         }
-                        if ping_sent_at.is_none() {
-                            ping_sent_at = Some(tokio::time::Instant::now());
-                        }
-                        // Re-arm: check again at the earlier of the next
-                        // interval or the pong deadline.
-                        let interval = keepalive.ping_interval.unwrap();
-                        next_ping = tokio::time::Instant::now() + interval.min(keepalive.pong_timeout);
+                        ping_sent_at = Some(tokio::time::Instant::now());
+                        next_ping = tokio::time::Instant::now() + keepalive.ping_interval.unwrap();
                     }
 
                     // [RECV] Handle incoming data
@@ -703,7 +704,18 @@ impl<C> WebSocketServerBuilder<C> {
         self
     }
 
-    pub(crate) fn bind_address(self, _addr: std::net::SocketAddr) -> Self {
+    /// Override the bind address on the concrete config. Previously a no-op:
+    /// the public factory passed the requested address into it and the server
+    /// silently bound the config default instead.
+    pub(crate) fn bind_address(mut self, addr: std::net::SocketAddr) -> Self
+    where
+        C: std::any::Any,
+    {
+        if let Some(cfg) = self.config.as_mut().and_then(|c| {
+            (c as &mut dyn std::any::Any).downcast_mut::<crate::protocol::WebSocketServerConfig>()
+        }) {
+            cfg.bind_address = addr;
+        }
         self
     }
 
@@ -834,7 +846,18 @@ impl<C> WebSocketClientBuilder<C> {
         self
     }
 
-    pub(crate) fn target_url<S: Into<String>>(self, _url: S) -> Self {
+    /// Override the target URL on the concrete config. Previously a no-op:
+    /// the public factory passed the requested uri into it and the client
+    /// silently connected to the config default instead.
+    pub(crate) fn target_url<S: Into<String>>(mut self, url: S) -> Self
+    where
+        C: std::any::Any,
+    {
+        if let Some(cfg) = self.config.as_mut().and_then(|c| {
+            (c as &mut dyn std::any::Any).downcast_mut::<crate::protocol::WebSocketClientConfig>()
+        }) {
+            cfg.target_url = url.into();
+        }
         self
     }
 
@@ -881,8 +904,14 @@ impl<C> WebSocketClientBuilder<C> {
             );
         }
 
-        // TLS behavior per config (only consulted for wss://).
-        let connector = build_tls_connector(&ws_cfg.tls)?;
+        // TLS behavior per config — consulted ONLY for wss://, exactly as
+        // documented: a plain ws:// connection must neither validate the CA
+        // material nor emit the Insecure warning.
+        let connector = if request.uri().scheme_str() == Some("wss") {
+            Some(build_tls_connector(&ws_cfg.tls)?)
+        } else {
+            None
+        };
 
         let connect = connect_async_tls_with_config(
             request,
@@ -891,7 +920,7 @@ impl<C> WebSocketClientBuilder<C> {
                 ws_cfg.max_frame_size,
             )),
             false,
-            Some(connector),
+            connector,
         );
         // Bounded connect (previously connect_timeout was ignored).
         let (ws_stream, _) = if ws_cfg.connect_timeout > std::time::Duration::ZERO {
