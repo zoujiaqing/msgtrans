@@ -51,10 +51,13 @@ jobs:
         run: cargo check --no-default-features --features "${{ matrix.features }}" --all-targets
         env:
           RUSTFLAGS: -D warnings
-      # --all-targets does NOT cover doctests; the README is attached as crate
-      # docs (full-feature builds only), so this catches doc examples drifting
-      # from what each feature combination actually exports.
-      - name: Doctests
+      # --all-targets does NOT cover doctests. The README (the only doctest
+      # source) documents the default build and is attached to the crate docs
+      # only when all three protocol features are enabled, so the doctest run
+      # is meaningful — and executed — only for the full combination; partial
+      # combinations would run zero doctests and are skipped honestly.
+      - name: Doctests (full feature set only)
+        if: matrix.features == 'tcp,websocket,quic'
         run: cargo test --no-default-features --features "${{ matrix.features }}" --doc
         env:
           RUSTFLAGS: -D warnings
