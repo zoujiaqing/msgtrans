@@ -1393,8 +1393,11 @@ impl TransportServer {
     ///    session's tasks ended and its permit returned. A supervisor that
     ///    outlives the budget stays owned in the registry (never detached,
     ///    never cancelled mid-cleanup); a later shutdown joins it.
-    /// 4. Wait (bounded) for serve() to finish, which joins the listeners and
-    ///    the timeout scanner and frees the TCP/WS/QUIC endpoints.
+    /// 4. Wait (bounded) for the OWNED startup/supervise task to publish
+    ///    Stopped — which it does only after the infra tracker has really
+    ///    drained (listeners + scanner joined, TCP/WS/QUIC endpoints freed).
+    ///    The serve() OBSERVER future returns on its own schedule; its
+    ///    completion is not part of this proof.
     ///
     /// `clean` is true only when ALL of it is proven: no session supervisors
     /// left, session map empty, infra finished (or never started), and — when
@@ -1482,10 +1485,10 @@ impl TransportServer {
         let sessions_remaining = self.session_tracker.len();
         let sessions_closed = initial_sessions.saturating_sub(sessions_remaining);
 
-        // Phase 4: infra join — wait for serve()'s guard to publish Stopped,
-        // which happens only after every listener and the scanner have been
-        // joined (freeing the endpoints). A server that never served is
-        // finalized to Stopped by us right here.
+        // Phase 4: infra join — wait for the owned startup/supervise task to
+        // publish Stopped, which happens only after the infra tracker has
+        // really drained (listeners + scanner joined, endpoints freed). A
+        // server that never served is finalized to Stopped by us right here.
         if never_served {
             self.set_phase(PHASE_STOPPED);
         }
@@ -1585,9 +1588,9 @@ impl TransportServer {
     }
 }
 
-/// What a [`TransportServer::shutdown`] accomplished. See the LIMITATION on
-/// [`TransportServer::shutdown_with_timeout`] for what `clean` does and does
-/// not yet prove.
+/// What a [`TransportServer::shutdown`] proved: see each field. `clean`
+/// requires all of them — session tracker empty, infra really finished,
+/// permits restored.
 #[derive(Debug, Clone)]
 pub struct ShutdownReport {
     /// Session supervisors joined by this shutdown (each join proves that

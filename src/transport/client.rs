@@ -129,7 +129,7 @@ impl Default for TransportClientBuilder {
 /// released by cascade — background tasks hold only Weak<Transport>, so the
 /// Transport, connection, socket and the server-side session/permit are freed
 /// shortly after, without an explicit disconnect(). Completion guarantees
-/// belong to the async shutdown path (planned shutdown().await).
+/// belong to [`Self::shutdown`], which joins the owned teardown task.
 pub struct TransportClient {
     inner: Arc<Transport>,
     retry_config: RetryConfig,
