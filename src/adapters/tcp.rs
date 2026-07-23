@@ -221,73 +221,80 @@ impl OptimizedReadBuffer {
         false
     }
 
-    /// Try to parse next complete packet from buffer
+    /// The stream decode limits: TCP enforces its own (tighter) caps, shared
+    /// with `is_valid_header_at` so the resync scanner and the codec agree on
+    /// what a valid frame is.
+    fn decode_limits() -> crate::packet::DecodeLimits {
+        crate::packet::DecodeLimits {
+            max_frame_size: FIXED_HEADER_SIZE + MAX_EXT_HEADER_SIZE + MAX_PAYLOAD_SIZE,
+        }
+    }
+
+    /// Try to parse next complete packet from buffer.
+    ///
+    /// Framing is delegated to the shared codec ([`Packet::decode_one_with`]),
+    /// so TCP no longer maintains a second length-parsing implementation.
+    ///
+    /// Policy:
+    /// - `Strict` (default): ANY invalid header closes the connection —
+    ///   including after valid packets have been parsed. A byte stream that
+    ///   lost sync is not trustworthy.
+    /// - `Lenient`: 1.x behavior — invalid first header still fast-fails
+    ///   (non-protocol traffic), later corruption attempts a bounded resync.
     ///
     /// Returns:
     /// - Ok(Some(packet)) - Successfully parsed a complete packet
     /// - Ok(None) - No complete packet in buffer (need more data)
     /// - Err(error) - Unrecoverable parse error
-    fn try_parse_next_packet(&mut self) -> Result<Option<Packet>, TcpError> {
+    fn try_parse_next_packet(&mut self, strict: bool) -> Result<Option<Packet>, TcpError> {
+        let limits = Self::decode_limits();
         loop {
-            // Check if there's enough data for header
-            if self.buffer.len() < FIXED_HEADER_SIZE {
-                return Ok(None);
-            }
-
-            // Validate header at current position
-            if !self.is_valid_header_at(0) {
-                // Fast-fail for non-protocol traffic: if we have never parsed a valid packet
-                // on this connection, invalid first header means this is not msgtrans.
-                if self.stats.packets_parsed == 0 {
-                    tracing::warn!(
-                        "[PARSE] Invalid protocol header on first packet, closing connection"
-                    );
-                    return Err(TcpError::Config(
-                        "Invalid protocol header on first packet".to_string(),
-                    ));
-                }
-                tracing::debug!("[PARSE] Invalid header detected, attempting resync");
-                if !self.try_resync_frame() {
-                    return Err(TcpError::BufferOverflow);
-                }
-                // Continue loop to try parsing again
-                continue;
-            }
-
-            // Header is valid, extract lengths
-            let header_bytes = &self.buffer[0..FIXED_HEADER_SIZE];
-            let ext_header_len = u16::from_be_bytes([header_bytes[8], header_bytes[9]]) as usize;
-            let payload_len = u32::from_be_bytes([
-                header_bytes[10],
-                header_bytes[11],
-                header_bytes[12],
-                header_bytes[13],
-            ]) as usize;
-
-            let total_packet_len = FIXED_HEADER_SIZE + ext_header_len + payload_len;
-
-            // Check if complete packet is available
-            if self.buffer.len() < total_packet_len {
-                return Ok(None);
-            }
-
-            // Split the complete packet out of the read buffer. No freeze(): we only
-            // borrow it as &[u8] for parsing, so turning it into a shared Bytes handle
-            // would allocate an Arc that is immediately dropped.
-            let packet_bytes = self.buffer.split_to(total_packet_len);
-
-            // Parse packet
-            match Packet::from_bytes(&packet_bytes) {
-                Ok(packet) => {
+            match Packet::decode_one_with(&self.buffer, &limits) {
+                Ok(Some((packet, consumed))) => {
+                    // Consume exactly the decoded frame from the read buffer.
+                    let _ = self.buffer.split_to(consumed);
+                    // Enforce the same per-field caps as the resync scanner
+                    // (the codec only caps the total frame size).
+                    if packet.ext_header.len() > MAX_EXT_HEADER_SIZE
+                        || packet.payload.len() > MAX_PAYLOAD_SIZE
+                    {
+                        if strict || self.stats.packets_parsed == 0 {
+                            return Err(TcpError::Config(
+                                "Frame exceeds TCP size limits".to_string(),
+                            ));
+                        }
+                        if !self.try_resync_frame() {
+                            return Err(TcpError::BufferOverflow);
+                        }
+                        continue;
+                    }
                     self.stats.packets_parsed += 1;
                     return Ok(Some(packet));
                 }
+                Ok(None) => return Ok(None),
                 Err(e) => {
-                    // Packet parsing failed, try resync
-                    tracing::warn!("[PARSE] Packet parse error: {:?}, attempting resync", e);
-                    // Put bytes back? No, they're already split. Try resync on remaining.
-                    if !self.try_resync_frame() {
+                    // Invalid header (version/type/compression) or oversized
+                    // declared frame at the front of the stream.
+                    if strict {
+                        tracing::warn!(
+                            "[PARSE] Invalid header under strict policy, closing connection: {:?}",
+                            e
+                        );
                         return Err(TcpError::Packet(e));
+                    }
+                    // Lenient: fast-fail for non-protocol traffic on the very
+                    // first packet, bounded resync afterwards.
+                    if self.stats.packets_parsed == 0 {
+                        tracing::warn!(
+                            "[PARSE] Invalid protocol header on first packet, closing connection"
+                        );
+                        return Err(TcpError::Config(
+                            "Invalid protocol header on first packet".to_string(),
+                        ));
+                    }
+                    tracing::debug!("[PARSE] Invalid header detected, attempting resync");
+                    if !self.try_resync_frame() {
+                        return Err(TcpError::BufferOverflow);
                     }
                     continue;
                 }
@@ -347,6 +354,8 @@ pub struct TcpAdapter<C> {
     shutdown_sender: mpsc::UnboundedSender<()>,
     /// Event loop handle
     event_loop_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Frame decode policy, shared with the read loop (Strict by default).
+    frame_policy: Arc<std::sync::atomic::AtomicU8>,
 }
 
 impl<C> TcpAdapter<C> {
@@ -377,6 +386,9 @@ impl<C> TcpAdapter<C> {
             crate::adapters::events::event_pipe(crate::adapters::events::default_pipe_capacity());
 
         let memory_pool = shared_memory_pool();
+        let frame_policy = Arc::new(std::sync::atomic::AtomicU8::new(
+            crate::packet::FramePolicy::default() as u8,
+        ));
 
         let event_loop_handle = Self::start_event_loop(
             stream,
@@ -385,6 +397,7 @@ impl<C> TcpAdapter<C> {
             shutdown_rx,
             event_pipe,
             memory_pool,
+            frame_policy.clone(),
         )
         .await;
 
@@ -397,6 +410,7 @@ impl<C> TcpAdapter<C> {
             event_pipe_rx: Some(event_pipe_rx),
             shutdown_sender: shutdown_tx,
             event_loop_handle: Some(event_loop_handle),
+            frame_policy,
         })
     }
 
@@ -407,6 +421,7 @@ impl<C> TcpAdapter<C> {
         mut shutdown_signal: mpsc::UnboundedReceiver<()>,
         event_pipe: crate::adapters::events::EventPipe,
         memory_pool: Arc<OptimizedMemoryPool>,
+        frame_policy: Arc<std::sync::atomic::AtomicU8>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let current_session_id = state.session_id();
@@ -434,8 +449,11 @@ impl<C> TcpAdapter<C> {
                             }
                             Ok(_) => {
                                 // Parse all complete packets currently in the buffer.
+                                let strict = crate::packet::FramePolicy::from(
+                                    frame_policy.load(std::sync::atomic::Ordering::Relaxed),
+                                ) == crate::packet::FramePolicy::Strict;
                                 loop {
-                                    match read_buffer.try_parse_next_packet() {
+                                    match read_buffer.try_parse_next_packet(strict) {
                                         Ok(Some(packet)) => {
                                             tracing::debug!("[RECV] TCP received packet: {} bytes (session: {})", packet.payload.len(), current_session_id);
                                             tracing::debug!("[DETAIL] Packet details: ID={}, type={:?}, payload_len={}", packet.header.message_id, packet.header.packet_type, packet.payload.len());
@@ -651,6 +669,11 @@ impl<C: Send + Sync + 'static> Connection for TcpAdapter<C> {
     fn take_event_pipe(&mut self) -> Option<crate::adapters::events::EventPipeRx> {
         self.event_pipe_rx.take()
     }
+
+    fn set_frame_policy(&self, policy: crate::packet::FramePolicy) {
+        self.frame_policy
+            .store(policy as u8, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// TCP server builder
@@ -777,5 +800,77 @@ impl TcpClientBuilder {
 impl Default for TcpClientBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod strict_stream_tests {
+    use super::*;
+
+    fn framer() -> OptimizedReadBuffer {
+        OptimizedReadBuffer::new_with_pool(8192, shared_memory_pool())
+    }
+
+    fn feed(f: &mut OptimizedReadBuffer, bytes: &[u8]) {
+        f.buffer.extend_from_slice(bytes);
+    }
+
+    /// Strict: an invalid header closes the connection even AFTER valid
+    /// packets were parsed — a desynchronized byte stream is not trustworthy.
+    /// (1.x only fast-failed on the FIRST packet and resynced afterwards.)
+    #[test]
+    fn strict_fails_on_corruption_after_valid_packets() {
+        let mut f = framer();
+        feed(&mut f, &Packet::one_way(1, b"ok".to_vec()).to_bytes());
+        let first = f.try_parse_next_packet(true).expect("valid stream");
+        assert_eq!(first.expect("complete").message_id(), 1);
+
+        feed(&mut f, &[0xFFu8; 32]); // garbage mid-stream
+        assert!(
+            f.try_parse_next_packet(true).is_err(),
+            "strict must close on any invalid header, not resync"
+        );
+    }
+
+    /// Lenient keeps the 1.x behavior: bounded resync recovers the next
+    /// valid frame after mid-stream corruption.
+    #[test]
+    fn lenient_resyncs_after_corruption() {
+        let mut f = framer();
+        feed(&mut f, &Packet::one_way(1, b"ok".to_vec()).to_bytes());
+        assert!(f.try_parse_next_packet(false).expect("ok").is_some());
+
+        feed(&mut f, &[0xFFu8; 8]); // corruption
+        feed(&mut f, &Packet::one_way(2, b"back".to_vec()).to_bytes());
+        let recovered = f
+            .try_parse_next_packet(false)
+            .expect("lenient stream survives")
+            .expect("resynced packet");
+        assert_eq!(recovered.message_id(), 2);
+    }
+
+    /// Both policies fast-fail non-protocol traffic on the very first bytes.
+    #[test]
+    fn first_invalid_header_fails_under_both_policies() {
+        for strict in [true, false] {
+            let mut f = framer();
+            feed(&mut f, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+            assert!(f.try_parse_next_packet(strict).is_err());
+        }
+    }
+
+    /// An oversized declared frame is refused up front (FrameTooLarge from
+    /// the shared codec), instead of waiting for ~1 MiB+ that must never be
+    /// accepted.
+    #[test]
+    fn oversized_declared_frame_fails_fast_under_strict() {
+        let mut f = framer();
+        let mut bytes = Packet::one_way(1, b"x".to_vec()).to_bytes().to_vec();
+        bytes[10] = 0xFF;
+        bytes[11] = 0xFF;
+        bytes[12] = 0xFF;
+        bytes[13] = 0xFF;
+        feed(&mut f, &bytes);
+        assert!(f.try_parse_next_packet(true).is_err());
     }
 }

@@ -105,6 +105,30 @@ impl From<u8> for FramePolicy {
     }
 }
 
+/// Limits enforced while decoding frames from untrusted input.
+///
+/// The declared lengths in a header are attacker-controlled: without a cap, a
+/// 16-byte header claiming a ~4 GiB payload would make a streaming caller
+/// buffer forever (and on 32-bit targets, unchecked length arithmetic could
+/// overflow). Exceeding the limit is a hard [`PacketError::FrameTooLarge`],
+/// never "keep waiting for more bytes".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeLimits {
+    /// Maximum total frame size in bytes (fixed header + ext header + payload).
+    pub max_frame_size: usize,
+}
+
+/// Default frame cap: matches the decompression bomb cap.
+pub const DEFAULT_MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+
+impl Default for DecodeLimits {
+    fn default() -> Self {
+        Self {
+            max_frame_size: DEFAULT_MAX_FRAME_SIZE,
+        }
+    }
+}
+
 /// Reserved field flags
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReservedFlags(u16);
@@ -493,7 +517,12 @@ impl Packet {
 
     /// See [`Self::from_bytes`] (alias with the explicit 2.0 name).
     pub fn decode_exact(bytes: &[u8]) -> Result<Self, PacketError> {
-        match Self::decode_one(bytes)? {
+        Self::decode_exact_with(bytes, &DecodeLimits::default())
+    }
+
+    /// [`Self::decode_exact`] with explicit limits.
+    pub fn decode_exact_with(bytes: &[u8], limits: &DecodeLimits) -> Result<Self, PacketError> {
+        match Self::decode_one_with(bytes, limits)? {
             Some((packet, consumed)) => {
                 if consumed != bytes.len() {
                     return Err(PacketError::InvalidPacket(format!(
@@ -518,6 +547,14 @@ impl Packet {
     /// - `Err(..)` — the front of the buffer is not a valid packet (bad
     ///   version / packet_type / compression); the stream is unrecoverable.
     pub fn decode_one(bytes: &[u8]) -> Result<Option<(Self, usize)>, PacketError> {
+        Self::decode_one_with(bytes, &DecodeLimits::default())
+    }
+
+    /// [`Self::decode_one`] with explicit limits.
+    pub fn decode_one_with(
+        bytes: &[u8],
+        limits: &DecodeLimits,
+    ) -> Result<Option<(Self, usize)>, PacketError> {
         if bytes.len() < 16 {
             return Ok(None);
         }
@@ -525,8 +562,23 @@ impl Packet {
         // Parse fixed header (validates version, packet_type, compression).
         let header = FixedHeader::from_bytes(&bytes[0..16])?;
 
-        let ext_end = 16usize + header.ext_header_len as usize;
-        let total = ext_end + header.payload_len as usize;
+        // Length arithmetic in u64: the declared lengths are attacker-
+        // controlled, and `16 + ext + payload` in usize wraps on 32-bit
+        // targets for payload_len near u32::MAX (reversed slice range =>
+        // panic). u64 cannot overflow here (16 + u16::MAX + u32::MAX).
+        let declared = 16u64 + header.ext_header_len as u64 + header.payload_len as u64;
+        if declared > limits.max_frame_size as u64 {
+            // A hard error, NOT Ok(None): "incomplete" would make a streaming
+            // caller buffer toward 4 GiB waiting for a frame that must never
+            // be accepted.
+            return Err(PacketError::FrameTooLarge {
+                declared,
+                limit: limits.max_frame_size,
+            });
+        }
+        // Fits in usize: bounded by max_frame_size, which is a usize.
+        let total = declared as usize;
+        let ext_end = 16 + header.ext_header_len as usize;
         if bytes.len() < total {
             return Ok(None);
         }
@@ -671,6 +723,9 @@ pub enum PacketError {
     #[error("Unsupported version: {0}")]
     UnsupportedVersion(u8),
 
+    #[error("Frame too large: declared {declared} bytes exceeds limit {limit}")]
+    FrameTooLarge { declared: u64, limit: usize },
+
     #[error("Compression error: {0}")]
     CompressionError(String),
 
@@ -735,6 +790,41 @@ mod tests {
                     .is_none()
         );
         assert!(Packet::decode_one(&[]).unwrap().is_none());
+    }
+
+    #[test]
+    fn oversized_declared_frame_is_a_hard_error_not_incomplete() {
+        // Header claims ~4 GiB payload: must be FrameTooLarge immediately —
+        // Ok(None) would tell a streaming caller to keep buffering, and on
+        // 32-bit targets the unchecked arithmetic used to wrap and panic.
+        let mut bytes = Packet::request(1, b"hi".to_vec()).to_bytes().to_vec();
+        bytes[10] = 0xFF;
+        bytes[11] = 0xFF;
+        bytes[12] = 0xFF;
+        bytes[13] = 0xFF;
+        assert!(matches!(
+            Packet::decode_one(&bytes),
+            Err(PacketError::FrameTooLarge { .. })
+        ));
+        assert!(matches!(
+            Packet::decode_exact(&bytes),
+            Err(PacketError::FrameTooLarge { .. })
+        ));
+
+        // A frame just over a custom limit errs; at the limit it decodes.
+        let p = Packet::one_way(1, vec![0u8; 100]);
+        let encoded = p.to_bytes();
+        let tight = DecodeLimits {
+            max_frame_size: encoded.len(),
+        };
+        assert!(Packet::decode_one_with(&encoded, &tight).unwrap().is_some());
+        let too_tight = DecodeLimits {
+            max_frame_size: encoded.len() - 1,
+        };
+        assert!(matches!(
+            Packet::decode_one_with(&encoded, &too_tight),
+            Err(PacketError::FrameTooLarge { .. })
+        ));
     }
 
     #[test]

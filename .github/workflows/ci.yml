@@ -23,6 +23,35 @@ jobs:
       - name: Test (compression features)
         run: cargo test --features flate2,zstd
 
+  # Every protocol feature combination must build ALL targets (lib, tests,
+  # examples, benches) with zero warnings — this is what keeps the feature
+  # gates real instead of only working with everything enabled.
+  feature-matrix:
+    name: features (${{ matrix.features == '' && 'none' || matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - ""
+          - "tcp"
+          - "websocket"
+          - "quic"
+          - "tcp,websocket"
+          - "tcp,quic"
+          - "websocket,quic"
+          - "tcp,websocket,quic"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: features-${{ matrix.features }}
+      - name: Check all targets
+        run: cargo check --no-default-features --features "${{ matrix.features }}" --all-targets
+        env:
+          RUSTFLAGS: -D warnings
+
   # Style gates are advisory for now: the crate predates a clean fmt/clippy pass,
   # so these run but do not block. Tighten to required once the backlog is clear.
   fmt:

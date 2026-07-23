@@ -68,3 +68,56 @@ criterion = "0.8"
 [[bench]]
 name = "packet_codec"
 harness = false
+
+# --- Per-target protocol requirements -------------------------------------
+# Targets that exercise specific protocols are skipped (not broken) when the
+# corresponding feature is disabled, so every feature combination passes
+# `cargo check --all-targets`.
+
+[[example]]
+name = "e2e_echo_server"
+required-features = ["websocket"]
+
+[[example]]
+name = "echo_client_quic"
+required-features = ["quic"]
+
+[[example]]
+name = "echo_client_tcp"
+required-features = ["tcp"]
+
+[[example]]
+name = "echo_client_websocket"
+required-features = ["websocket"]
+
+[[example]]
+name = "echo_server"
+required-features = ["tcp", "websocket", "quic"]
+
+[[example]]
+name = "load_test"
+required-features = ["tcp", "websocket", "quic"]
+
+[[example]]
+name = "load_test_server"
+required-features = ["tcp", "websocket", "quic"]
+
+[[example]]
+name = "transport_events"
+required-features = ["tcp"]
+
+[[test]]
+name = "backpressure"
+required-features = ["tcp"]
+
+[[test]]
+name = "lifecycle"
+required-features = ["tcp", "websocket", "quic"]
+
+[[test]]
+name = "max_connections"
+required-features = ["tcp", "websocket"]
+
+[[test]]
+name = "write_deadline"
+required-features = ["tcp"]
