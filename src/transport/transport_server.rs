@@ -1078,37 +1078,49 @@ impl TransportServer {
         tracing::info!("[STOP] TransportServer stopped");
         Ok(())
     }
-
-    /// The OWNED startup + supervision body: binds every protocol (Phase A,
-    /// interruptible by root cancellation), starts all accept loops (Phase B),
-    /// publishes Running, waits for the infra tracker to drain, and publishes
-    /// Stopped. A guard guarantees Stopped (and sibling teardown) even on
-    /// panic — the phase can never wedge in Starting.
+    /// The OWNED startup + supervision body. Wraps the fallible startup in
+    /// catch_unwind: a panic (e.g. from a public DynServerConfig build) is
+    /// RECORDED as a serve() error, siblings are cancelled, and Stopped is
+    /// published only after the infra tracker has ASYNCHRONOUSLY drained —
+    /// never from a synchronous unwind guard that could overstate cleanup
+    /// while listeners still run.
     async fn startup_and_supervise(&self) {
-        struct StartupGuard(TransportServer);
-        impl Drop for StartupGuard {
-            fn drop(&mut self) {
-                if self.0.phase() != PHASE_STOPPED {
-                    self.0
-                        .admission_open
-                        .store(false, std::sync::atomic::Ordering::SeqCst);
-                    self.0.root_cancel.cancel();
-                    self.0.set_phase(PHASE_STOPPED);
-                }
+        use futures::FutureExt;
+        let outcome = std::panic::AssertUnwindSafe(self.run_startup())
+            .catch_unwind()
+            .await;
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                *self.serve_error.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+            }
+            Err(_) => {
+                tracing::error!("[ERROR] startup panicked");
+                self.admission_open
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                self.root_cancel.cancel();
+                *self.serve_error.lock().unwrap_or_else(|p| p.into_inner()) =
+                    Some(TransportError::config_error("server", "startup panicked"));
             }
         }
-        let guard = StartupGuard(self.clone());
-        let fail = |e: TransportError| {
-            *self.serve_error.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
-        };
+        // Unified tail for success, error and panic alike: Stopped only after
+        // the tracker has really drained.
+        self.infra_tracker.close();
+        self.infra_tracker.wait().await;
+        self.set_phase(PHASE_STOPPED);
+        tracing::info!("[STOP] TransportServer infra fully joined");
+    }
 
+    /// Fallible startup: bind all (Phase A, cancellation-interruptible),
+    /// start all accept loops (Phase B), publish Running, then return —
+    /// supervision and Stopped belong to startup_and_supervise's tail.
+    async fn run_startup(&self) -> Result<(), TransportError> {
         if self.protocol_configs.is_empty() {
             tracing::warn!("[WARN] No protocols configured, server cannot start listening");
-            fail(TransportError::config_error(
+            return Err(TransportError::config_error(
                 "protocols",
                 "No protocols configured",
             ));
-            return; // guard publishes Stopped
         }
         tracing::info!(
             "[START] Starting {} protocol servers",
@@ -1128,11 +1140,10 @@ impl TransportServer {
             let build = tokio::select! {
                 _ = self.root_cancel.cancelled() => {
                     tracing::info!("[STOP] Startup cancelled during {} build", protocol_name);
-                    fail(TransportError::config_error(
+                    return Err(TransportError::config_error(
                         "server",
                         "startup cancelled by shutdown",
-                    ));
-                    return; // built drops -> bound endpoints close; guard -> Stopped
+                    )); // built drops -> bound endpoints close
                 }
                 r = protocol_config.build_server_dyn() => r,
             };
@@ -1140,8 +1151,7 @@ impl TransportServer {
                 Ok(server) => built.push((protocol_name.clone(), server)),
                 Err(e) => {
                     tracing::error!("[ERROR] {} server build failed: {:?}", protocol_name, e);
-                    fail(e);
-                    return; // built drops; guard -> Stopped
+                    return Err(e); // built drops
                 }
             }
         }
@@ -1166,8 +1176,7 @@ impl TransportServer {
                         task.abort();
                         let _ = task.await;
                     }
-                    fail(e);
-                    return; // guard -> Stopped
+                    return Err(e);
                 }
             }
         }
@@ -1191,14 +1200,8 @@ impl TransportServer {
             let _ = self.phase_notify.send_replace(PHASE_RUNNING);
         }
         tracing::info!("[TARGET] All protocol servers started, waiting for connections...");
-
-        // Supervise: Stopped only after the tracker has REALLY drained.
-        self.infra_tracker.wait().await;
-        self.set_phase(PHASE_STOPPED);
-        tracing::info!("[STOP] TransportServer infra fully joined");
-        drop(guard); // already Stopped: guard is a no-op
+        Ok(())
     }
-
     /// [START] Start protocol listener - generic method
     async fn start_protocol_listener(
         &self,

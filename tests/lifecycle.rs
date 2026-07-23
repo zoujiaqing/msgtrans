@@ -756,3 +756,156 @@ async fn handler_panic_releases_session_and_permit() {
     let c2 = connect(addr).await;
     drop(c2);
 }
+
+use msgtrans::protocol::adapter::{DynProtocolConfig, DynServerConfig};
+
+/// Test-only protocol config: build_server_dyn signals it has ENTERED the
+/// build, then pends forever — the deterministic Phase A window.
+#[derive(Clone)]
+struct GatedBuildConfig {
+    entered: Arc<Notify>,
+    entered_flag: Arc<AtomicBool>,
+}
+
+impl DynProtocolConfig for GatedBuildConfig {
+    fn protocol_name(&self) -> &'static str {
+        "gated-test"
+    }
+    fn validate_dyn(&self) -> Result<(), msgtrans::protocol::ConfigError> {
+        Ok(())
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn clone_dyn(&self) -> Box<dyn DynProtocolConfig> {
+        Box::new(self.clone())
+    }
+}
+
+impl DynServerConfig for GatedBuildConfig {
+    fn build_server_dyn(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        Box<dyn msgtrans::connection::Server>,
+                        msgtrans::TransportError,
+                    >,
+                > + Send
+                + '_,
+        >,
+    > {
+        let entered = self.entered.clone();
+        let flag = self.entered_flag.clone();
+        Box::pin(async move {
+            flag.store(true, Ordering::SeqCst);
+            entered.notify_waiters();
+            std::future::pending::<()>().await;
+            unreachable!()
+        })
+    }
+    fn get_bind_address(&self) -> std::net::SocketAddr {
+        "127.0.0.1:0".parse().unwrap()
+    }
+    fn clone_server_dyn(&self) -> Box<dyn DynServerConfig> {
+        Box::new(self.clone())
+    }
+}
+
+/// DETERMINISTIC Phase A coverage (the shape that reproduced the original
+/// bug): the build signals entry then pends; only after that signal do we
+/// abort the serve() observer and shut down. The owned startup must be
+/// interrupted by the cancellation and drive the phase to Stopped.
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_interrupts_a_stuck_phase_a_build() {
+    let entered = Arc::new(Notify::new());
+    let entered_flag = Arc::new(AtomicBool::new(false));
+    let server = TransportServerBuilder::new()
+        .protocol(GatedBuildConfig {
+            entered: entered.clone(),
+            entered_flag: entered_flag.clone(),
+        })
+        .build(Arc::new(Echo))
+        .await
+        .expect("server");
+    let serve_handle = {
+        let s = server.clone();
+        tokio::spawn(async move { s.serve().await })
+    };
+    // Wait until we are PROVABLY inside Phase A.
+    if !entered_flag.load(Ordering::SeqCst) {
+        entered.notified().await;
+    }
+    // Cancel the observer mid-Phase-A: must detach nothing.
+    serve_handle.abort();
+    let _ = serve_handle.await;
+
+    let report = server.shutdown_with_timeout(Duration::from_secs(5)).await;
+    assert!(
+        report.infra_stopped,
+        "a stuck Phase A build must be interrupted and finalized: {:?}",
+        report
+    );
+    assert!(report.clean, "{:?}", report);
+}
+
+/// Test-only protocol config whose build PANICS: serve() must report the
+/// failure, not Ok(()).
+#[derive(Clone)]
+struct PanicBuildConfig;
+
+impl DynProtocolConfig for PanicBuildConfig {
+    fn protocol_name(&self) -> &'static str {
+        "panic-test"
+    }
+    fn validate_dyn(&self) -> Result<(), msgtrans::protocol::ConfigError> {
+        Ok(())
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn clone_dyn(&self) -> Box<dyn DynProtocolConfig> {
+        Box::new(self.clone())
+    }
+}
+
+impl DynServerConfig for PanicBuildConfig {
+    fn build_server_dyn(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        Box<dyn msgtrans::connection::Server>,
+                        msgtrans::TransportError,
+                    >,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move { panic!("build exploded on purpose") })
+    }
+    fn get_bind_address(&self) -> std::net::SocketAddr {
+        "127.0.0.1:0".parse().unwrap()
+    }
+    fn clone_server_dyn(&self) -> Box<dyn DynServerConfig> {
+        Box::new(self.clone())
+    }
+}
+
+/// A panicking startup must surface as a serve() ERROR (previously it was
+/// reported as Ok), and the phase must still reach Stopped.
+#[tokio::test(flavor = "multi_thread")]
+async fn startup_panic_is_reported_as_serve_error() {
+    let server = TransportServerBuilder::new()
+        .protocol(PanicBuildConfig)
+        .build(Arc::new(Echo))
+        .await
+        .expect("server");
+    let result = server.serve().await;
+    assert!(result.is_err(), "a panicking startup must not report Ok");
+    let report = server.shutdown_with_timeout(Duration::from_secs(5)).await;
+    assert!(report.infra_stopped, "{:?}", report);
+    assert!(report.clean, "{:?}", report);
+}

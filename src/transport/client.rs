@@ -462,7 +462,15 @@ impl TransportClient {
                     .unwrap_or_else(|e| e.into_inner())
                     .take();
                 if let Some(handle) = handle {
-                    let _ = handle.await;
+                    // The completion guard woke us; the JOIN reports what
+                    // actually happened — a panicked teardown must not be
+                    // presented as a successful shutdown.
+                    if handle.await.is_err() {
+                        return Err(TransportError::connection_error(
+                            "client teardown panicked",
+                            false,
+                        ));
+                    }
                 }
                 break;
             }
