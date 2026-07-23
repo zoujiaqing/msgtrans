@@ -9,6 +9,23 @@ pub trait Connection: Send + Sync + std::any::Any {
     /// Send packet
     async fn send(&mut self, packet: Packet) -> Result<(), TransportError>;
 
+    /// Enqueue with a WRITE receipt: the returned receiver resolves with the
+    /// REAL write result (written to the socket / OS buffer, or the write or
+    /// connection failed). Split from awaiting on purpose: callers reach this
+    /// method through a connection lock and must await the receipt AFTER
+    /// releasing it, or one slow write would serialize every other sender.
+    /// The default (for test doubles) performs an enqueue-only `send` and
+    /// resolves the receipt immediately; every real adapter overrides it.
+    async fn send_with_receipt(
+        &mut self,
+        packet: Packet,
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<(), TransportError>>, TransportError> {
+        self.send(packet).await?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = tx.send(Ok(()));
+        Ok(rx)
+    }
+
     /// Close connection
     async fn close(&mut self) -> Result<(), TransportError>;
 

@@ -668,7 +668,7 @@ impl TransportContext {
                 ..
             } => {
                 if let Some(registry) = request_registry {
-                    match registry.mark_responded(self.peer, self.message_id) {
+                    match registry.begin_respond(self.peer, self.message_id) {
                         MarkResult::Updated => {}
                         MarkResult::Already(state) => {
                             tracing::debug!(
@@ -694,8 +694,16 @@ impl TransportContext {
                     .is_ok()
                 {
                     let fut = responder(response);
+                    let registry = request_registry.clone();
+                    let peer = self.peer;
+                    let message_id = self.message_id;
                     tokio::spawn(async move {
-                        if let Err(e) = fut.await {
+                        // Resolve the Responding claim with the real write result.
+                        let result = fut.await;
+                        if let Some(registry) = &registry {
+                            registry.finish_respond(peer, message_id, result.is_ok());
+                        }
+                        if let Err(e) = result {
                             tracing::debug!(
                                 "[RESPOND] fire-and-forget response send failed: {:?}",
                                 e
@@ -733,7 +741,7 @@ impl TransportContext {
         response: impl Into<Bytes>,
     ) -> Result<(), crate::error::TransportError> {
         let response: Bytes = response.into();
-        let fut = match &mut self.kind {
+        let (fut, registry) = match &mut self.kind {
             TransportContextKind::Request {
                 responder,
                 responded,
@@ -741,7 +749,7 @@ impl TransportContext {
                 ..
             } => {
                 if let Some(registry) = request_registry {
-                    match registry.mark_responded(self.peer, self.message_id) {
+                    match registry.begin_respond(self.peer, self.message_id) {
                         MarkResult::Updated => {}
                         _ => return Ok(()),
                     }
@@ -750,9 +758,9 @@ impl TransportContext {
                     .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok()
                 {
-                    Some(responder(response))
+                    (Some(responder(response)), request_registry.clone())
                 } else {
-                    None
+                    (None, None)
                 }
             }
             TransportContextKind::OneWay => {
@@ -763,7 +771,14 @@ impl TransportContext {
             }
         };
         match fut {
-            Some(f) => f.await,
+            Some(f) => {
+                let result = f.await;
+                if let Some(registry) = &registry {
+                    // Resolve the Responding claim with the real write result.
+                    registry.finish_respond(self.peer, self.message_id, result.is_ok());
+                }
+                result
+            }
             None => Ok(()),
         }
     }

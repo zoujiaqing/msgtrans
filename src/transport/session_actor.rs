@@ -126,11 +126,12 @@ impl SessionSender {
         data: impl Into<bytes::Bytes>,
     ) -> Result<(), crate::TransportError> {
         let data: bytes::Bytes = data.into();
-        // Idempotent response: mark the inbound request Responded so the registry
-        // stops tracking it and duplicate/late responses are dropped — giving the
-        // actor path the same response semantics as the legacy path.
+        // Claim the respond (Pending -> Responding): exactly one responder wins,
+        // duplicates/late responses are dropped. The claim is resolved below with
+        // the REAL write result, so `Ok(())` means the bytes were written to the
+        // transport, not merely queued.
         if let Some(registry) = &self.inbound_registry {
-            if registry.mark_responded(Some(self.session_id), message_id) != MarkResult::Updated {
+            if registry.begin_respond(Some(self.session_id), message_id) != MarkResult::Updated {
                 tracing::debug!(
                     "[ACTOR] Skip duplicate/late/unknown response: session={}, id={}",
                     self.session_id,
@@ -153,12 +154,12 @@ impl SessionSender {
             ext_header: Vec::new(),
             payload: data,
         };
-        let result = self.transport.send(response_packet).await;
-        if result.is_err() {
-            if let Some(registry) = &self.inbound_registry {
-                // Keep the actor path's failure metric consistent with legacy mode.
-                registry.record_response_send_failed();
-            }
+        let result = self.transport.send_confirmed(response_packet).await;
+        if let Some(registry) = &self.inbound_registry {
+            // Resolve the claim with the write outcome. A failed send is counted
+            // (response_send_failed) inside finish_respond; a session that died
+            // mid-send already drained the entry via close_session (NotFound here).
+            registry.finish_respond(Some(self.session_id), message_id, result.is_ok());
         }
         result
     }
@@ -225,7 +226,7 @@ impl Responder {
             payload: data,
         };
 
-        self.transport.send(response_packet).await
+        self.transport.send_confirmed(response_packet).await
     }
 
     /// Get the session ID

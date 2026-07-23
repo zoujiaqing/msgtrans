@@ -88,6 +88,23 @@ impl Transport {
         }
     }
 
+    /// Send with a write receipt: resolves only once the packet was actually
+    /// written (or the write/connection failed). The slot lock is held ONLY
+    /// for the bounded enqueue; the receipt is awaited after releasing it, so
+    /// a slow write cannot serialize other senders or block the close paths.
+    pub(crate) async fn send_confirmed(&self, packet: Packet) -> Result<(), TransportError> {
+        let receipt = {
+            let mut guard = self.slot.lock().await;
+            match guard.as_mut() {
+                Some(slot) => slot.connection.send_with_receipt(packet).await?,
+                None => {
+                    return Err(TransportError::connection_error("Not connected", false));
+                }
+            }
+        };
+        crate::adapters::outbound::await_receipt(receipt, "connection closed before write").await
+    }
+
     /// Apply a frame decode policy to the underlying connection (if connected).
     pub(crate) async fn set_frame_policy(&self, policy: crate::packet::FramePolicy) {
         if let Some(slot) = self.slot.lock().await.as_ref() {

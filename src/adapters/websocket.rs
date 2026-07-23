@@ -78,7 +78,7 @@ pub struct WebSocketAdapter<C> {
     /// Connection information
     connection_info: ConnectionInfo,
     /// Send queue
-    send_queue: mpsc::Sender<Packet>,
+    send_queue: mpsc::Sender<crate::adapters::outbound::Outbound>,
     /// Event sender
     event_pipe_rx: Option<crate::adapters::events::EventPipeRx>,
     /// Shutdown signal sender
@@ -164,7 +164,7 @@ impl<C> WebSocketAdapter<C> {
     async fn start_event_loop(
         mut stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
         state: crate::adapters::core::ConnState,
-        mut send_queue: mpsc::Receiver<Packet>,
+        mut send_queue: mpsc::Receiver<crate::adapters::outbound::Outbound>,
         mut shutdown_signal: mpsc::UnboundedReceiver<()>,
         event_pipe: crate::adapters::events::EventPipe,
         frame_policy: Arc<std::sync::atomic::AtomicU8>,
@@ -253,8 +253,9 @@ impl<C> WebSocketAdapter<C> {
                     }
 
                     // [SEND] Handle outgoing data - zero-copy optimization
-                    packet = send_queue.recv() => {
-                        if let Some(packet) = packet {
+                    item = send_queue.recv() => {
+                        if let Some(item) = item {
+                            let (packet, ack) = (item.packet, item.ack);
                             // tungstenite takes Bytes directly, so the packet's own
                             // Bytes buffer is handed over without another copy.
                             let message = Message::Binary(packet.to_bytes());
@@ -262,12 +263,20 @@ impl<C> WebSocketAdapter<C> {
                             match stream.send(message).await {
                                 Ok(_) => {
                                     tracing::debug!("[SEND] WebSocket send successful: {} bytes (session: {})", packet.payload.len(), current_session_id);
-
+                                    if let Some(ack) = ack {
+                                        let _ = ack.send(Ok(()));
+                                    }
                                     // Send send event
                                     event_pipe.diagnostic(TransportEvent::MessageSent { packet_id: packet.header.message_id });
                                 }
                                 Err(e) => {
                                     tracing::error!("[ERROR] WebSocket send error: {:?} (session: {})", e, current_session_id);
+                                    if let Some(ack) = ack {
+                                        let _ = ack.send(Err(crate::error::TransportError::connection_error(
+                                            "WebSocket write failed",
+                                            false,
+                                        )));
+                                    }
                                     // Send error: notify upper layer application of connection error for resource cleanup
                                     event_pipe.close(crate::error::CloseReason::Error(format!("{:?}", e)));
                                     state.set_status(crate::adapters::core::ConnStatus::Closed);
@@ -377,6 +386,19 @@ impl<C> WebSocketAdapter<C> {
 impl<C: Send + Sync + 'static> Connection for WebSocketAdapter<C> {
     async fn send(&mut self, packet: Packet) -> Result<(), TransportError> {
         crate::adapters::outbound::send_bounded(
+            &self.send_queue,
+            packet,
+            "websocket_outbound_queue",
+            "WebSocket connection closed",
+        )
+        .await
+    }
+
+    async fn send_with_receipt(
+        &mut self,
+        packet: Packet,
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<(), TransportError>>, TransportError> {
+        crate::adapters::outbound::enqueue_with_receipt(
             &self.send_queue,
             packet,
             "websocket_outbound_queue",

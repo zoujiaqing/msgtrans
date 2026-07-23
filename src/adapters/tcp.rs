@@ -340,7 +340,7 @@ pub struct TcpAdapter<C> {
     /// Connection information
     connection_info: ConnectionInfo,
     /// Send queue
-    send_queue: mpsc::Sender<Packet>,
+    send_queue: mpsc::Sender<crate::adapters::outbound::Outbound>,
     /// Consumer half of the bounded event pipe, taken exactly once.
     event_pipe_rx: Option<crate::adapters::events::EventPipeRx>,
     /// Shutdown signal sender
@@ -403,7 +403,7 @@ impl<C> TcpAdapter<C> {
     async fn start_event_loop(
         stream: TcpStream,
         state: crate::adapters::core::ConnState,
-        mut send_queue: mpsc::Receiver<Packet>,
+        mut send_queue: mpsc::Receiver<crate::adapters::outbound::Outbound>,
         mut shutdown_signal: mpsc::UnboundedReceiver<()>,
         event_pipe: crate::adapters::events::EventPipe,
         memory_pool: Arc<OptimizedMemoryPool>,
@@ -471,17 +471,27 @@ impl<C> TcpAdapter<C> {
                     }
 
                     // [SEND] Handle send data
-                    packet = send_queue.recv() => {
-                        if let Some(packet) = packet {
+                    item = send_queue.recv() => {
+                        if let Some(item) = item {
+                            let (packet, ack) = (item.packet, item.ack);
                             match Self::write_packet_to_stream(&mut write_half, &packet).await {
                                 Ok(_) => {
                                     tracing::debug!("[SEND] TCP send successful: {} bytes (session: {})", packet.payload.len(), current_session_id);
-
+                                    // Write receipt: the REAL result, after the write.
+                                    if let Some(ack) = ack {
+                                        let _ = ack.send(Ok(()));
+                                    }
                                     // Diagnostic tier: droppable under load.
                                     event_pipe.diagnostic(TransportEvent::MessageSent { packet_id: packet.header.message_id });
                                 }
                                 Err(e) => {
                                     tracing::error!("[SEND] TCP send error: {:?} (session: {})", e, current_session_id);
+                                    if let Some(ack) = ack {
+                                        let _ = ack.send(Err(crate::error::TransportError::connection_error(
+                                            "TCP write failed",
+                                            false,
+                                        )));
+                                    }
                                     // Send error: notify upper layer of connection error for resource cleanup
                                     event_pipe.close(crate::error::CloseReason::Error(format!("{:?}", e)));
                                     break;
@@ -562,6 +572,19 @@ impl TcpAdapter<TcpClientConfig> {
 impl<C: Send + Sync + 'static> Connection for TcpAdapter<C> {
     async fn send(&mut self, packet: Packet) -> Result<(), TransportError> {
         crate::adapters::outbound::send_bounded(
+            &self.send_queue,
+            packet,
+            "tcp_outbound_queue",
+            "TCP connection closed",
+        )
+        .await
+    }
+
+    async fn send_with_receipt(
+        &mut self,
+        packet: Packet,
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<(), TransportError>>, TransportError> {
+        crate::adapters::outbound::enqueue_with_receipt(
             &self.send_queue,
             packet,
             "tcp_outbound_queue",

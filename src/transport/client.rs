@@ -727,7 +727,7 @@ impl TransportClient {
                                                 ext_header: Vec::new(),
                                                 payload: response_data,
                                             };
-                                            transport.send(response_packet).await
+                                            transport.send_confirmed(response_packet).await
                                         })
                                     },
                                 ),

@@ -327,7 +327,7 @@ pub struct QuicAdapter<C> {
     stats: AdapterStats,
     connection_info: ConnectionInfo,
     /// Send queue
-    send_queue: mpsc::Sender<Packet>,
+    send_queue: mpsc::Sender<crate::adapters::outbound::Outbound>,
     /// Event sender
     event_pipe_rx: Option<crate::adapters::events::EventPipeRx>,
     /// Shutdown signal sender
@@ -417,7 +417,7 @@ impl<C> QuicAdapter<C> {
     async fn start_event_loop(
         connection: QuinnConnection,
         state: crate::adapters::core::ConnState,
-        mut send_queue: mpsc::Receiver<Packet>,
+        mut send_queue: mpsc::Receiver<crate::adapters::outbound::Outbound>,
         mut shutdown_signal: mpsc::UnboundedReceiver<()>,
         event_pipe: std::sync::Arc<crate::adapters::events::EventPipe>,
         is_server: bool,
@@ -632,8 +632,13 @@ impl<C> QuicAdapter<C> {
                     // Batch serialize all packets into write buffer
                     write_buf.clear();
                     let mut packet_ids = Vec::with_capacity(count);
+                    let mut acks = Vec::new();
 
-                    for packet in batch.drain(..) {
+                    for item in batch.drain(..) {
+                        let packet = item.packet;
+                        if let Some(ack) = item.ack {
+                            acks.push(ack);
+                        }
                         let packet_id = packet.header.message_id;
                         packet_ids.push(packet_id);
 
@@ -653,6 +658,13 @@ impl<C> QuicAdapter<C> {
                             e,
                             current_session_id
                         );
+                        // The whole batch failed: every receipt in it fails.
+                        for ack in acks {
+                            let _ = ack.send(Err(crate::error::TransportError::connection_error(
+                                "QUIC write failed",
+                                false,
+                            )));
+                        }
                         write_event_pipe.close(crate::error::CloseReason::Error(format!(
                             "Write error: {:?}",
                             e
@@ -667,7 +679,10 @@ impl<C> QuicAdapter<C> {
                         current_session_id
                     );
 
-                    // Send confirmation events for all packets in batch
+                    // Write receipts for the whole batch, then diagnostics.
+                    for ack in acks {
+                        let _ = ack.send(Ok(()));
+                    }
                     for packet_id in packet_ids {
                         write_event_pipe.diagnostic(TransportEvent::MessageSent { packet_id });
                     }
@@ -770,6 +785,19 @@ impl QuicAdapter<QuicClientConfig> {
 impl<C: Send + Sync + 'static> Connection for QuicAdapter<C> {
     async fn send(&mut self, packet: Packet) -> Result<(), TransportError> {
         crate::adapters::outbound::send_bounded(
+            &self.send_queue,
+            packet,
+            "quic_outbound_queue",
+            "QUIC connection closed",
+        )
+        .await
+    }
+
+    async fn send_with_receipt(
+        &mut self,
+        packet: Packet,
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<(), TransportError>>, TransportError> {
+        crate::adapters::outbound::enqueue_with_receipt(
             &self.send_queue,
             packet,
             "quic_outbound_queue",

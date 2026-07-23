@@ -61,6 +61,11 @@ pub enum RequestState {
     TimedOut = 2,
     SessionClosed = 3,
     Dropped = 4,
+    /// A response send is in flight: claimed by exactly one responder, not
+    /// yet confirmed written. Duplicates are refused while here.
+    Responding = 5,
+    /// The response send failed (enqueue or write): terminal, counted.
+    SendFailed = 6,
 }
 
 impl RequestState {
@@ -71,6 +76,8 @@ impl RequestState {
             2 => Some(Self::TimedOut),
             3 => Some(Self::SessionClosed),
             4 => Some(Self::Dropped),
+            5 => Some(Self::Responding),
+            6 => Some(Self::SendFailed),
             _ => None,
         }
     }
@@ -488,6 +495,66 @@ impl RequestRegistry {
         self.mark_responded_key(RequestKey::inbound(session_id, request_id))
     }
 
+    /// Claim an inbound request for responding: Pending -> Responding.
+    /// Exactly one responder wins; duplicates (including a concurrent
+    /// responder currently in flight) are refused with the observed state.
+    pub fn begin_respond(&self, session_id: Option<SessionId>, request_id: u32) -> MarkResult {
+        let key = RequestKey::inbound(session_id, request_id);
+        let Some(entry) = self.entries.get(&key) else {
+            self.counters
+                .duplicate_response_total
+                .fetch_add(1, Ordering::Relaxed);
+            return MarkResult::NotFound;
+        };
+        match entry.try_transition(RequestState::Pending, RequestState::Responding) {
+            Ok(_) => MarkResult::Updated,
+            Err(state) => {
+                if matches!(state, RequestState::Responded | RequestState::Responding) {
+                    self.counters
+                        .duplicate_response_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                MarkResult::Already(state)
+            }
+        }
+    }
+
+    /// Resolve a claimed respond: Responding -> Responded (write confirmed)
+    /// or Responding -> SendFailed. Both are terminal; the entry is removed
+    /// and the pending gauge decremented exactly once.
+    pub fn finish_respond(
+        &self,
+        session_id: Option<SessionId>,
+        request_id: u32,
+        write_confirmed: bool,
+    ) -> MarkResult {
+        let key = RequestKey::inbound(session_id, request_id);
+        let Some(entry) = self.entries.get(&key) else {
+            return MarkResult::NotFound;
+        };
+        let target = if write_confirmed {
+            RequestState::Responded
+        } else {
+            RequestState::SendFailed
+        };
+        match entry.try_transition(RequestState::Responding, target) {
+            Ok(_) => {
+                self.counters
+                    .pending_requests
+                    .fetch_sub(1, Ordering::Relaxed);
+                if !write_confirmed {
+                    self.counters
+                        .response_send_failed_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                drop(entry);
+                self.remove_terminal_entry(key);
+                MarkResult::Updated
+            }
+            Err(state) => MarkResult::Already(state),
+        }
+    }
+
     fn mark_responded_key(&self, key: RequestKey) -> MarkResult {
         let Some(entry) = self.entries.get(&key) else {
             self.counters
@@ -570,10 +637,16 @@ impl RequestRegistry {
         for key in runtime.requests.iter() {
             let key = *key.key();
             if let Some(entry) = self.entries.get(&key) {
-                if entry
+                // Pending AND Responding both die with their session — a
+                // respond in flight when the connection ends must not leave
+                // an immortal Responding entry behind.
+                let died = entry
                     .try_transition(RequestState::Pending, RequestState::SessionClosed)
                     .is_ok()
-                {
+                    || entry
+                        .try_transition(RequestState::Responding, RequestState::SessionClosed)
+                        .is_ok();
+                if died {
                     closed += 1;
                     self.counters
                         .pending_requests
@@ -721,6 +794,100 @@ mod tests {
         assert_eq!(snapshot.pending_requests, 0);
         assert_eq!(snapshot.duplicate_response_total, 1);
         assert_eq!(registry.active_len(), 0);
+    }
+
+    #[test]
+    fn begin_finish_respond_confirmed_write() {
+        let registry = RequestRegistry::new();
+        let sid = Some(SessionId(7));
+        open(&registry, &[7]);
+        assert!(registry.register(1, sid, 1, Duration::from_secs(3)));
+
+        // Claim: Pending -> Responding, exactly once.
+        assert_eq!(registry.begin_respond(sid, 1), MarkResult::Updated);
+        assert_eq!(
+            registry.get_state(sid, 1, RequestDirection::Inbound),
+            Some(RequestState::Responding)
+        );
+        // Concurrent duplicate is refused and counted while in flight.
+        assert_eq!(
+            registry.begin_respond(sid, 1),
+            MarkResult::Already(RequestState::Responding)
+        );
+
+        // Write confirmed: terminal, entry removed, gauge decremented once.
+        assert_eq!(registry.finish_respond(sid, 1, true), MarkResult::Updated);
+        assert_eq!(registry.get_state(sid, 1, RequestDirection::Inbound), None);
+        assert_eq!(registry.finish_respond(sid, 1, true), MarkResult::NotFound);
+
+        let snapshot = registry.counters_snapshot();
+        assert_eq!(snapshot.pending_requests, 0);
+        assert_eq!(snapshot.duplicate_response_total, 1);
+        assert_eq!(snapshot.response_send_failed_total, 0);
+        assert_eq!(registry.active_len(), 0);
+    }
+
+    #[test]
+    fn finish_respond_failed_write_is_terminal_and_counted() {
+        let registry = RequestRegistry::new();
+        let sid = Some(SessionId(7));
+        open(&registry, &[7]);
+        assert!(registry.register(1, sid, 1, Duration::from_secs(3)));
+
+        assert_eq!(registry.begin_respond(sid, 1), MarkResult::Updated);
+        assert_eq!(registry.finish_respond(sid, 1, false), MarkResult::Updated);
+        // Terminal: no retry slot, entry gone.
+        assert_eq!(registry.get_state(sid, 1, RequestDirection::Inbound), None);
+        assert_eq!(registry.begin_respond(sid, 1), MarkResult::NotFound);
+
+        let snapshot = registry.counters_snapshot();
+        assert_eq!(snapshot.pending_requests, 0);
+        assert_eq!(snapshot.response_send_failed_total, 1);
+        assert_eq!(registry.active_len(), 0);
+    }
+
+    #[test]
+    fn close_session_drains_responding_entries() {
+        // A respond in flight when the session dies must not leave an immortal
+        // Responding entry: close_session transitions it to SessionClosed, and
+        // the late finish_respond observes NotFound (no double decrement).
+        let registry = RequestRegistry::new();
+        let sid = Some(SessionId(7));
+        open(&registry, &[7]);
+        assert!(registry.register(1, sid, 1, Duration::from_secs(3)));
+        assert_eq!(registry.begin_respond(sid, 1), MarkResult::Updated);
+
+        assert_eq!(registry.close_session_pending(SessionId(7)), 1);
+        assert_eq!(registry.get_state(sid, 1, RequestDirection::Inbound), None);
+        assert_eq!(registry.finish_respond(sid, 1, true), MarkResult::NotFound);
+
+        let snapshot = registry.counters_snapshot();
+        assert_eq!(snapshot.pending_requests, 0);
+        assert_eq!(registry.active_len(), 0);
+    }
+
+    #[test]
+    fn timeout_does_not_touch_responding() {
+        // A claimed respond is past the point of timing out: only the write
+        // outcome (or session close) may resolve it.
+        let registry = RequestRegistry::new_with_timing(32, Duration::from_millis(10));
+        let sid = Some(SessionId(7));
+        open(&registry, &[7]);
+        assert!(registry.register(1, sid, 1, Duration::from_millis(1)));
+        assert_eq!(registry.begin_respond(sid, 1), MarkResult::Updated);
+
+        std::thread::sleep(Duration::from_millis(20));
+        let mut timeout_total = 0usize;
+        for _ in 0..4 {
+            timeout_total += registry.scan_timeout_bucket();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(timeout_total, 0);
+        assert_eq!(
+            registry.get_state(sid, 1, RequestDirection::Inbound),
+            Some(RequestState::Responding)
+        );
+        assert_eq!(registry.finish_respond(sid, 1, true), MarkResult::Updated);
     }
 
     #[test]

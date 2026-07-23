@@ -17,6 +17,26 @@ use crate::error::TransportError;
 use crate::packet::Packet;
 use std::time::Duration;
 use tokio::sync::mpsc::{self, error::SendTimeoutError};
+use tokio::sync::oneshot;
+
+/// One outbound queue item: the packet, plus an optional write receipt.
+///
+/// `ack: None` is the fire-and-forget tier (enqueue success is the only
+/// signal). `ack: Some` is the confirmed tier: the write loop sends the REAL
+/// write result after the socket write, and dropping the sender (connection
+/// died before the write) is observed by the caller as a connection error —
+/// "accepted for delivery" and "delivered to the socket" are no longer
+/// conflated.
+pub(crate) struct Outbound {
+    pub packet: Packet,
+    pub ack: Option<oneshot::Sender<Result<(), TransportError>>>,
+}
+
+impl Outbound {
+    pub fn fire_and_forget(packet: Packet) -> Self {
+        Self { packet, ack: None }
+    }
+}
 
 /// Depth of each connection's outbound queue.
 ///
@@ -40,12 +60,75 @@ pub(crate) const SEND_QUEUE_WAIT: Duration = Duration::from_millis(100);
 /// Returns a resource error (carrying the real queued depth) if the queue stays
 /// full for [`SEND_QUEUE_WAIT`], or a connection error if the peer is gone.
 pub(crate) async fn send_bounded(
-    queue: &mpsc::Sender<Packet>,
+    queue: &mpsc::Sender<Outbound>,
     packet: Packet,
     queue_name: &'static str,
     closed_msg: &'static str,
 ) -> Result<(), TransportError> {
-    match queue.send_timeout(packet, SEND_QUEUE_WAIT).await {
+    send_item(
+        queue,
+        Outbound::fire_and_forget(packet),
+        queue_name,
+        closed_msg,
+    )
+    .await
+}
+
+/// Enqueue a packet AND await the write loop's receipt: `Ok` means the packet
+/// was actually written to the socket (or its OS buffer), `Err` means the
+/// enqueue failed, the write failed, or the connection died before the write.
+pub(crate) async fn send_confirmed_bounded(
+    queue: &mpsc::Sender<Outbound>,
+    packet: Packet,
+    queue_name: &'static str,
+    closed_msg: &'static str,
+) -> Result<(), TransportError> {
+    let rx = enqueue_with_receipt(queue, packet, queue_name, closed_msg).await?;
+    await_receipt(rx, closed_msg).await
+}
+
+/// Enqueue with a receipt WITHOUT awaiting it — callers that hold a lock for
+/// the enqueue must await the receipt after releasing it, or one slow write
+/// would serialize every other sender behind that lock.
+pub(crate) async fn enqueue_with_receipt(
+    queue: &mpsc::Sender<Outbound>,
+    packet: Packet,
+    queue_name: &'static str,
+    closed_msg: &'static str,
+) -> Result<oneshot::Receiver<Result<(), TransportError>>, TransportError> {
+    let (tx, rx) = oneshot::channel();
+    send_item(
+        queue,
+        Outbound {
+            packet,
+            ack: Some(tx),
+        },
+        queue_name,
+        closed_msg,
+    )
+    .await?;
+    Ok(rx)
+}
+
+/// Await a write receipt; a dropped sender (connection ended before the
+/// write) is a connection error, not silence.
+pub(crate) async fn await_receipt(
+    rx: oneshot::Receiver<Result<(), TransportError>>,
+    closed_msg: &'static str,
+) -> Result<(), TransportError> {
+    match rx.await {
+        Ok(result) => result,
+        Err(_) => Err(TransportError::connection_error(closed_msg, false)),
+    }
+}
+
+async fn send_item(
+    queue: &mpsc::Sender<Outbound>,
+    item: Outbound,
+    queue_name: &'static str,
+    closed_msg: &'static str,
+) -> Result<(), TransportError> {
+    match queue.send_timeout(item, SEND_QUEUE_WAIT).await {
         Ok(()) => Ok(()),
         Err(SendTimeoutError::Timeout(_)) => Err(TransportError::resource_error(
             queue_name,
@@ -69,7 +152,7 @@ mod tests {
 
     #[tokio::test]
     async fn sends_immediately_when_queue_has_room() {
-        let (tx, _rx) = mpsc::channel(2);
+        let (tx, _rx) = mpsc::channel::<Outbound>(2);
         assert!(send_bounded(&tx, packet(1), "q", "closed").await.is_ok());
     }
 
@@ -77,8 +160,8 @@ mod tests {
     /// delivered once the writer drains it, not rejected outright.
     #[tokio::test]
     async fn absorbs_transient_burst_instead_of_failing() {
-        let (tx, mut rx) = mpsc::channel(1);
-        tx.send(packet(1)).await.unwrap();
+        let (tx, mut rx) = mpsc::channel::<Outbound>(1);
+        tx.send(Outbound::fire_and_forget(packet(1))).await.unwrap();
 
         // Writer drains shortly after, well within SEND_QUEUE_WAIT.
         tokio::spawn(async move {
@@ -93,9 +176,9 @@ mod tests {
 
     #[tokio::test]
     async fn reports_real_depth_when_queue_stays_full() {
-        let (tx, _rx) = mpsc::channel(2);
-        tx.send(packet(1)).await.unwrap();
-        tx.send(packet(2)).await.unwrap();
+        let (tx, _rx) = mpsc::channel::<Outbound>(2);
+        tx.send(Outbound::fire_and_forget(packet(1))).await.unwrap();
+        tx.send(Outbound::fire_and_forget(packet(2))).await.unwrap();
 
         let error = send_bounded(&tx, packet(3), "tcp_outbound_queue", "closed")
             .await
@@ -113,7 +196,7 @@ mod tests {
 
     #[tokio::test]
     async fn reports_connection_closed_when_peer_is_gone() {
-        let (tx, rx) = mpsc::channel(1);
+        let (tx, rx) = mpsc::channel::<Outbound>(1);
         drop(rx);
 
         let error = send_bounded(&tx, packet(1), "q", "TCP connection closed")
@@ -124,5 +207,42 @@ mod tests {
             matches!(error, TransportError::Connection { .. }),
             "unexpected error: {error:?}"
         );
+    }
+
+    /// Confirmed tier: Ok only after the writer acks the actual write.
+    #[tokio::test]
+    async fn confirmed_send_reports_the_write_result() {
+        let (tx, mut rx) = mpsc::channel::<Outbound>(2);
+        let writer = tokio::spawn(async move {
+            let item = rx.recv().await.expect("item");
+            item.ack.expect("ack").send(Ok(())).unwrap();
+            let item = rx.recv().await.expect("item");
+            item.ack
+                .expect("ack")
+                .send(Err(TransportError::connection_error("write failed", false)))
+                .unwrap();
+        });
+        assert!(send_confirmed_bounded(&tx, packet(1), "q", "closed")
+            .await
+            .is_ok());
+        assert!(send_confirmed_bounded(&tx, packet(2), "q", "closed")
+            .await
+            .is_err());
+        writer.await.unwrap();
+    }
+
+    /// Writer dying before the write is a connection error, not silence.
+    #[tokio::test]
+    async fn confirmed_send_fails_when_writer_drops_the_ack() {
+        let (tx, mut rx) = mpsc::channel::<Outbound>(1);
+        let writer = tokio::spawn(async move {
+            let item = rx.recv().await.expect("item");
+            drop(item.ack); // connection died before the write
+        });
+        let err = send_confirmed_bounded(&tx, packet(1), "q", "conn closed")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TransportError::Connection { .. }));
+        writer.await.unwrap();
     }
 }
