@@ -1,6 +1,12 @@
 // The README is the crate documentation, which also makes its examples part of
-// the doctest suite so they cannot drift from the real API.
-#![doc = include_str!("../README.md")]
+// the doctest suite so they cannot drift from the real API. It documents the
+// default (all-protocols) build and its examples import TCP/WebSocket/QUIC
+// types freely, so it is only attached when all three features are enabled —
+// partial builds skip the README doctests instead of failing to compile them.
+#![cfg_attr(
+    all(feature = "tcp", feature = "websocket", feature = "quic"),
+    doc = include_str!("../README.md")
+)]
 #![allow(unused_variables)]
 #![allow(unused_mut)]
 #![allow(dead_code)]

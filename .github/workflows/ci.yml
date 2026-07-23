@@ -51,6 +51,13 @@ jobs:
         run: cargo check --no-default-features --features "${{ matrix.features }}" --all-targets
         env:
           RUSTFLAGS: -D warnings
+      # --all-targets does NOT cover doctests; the README is attached as crate
+      # docs (full-feature builds only), so this catches doc examples drifting
+      # from what each feature combination actually exports.
+      - name: Doctests
+        run: cargo test --no-default-features --features "${{ matrix.features }}" --doc
+        env:
+          RUSTFLAGS: -D warnings
 
   # Style gates are advisory for now: the crate predates a clean fmt/clippy pass,
   # so these run but do not block. Tighten to required once the backlog is clear.

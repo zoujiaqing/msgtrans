@@ -227,6 +227,8 @@ impl OptimizedReadBuffer {
     fn decode_limits() -> crate::packet::DecodeLimits {
         crate::packet::DecodeLimits {
             max_frame_size: FIXED_HEADER_SIZE + MAX_EXT_HEADER_SIZE + MAX_PAYLOAD_SIZE,
+            max_payload_size: MAX_PAYLOAD_SIZE,
+            max_ext_header_size: MAX_EXT_HEADER_SIZE,
         }
     }
 
@@ -251,30 +253,29 @@ impl OptimizedReadBuffer {
         loop {
             match Packet::decode_one_with(&self.buffer, &limits) {
                 Ok(Some((packet, consumed))) => {
-                    // Consume exactly the decoded frame from the read buffer.
+                    // Per-field limits were enforced by the codec from the
+                    // fixed header alone, so a decoded frame is within caps
+                    // by construction. Consume exactly the decoded frame.
                     let _ = self.buffer.split_to(consumed);
-                    // Enforce the same per-field caps as the resync scanner
-                    // (the codec only caps the total frame size).
-                    if packet.ext_header.len() > MAX_EXT_HEADER_SIZE
-                        || packet.payload.len() > MAX_PAYLOAD_SIZE
-                    {
-                        if strict || self.stats.packets_parsed == 0 {
-                            return Err(TcpError::Config(
-                                "Frame exceeds TCP size limits".to_string(),
-                            ));
-                        }
-                        if !self.try_resync_frame() {
-                            return Err(TcpError::BufferOverflow);
-                        }
-                        continue;
-                    }
                     self.stats.packets_parsed += 1;
                     return Ok(Some(packet));
                 }
                 Ok(None) => return Ok(None),
+                Err(e @ PacketError::FrameTooLarge { .. }) => {
+                    // Refused from the header, BEFORE waiting for or buffering
+                    // the declared payload, and before consuming any bytes.
+                    // Both policies close: resyncing from inside a frame the
+                    // peer declared but we refused would only skip past valid
+                    // data (the peer is either broken or hostile).
+                    tracing::warn!(
+                        "[PARSE] Oversized declared frame, closing connection: {:?}",
+                        e
+                    );
+                    return Err(TcpError::Packet(e));
+                }
                 Err(e) => {
-                    // Invalid header (version/type/compression) or oversized
-                    // declared frame at the front of the stream.
+                    // Invalid header (version/type/compression) at the front
+                    // of the stream. Nothing has been consumed.
                     if strict {
                         tracing::warn!(
                             "[PARSE] Invalid header under strict policy, closing connection: {:?}",
@@ -872,5 +873,29 @@ mod strict_stream_tests {
         bytes[13] = 0xFF;
         feed(&mut f, &bytes);
         assert!(f.try_parse_next_packet(true).is_err());
+    }
+
+    /// The TCP-specific payload cap (1 MiB) bites from the header ALONE:
+    /// payload_len = 1 MiB + 1 with only the 16-byte header buffered is
+    /// rejected immediately under BOTH policies — no waiting for the payload,
+    /// no resync into it, even after valid packets were parsed.
+    #[test]
+    fn payload_one_over_tcp_cap_rejects_from_header_alone_under_both_policies() {
+        for strict in [true, false] {
+            let mut f = framer();
+            // Establish a valid stream first so this is not the first-packet
+            // fast-fail path.
+            feed(&mut f, &Packet::one_way(1, b"ok".to_vec()).to_bytes());
+            assert!(f.try_parse_next_packet(strict).expect("ok").is_some());
+
+            let mut header = Packet::one_way(2, Vec::new()).to_bytes().to_vec();
+            header[10..14].copy_from_slice(&((MAX_PAYLOAD_SIZE as u32) + 1).to_be_bytes());
+            assert_eq!(header.len(), FIXED_HEADER_SIZE, "header only, no payload");
+            feed(&mut f, &header);
+            assert!(
+                f.try_parse_next_packet(strict).is_err(),
+                "strict={strict}: oversized payload must be refused from the header"
+            );
+        }
     }
 }

@@ -116,6 +116,12 @@ impl From<u8> for FramePolicy {
 pub struct DecodeLimits {
     /// Maximum total frame size in bytes (fixed header + ext header + payload).
     pub max_frame_size: usize,
+    /// Maximum payload size in bytes. Checked from the fixed header alone, so
+    /// an oversized frame is refused BEFORE its payload is awaited/buffered.
+    pub max_payload_size: usize,
+    /// Maximum extension header size in bytes (the wire field is u16, so
+    /// values above 65535 cannot occur; a tighter cap rejects earlier).
+    pub max_ext_header_size: usize,
 }
 
 /// Default frame cap: matches the decompression bomb cap.
@@ -125,6 +131,8 @@ impl Default for DecodeLimits {
     fn default() -> Self {
         Self {
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
+            max_payload_size: DEFAULT_MAX_FRAME_SIZE,
+            max_ext_header_size: u16::MAX as usize,
         }
     }
 }
@@ -567,10 +575,23 @@ impl Packet {
         // targets for payload_len near u32::MAX (reversed slice range =>
         // panic). u64 cannot overflow here (16 + u16::MAX + u32::MAX).
         let declared = 16u64 + header.ext_header_len as u64 + header.payload_len as u64;
+        // All limits are enforced from the fixed header alone, BEFORE any
+        // Ok(None): a frame that must never be accepted is refused up front,
+        // not buffered toward its declared size first. Hard errors, not
+        // "incomplete".
+        if header.payload_len as u64 > limits.max_payload_size as u64 {
+            return Err(PacketError::FrameTooLarge {
+                declared: header.payload_len as u64,
+                limit: limits.max_payload_size,
+            });
+        }
+        if header.ext_header_len as usize > limits.max_ext_header_size {
+            return Err(PacketError::FrameTooLarge {
+                declared: header.ext_header_len as u64,
+                limit: limits.max_ext_header_size,
+            });
+        }
         if declared > limits.max_frame_size as u64 {
-            // A hard error, NOT Ok(None): "incomplete" would make a streaming
-            // caller buffer toward 4 GiB waiting for a frame that must never
-            // be accepted.
             return Err(PacketError::FrameTooLarge {
                 declared,
                 limit: limits.max_frame_size,
@@ -816,15 +837,60 @@ mod tests {
         let encoded = p.to_bytes();
         let tight = DecodeLimits {
             max_frame_size: encoded.len(),
+            ..DecodeLimits::default()
         };
         assert!(Packet::decode_one_with(&encoded, &tight).unwrap().is_some());
         let too_tight = DecodeLimits {
             max_frame_size: encoded.len() - 1,
+            ..DecodeLimits::default()
         };
         assert!(matches!(
             Packet::decode_one_with(&encoded, &too_tight),
             Err(PacketError::FrameTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn per_field_limits_reject_from_the_header_alone() {
+        // Payload one byte over the cap, only the 16-byte header present: the
+        // decoder must refuse immediately instead of reporting "incomplete"
+        // and letting the caller buffer the whole oversized payload.
+        let limits = DecodeLimits {
+            max_frame_size: 2 * 1024 * 1024,
+            max_payload_size: 1024 * 1024,
+            max_ext_header_size: 64 * 1024,
+        };
+        let mut header_only = Packet::one_way(1, Vec::new()).to_bytes().to_vec();
+        let over = (1024 * 1024 + 1u32).to_be_bytes();
+        header_only[10..14].copy_from_slice(&over);
+        assert!(matches!(
+            Packet::decode_one_with(&header_only, &limits),
+            Err(PacketError::FrameTooLarge { declared, limit })
+                if declared == 1024 * 1024 + 1 && limit == 1024 * 1024
+        ));
+
+        // Ext header over its own cap is likewise refused from the header
+        // (the wire field is u16, so the cap must be below 65535 to bite).
+        let mut header_only = Packet::one_way(1, Vec::new()).to_bytes().to_vec();
+        header_only[8..10].copy_from_slice(&2048u16.to_be_bytes());
+        let tight_ext = DecodeLimits {
+            max_ext_header_size: 1024,
+            ..limits
+        };
+        assert!(matches!(
+            Packet::decode_one_with(&header_only, &tight_ext),
+            Err(PacketError::FrameTooLarge { .. })
+        ));
+
+        // At the payload cap with the payload actually present: decodes.
+        let p = Packet::one_way(2, vec![0u8; 1024]);
+        let capped = DecodeLimits {
+            max_payload_size: 1024,
+            ..limits
+        };
+        assert!(Packet::decode_one_with(&p.to_bytes(), &capped)
+            .unwrap()
+            .is_some());
     }
 
     #[test]
