@@ -272,12 +272,17 @@ impl TransportClient {
         &mut self,
         protocol_config: &dyn DynClientConfig,
     ) -> Result<SessionId, TransportError> {
+        // Single client SPI: build the connection through the object-safe
+        // DynClientConfig, no per-protocol name match or downcast. Any config
+        // implementing the trait works, so custom protocols are truly
+        // extensible on the client side too.
+        let limits = self.inner.config().connection_limits;
+        protocol_config
+            .validate_dyn()
+            .map_err(|e| TransportError::config_error("protocol", e.to_string()))?;
+
         let mut last_error = None;
         let max_retries = self.retry_config.max_retries;
-
-        // never_loop fires only in a no-protocol-feature build (the match has
-        // no arms); with any protocol enabled the loop retries normally.
-        #[allow(clippy::never_loop)]
         for attempt in 0..=max_retries {
             if attempt > 0 {
                 let delay = self.calculate_retry_delay(attempt);
@@ -289,91 +294,19 @@ impl TransportClient {
                 );
                 tokio::time::sleep(delay).await;
             }
-
-            // Connect according to protocol type
-            match protocol_config.protocol_name() {
-                #[cfg(feature = "tcp")]
-                "tcp" => {
-                    if let Some(tcp_config) = protocol_config
-                        .as_any()
-                        .downcast_ref::<crate::protocol::TcpClientConfig>()
-                    {
-                        match self.inner.connect_with_config(tcp_config.clone()).await {
-                            Ok(session_id) => return Ok(session_id),
-                            Err(e) => {
-                                last_error = Some(e);
-                                tracing::warn!(
-                                    "TCP connection failed (attempt {}): {:?}",
-                                    attempt + 1,
-                                    last_error
-                                );
-                            }
-                        }
-                    } else {
-                        return Err(TransportError::config_error(
-                            "protocol",
-                            "Invalid TCP config",
-                        ));
-                    }
-                }
-                #[cfg(feature = "websocket")]
-                "websocket" => {
-                    if let Some(ws_config) = protocol_config
-                        .as_any()
-                        .downcast_ref::<crate::protocol::WebSocketClientConfig>(
-                    ) {
-                        match self.inner.connect_with_config(ws_config.clone()).await {
-                            Ok(session_id) => return Ok(session_id),
-                            Err(e) => {
-                                last_error = Some(e);
-                                tracing::warn!(
-                                    "WebSocket connection failed (attempt {}): {:?}",
-                                    attempt + 1,
-                                    last_error
-                                );
-                            }
-                        }
-                    } else {
-                        return Err(TransportError::config_error(
-                            "protocol",
-                            "Invalid WebSocket config",
-                        ));
-                    }
-                }
-                #[cfg(feature = "quic")]
-                "quic" => {
-                    if let Some(quic_config) = protocol_config
-                        .as_any()
-                        .downcast_ref::<crate::protocol::QuicClientConfig>()
-                    {
-                        match self.inner.connect_with_config(quic_config.clone()).await {
-                            Ok(session_id) => return Ok(session_id),
-                            Err(e) => {
-                                last_error = Some(e);
-                                tracing::warn!(
-                                    "QUIC connection failed (attempt {}): {:?}",
-                                    attempt + 1,
-                                    last_error
-                                );
-                            }
-                        }
-                    } else {
-                        return Err(TransportError::config_error(
-                            "protocol",
-                            "Invalid QUIC config",
-                        ));
-                    }
-                }
-                protocol_name => {
-                    return Err(TransportError::config_error(
-                        "protocol",
-                        format!("Unsupported protocol: {}", protocol_name),
-                    ));
+            match protocol_config.build_connection_dyn(limits).await {
+                Ok(connection) => return Ok(self.inner.set_connection(connection).await),
+                Err(e) => {
+                    tracing::warn!(
+                        "{} connection failed (attempt {}): {:?}",
+                        protocol_config.protocol_name(),
+                        attempt + 1,
+                        e
+                    );
+                    last_error = Some(e);
                 }
             }
         }
-
-        // All retries failed
         Err(last_error.unwrap_or_else(|| {
             TransportError::connection_error("Connection failed after all retries", true)
         }))
