@@ -637,6 +637,36 @@ impl Packet {
         )))
     }
 
+    /// The total on-wire length of the frame at the front of `bytes`, or
+    /// `Ok(None)` when the buffer does not yet hold a complete frame. Lets a
+    /// framed byte-stream reader (e.g. TCP) split exactly one frame off an
+    /// owned buffer and then decode it zero-copy with [`Self::decode_exact_from`].
+    pub fn frame_len(bytes: &[u8], limits: &DecodeLimits) -> Result<Option<usize>, PacketError> {
+        Ok(Self::frame_layout(bytes, limits)?.map(|l| l.total))
+    }
+
+    /// Zero-copy decode of a `Bytes` holding EXACTLY one frame: the body is
+    /// sliced from `frame` (ref-counted, no copy), and trailing bytes are a
+    /// protocol error. Pair with [`Self::frame_len`] to carve the frame off a
+    /// stream buffer.
+    pub fn decode_exact_from(frame: &Bytes, limits: &DecodeLimits) -> Result<Self, PacketError> {
+        match Self::decode_one_from(frame, limits)? {
+            Some((packet, consumed)) => {
+                if consumed != frame.len() {
+                    return Err(PacketError::InvalidPacket(format!(
+                        "trailing bytes after packet: consumed {consumed} of {}",
+                        frame.len()
+                    )));
+                }
+                Ok(packet)
+            }
+            None => Err(PacketError::InvalidPacket(format!(
+                "packet incomplete: {} bytes",
+                frame.len()
+            ))),
+        }
+    }
+
     /// Parse and limit-check the fixed header, returning the frame layout, or
     /// `Ok(None)` when the buffer does not yet hold a complete frame. Shared by
     /// the borrowed ([`Self::decode_one_with`]) and owned

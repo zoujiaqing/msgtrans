@@ -575,7 +575,11 @@ impl<C> QuicAdapter<C> {
                                         read_frame_policy
                                             .load(std::sync::atomic::Ordering::Relaxed),
                                     ) == crate::packet::FramePolicy::Strict;
-                                    let packet = if payload_buf.len() < 16 {
+                                    // Zero-copy: take ownership of the read
+                                    // buffer as Bytes (moves the allocation, no
+                                    // copy), then slice the body out of it.
+                                    let frame = bytes::Bytes::from(payload_buf);
+                                    let packet = if frame.len() < 16 {
                                         if strict {
                                             read_event_pipe.close(
                                                 crate::error::CloseReason::Error(
@@ -584,9 +588,12 @@ impl<C> QuicAdapter<C> {
                                             );
                                             break;
                                         }
-                                        Packet::one_way(0, payload_buf)
+                                        Packet::one_way(0, frame)
                                     } else {
-                                        match Packet::from_bytes(&payload_buf) {
+                                        match Packet::decode_exact_from(
+                                            &frame,
+                                            &crate::packet::DecodeLimits::default(),
+                                        ) {
                                             Ok(packet) => packet,
                                             Err(_) if strict => {
                                                 read_event_pipe.close(
@@ -597,7 +604,7 @@ impl<C> QuicAdapter<C> {
                                                 );
                                                 break;
                                             }
-                                            Err(_) => Packet::one_way(0, payload_buf),
+                                            Err(_) => Packet::one_way(0, frame),
                                         }
                                     };
 

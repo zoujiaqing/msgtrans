@@ -547,8 +547,9 @@ impl<C> WebSocketAdapter<C> {
                     return MessageProcessResult::Packet(packet);
                 }
 
-                // Try to parse as complete Packet
-                match Packet::from_bytes(&data) {
+                // Zero-copy: `data` is an owned Bytes (tungstenite), so
+                // decode_exact_from slices the body out without a payload copy.
+                match Packet::decode_exact_from(&data, &crate::packet::DecodeLimits::default()) {
                     Ok(packet) => {
                         tracing::debug!(
                             "[RECV] WebSocket packet parsing successful: {} bytes",

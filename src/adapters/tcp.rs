@@ -250,12 +250,13 @@ impl OptimizedReadBuffer {
     fn try_parse_next_packet(&mut self, strict: bool) -> Result<Option<Packet>, TcpError> {
         let limits = Self::decode_limits();
         loop {
-            match Packet::decode_one_with(&self.buffer, &limits) {
-                Ok(Some((packet, consumed))) => {
-                    // Per-field limits were enforced by the codec from the
-                    // fixed header alone, so a decoded frame is within caps
-                    // by construction. Consume exactly the decoded frame.
-                    let _ = self.buffer.split_to(consumed);
+            // Zero-copy: peek the header for the frame length, split that many
+            // bytes off the read buffer as an owned Bytes, and slice the body
+            // out of it (ref-counted, no payload memcpy).
+            match Packet::frame_len(&self.buffer, &limits) {
+                Ok(Some(total)) => {
+                    let frame = self.buffer.split_to(total).freeze();
+                    let packet = Packet::decode_exact_from(&frame, &limits)?;
                     self.stats.packets_parsed += 1;
                     return Ok(Some(packet));
                 }
