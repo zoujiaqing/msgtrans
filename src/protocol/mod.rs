@@ -3,7 +3,6 @@
 /// Provides abstractions for protocol configuration, adapters, and factories
 pub mod adapter;
 pub mod client_config;
-pub mod protocol_adapter;
 pub mod server_config;
 
 // Re-export core types

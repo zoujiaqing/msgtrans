@@ -95,8 +95,7 @@ pub use packet::{FramePolicy, Packet, PacketError, PacketType};
 pub use stream::{ClientEvents, EventStream, PacketStream};
 
 pub use transport::{
-    LockFreeCounter, LockFreeHashMap, LockFreeQueue, MemoryPool, MemoryStats, MemoryStatsSnapshot,
-    ProtocolStats, RetryConfig, Transport, TransportClient, TransportClientBuilder,
+    RetryConfig, ShutdownReport, Transport, TransportClient, TransportClientBuilder,
     TransportConfig, TransportContext, TransportServer, TransportServerBuilder,
 };
 

@@ -31,16 +31,14 @@ pub mod client;
 pub mod config;
 pub mod connection_state;
 pub mod limits;
-pub mod request_manager;
 pub mod request_registry;
 pub mod server;
 pub mod transport;
 pub mod transport_server;
 
 pub mod context;
-pub mod lockfree;
-pub mod memory_pool;
-pub mod protocol_adapter;
+pub(crate) mod lockfree;
+pub(crate) mod memory_pool;
 pub mod session_actor;
 
 // [EXPORTS] Re-export core APIs with unified architecture
@@ -53,20 +51,8 @@ pub use transport_server::{ShutdownReport, TransportServer};
 // [CONFIG] Configuration exports
 pub use config::TransportConfig;
 
-pub use memory_pool::{
-    BufferSize, MemoryPoolEvent, OptimizedMemoryPool as MemoryPool,
-    OptimizedMemoryStats as MemoryStats, OptimizedMemoryStatsSnapshot as MemoryStatsSnapshot,
-};
-
-pub use protocol_adapter::{
-    create_test_packet, FlumePoweredProtocolAdapter, LockFreeProtocolStats as ProtocolStats,
-    PerformanceMetrics, ProtocolEvent, ProtocolStatsSnapshot,
-};
-
-// [LOCKFREE] Lock-free core component exports
-pub use lockfree::{
-    CounterStats, LockFreeCounter, LockFreeHashMap, LockFreeQueue, LockFreeStats, QueueStats,
-};
+// Internal performance machinery (memory pool, lock-free primitives) is not
+// part of the public API; the modules stay crate-internal.
 
 // [CONNECTION] Lock-free connection exports
 
