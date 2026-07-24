@@ -342,11 +342,22 @@ pub struct Packet {
     /// Fixed header metadata. Crate-internal; external access is via the
     /// accessor methods (`message_id()`, `packet_type()`, `biz_type()`, ...).
     pub(crate) header: FixedHeader,
-    /// Extension header, `Bytes` for zero-copy slicing/handoff.
+    /// Extension header. `Bytes` so `decode_one_from` can slice it from an
+    /// owned buffer and encoding can hand it over without a copy.
     pub(crate) ext_header: Bytes,
-    /// Payload data, `Bytes` so decoding slices the read buffer and encoding
-    /// hands the buffer over without a copy.
+    /// Payload data. `Bytes` so `decode_one_from` slices it from an owned
+    /// buffer (zero-copy) and encoding hands the buffer over without a copy.
+    /// The borrowed `decode_one`/`from_bytes` path copies the body out.
     pub(crate) payload: Bytes,
+}
+
+/// The validated on-wire layout of one frame (header + body ranges).
+struct FrameLayout {
+    header: FixedHeader,
+    ext_header_len: u16,
+    payload_len: u32,
+    ext_end: usize,
+    total: usize,
 }
 
 impl Packet {
@@ -567,10 +578,76 @@ impl Packet {
         bytes: &[u8],
         limits: &DecodeLimits,
     ) -> Result<Option<(Self, usize)>, PacketError> {
+        // Copies the body out of the borrowed slice. For a true zero-copy
+        // decode from an owned buffer, use [`Self::decode_one_from`].
+        let Some(layout) = Self::frame_layout(bytes, limits)? else {
+            return Ok(None);
+        };
+        let ext_header = if layout.ext_header_len > 0 {
+            Bytes::copy_from_slice(&bytes[16..layout.ext_end])
+        } else {
+            Bytes::new()
+        };
+        let payload = if layout.payload_len > 0 {
+            Bytes::copy_from_slice(&bytes[layout.ext_end..layout.total])
+        } else {
+            Bytes::new()
+        };
+        Ok(Some((
+            Self {
+                header: layout.header,
+                ext_header,
+                payload,
+            },
+            layout.total,
+        )))
+    }
+
+    /// Decode ONE packet from an owned [`Bytes`] buffer, slicing the body
+    /// instead of copying it — the true zero-copy decode path.
+    ///
+    /// Semantics match [`Self::decode_one`]: `Ok(Some((packet, consumed)))`,
+    /// `Ok(None)` when more bytes are needed, `Err` on an invalid/oversized
+    /// frame. The returned packet's `ext_header`/`payload` are `Bytes` slices
+    /// that share `buf`'s allocation (ref-counted), so no payload copy occurs.
+    pub fn decode_one_from(
+        buf: &Bytes,
+        limits: &DecodeLimits,
+    ) -> Result<Option<(Self, usize)>, PacketError> {
+        let Some(layout) = Self::frame_layout(buf, limits)? else {
+            return Ok(None);
+        };
+        let ext_header = if layout.ext_header_len > 0 {
+            buf.slice(16..layout.ext_end)
+        } else {
+            Bytes::new()
+        };
+        let payload = if layout.payload_len > 0 {
+            buf.slice(layout.ext_end..layout.total)
+        } else {
+            Bytes::new()
+        };
+        Ok(Some((
+            Self {
+                header: layout.header,
+                ext_header,
+                payload,
+            },
+            layout.total,
+        )))
+    }
+
+    /// Parse and limit-check the fixed header, returning the frame layout, or
+    /// `Ok(None)` when the buffer does not yet hold a complete frame. Shared by
+    /// the borrowed ([`Self::decode_one_with`]) and owned
+    /// ([`Self::decode_one_from`]) decoders.
+    fn frame_layout(
+        bytes: &[u8],
+        limits: &DecodeLimits,
+    ) -> Result<Option<FrameLayout>, PacketError> {
         if bytes.len() < 16 {
             return Ok(None);
         }
-
         // Parse fixed header (validates version, packet_type, compression) and
         // the two declared body lengths (no longer stored in the header).
         let (header, ext_header_len, payload_len) = FixedHeader::from_bytes(&bytes[0..16])?;
@@ -608,26 +685,13 @@ impl Packet {
         if bytes.len() < total {
             return Ok(None);
         }
-
-        let ext_header = if ext_header_len > 0 {
-            Bytes::copy_from_slice(&bytes[16..ext_end])
-        } else {
-            Bytes::new()
-        };
-        let payload = if payload_len > 0 {
-            Bytes::copy_from_slice(&bytes[ext_end..total])
-        } else {
-            Bytes::new()
-        };
-
-        Ok(Some((
-            Self {
-                header,
-                ext_header,
-                payload,
-            },
+        Ok(Some(FrameLayout {
+            header,
+            ext_header_len,
+            payload_len,
+            ext_end,
             total,
-        )))
+        }))
     }
 
     /// Get packet type
@@ -822,6 +886,33 @@ mod tests {
         // Strict: unknown values are protocol errors, never a silent None.
         assert!(CompressionType::try_from(3).is_err());
         assert!(CompressionType::try_from(255).is_err());
+    }
+
+    #[test]
+    fn decode_one_from_slices_without_copying() {
+        use bytes::Bytes;
+        let p = Packet::request(7, b"payload".to_vec());
+        let encoded = Bytes::from(p.try_encode().unwrap().to_vec());
+        let (decoded, used) = Packet::decode_one_from(&encoded, &DecodeLimits::default())
+            .unwrap()
+            .expect("complete");
+        assert_eq!(used, encoded.len());
+        assert_eq!(decoded.message_id(), 7);
+        assert_eq!(decoded.payload().as_ref(), b"payload");
+        // The decoded payload shares the source allocation (zero-copy slice):
+        // its pointer lies inside the source buffer's range.
+        let base = encoded.as_ptr() as usize;
+        let pl = decoded.payload().as_ptr() as usize;
+        assert!(
+            pl >= base && pl < base + encoded.len(),
+            "payload must be a slice into the owned buffer, not a copy"
+        );
+        // Incomplete owned buffer -> Ok(None).
+        assert!(
+            Packet::decode_one_from(&encoded.slice(0..10), &DecodeLimits::default())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
