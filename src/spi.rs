@@ -1,14 +1,14 @@
 //! Stable extension SPI for implementing a custom transport protocol.
 //!
 //! Everything an out-of-crate adapter needs — and nothing that leaks an
-//! internal type. Implement [`Connection`] (and [`Server`]/[`ConnectionFactory`]
+//! internal type. Implement [`Connection`] (and [`Server`]
 //! for accept/connect), drive the read loop by pushing [`TransportEvent`]s into
 //! an [`EventSink`], and hand the paired [`ConnectionEvents`] back from
 //! [`Connection::take_event_pipe`]. To advertise the config to the builder,
 //! implement [`ServerConfig`]/[`ClientConfig`] (and their object-safe
 //! [`DynServerConfig`]/[`DynClientConfig`]).
 
-pub use crate::connection::{Connection, ConnectionFactory, Server, WriteCompletion};
+pub use crate::connection::{Connection, Server, WriteCompletion};
 pub use crate::packet::Packet;
 pub use crate::protocol::adapter::{
     ClientConfig, ConfigError, DynClientConfig, DynServerConfig, ProtocolConfig, ServerConfig,

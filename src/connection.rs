@@ -125,10 +125,3 @@ pub trait Server: Send + Sync {
     /// Shutdown server
     async fn shutdown(&mut self) -> Result<(), TransportError>;
 }
-
-/// Connection factory - Create client connections
-#[async_trait]
-pub trait ConnectionFactory: Send + Sync {
-    /// Establish connection
-    async fn connect(&self) -> Result<Box<dyn Connection>, TransportError>;
-}

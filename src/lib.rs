@@ -85,7 +85,7 @@ impl From<SessionId> for u64 {
 }
 
 // Re-export core types
-pub use command::{ConnectionInfo, TransportCommand, TransportStats};
+pub use command::ConnectionInfo;
 pub use error::{CloseReason, TransportError};
 #[cfg(feature = "quic")]
 pub use event::QuicEvent;
@@ -112,7 +112,7 @@ pub use protocol::{QuicClientConfig, QuicServerConfig};
 #[cfg(feature = "tcp")]
 pub use protocol::{TcpClientConfig, TcpServerConfig};
 // Re-export new abstractions
-pub use connection::{Connection, ConnectionFactory, Server, WriteCompletion};
+pub use connection::{Connection, Server, WriteCompletion};
 pub use transport::limits::{ClientLimits, ConnectionLimits, ServerLimits};
 
 // Convenient type aliases

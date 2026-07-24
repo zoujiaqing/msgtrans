@@ -80,19 +80,6 @@ impl Transport {
         }
     }
 
-    /// [TARGET] Core method: establish connection with protocol configuration
-    /// This is the connection method needed by TransportClient
-    pub async fn connect_with_config<T>(
-        self: &Arc<Self>,
-        config: T,
-    ) -> Result<SessionId, TransportError>
-    where
-        T: crate::protocol::client_config::ConnectableConfig,
-    {
-        // Directly use the current Transport Arc instance
-        config.connect(Arc::clone(self)).await
-    }
-
     /// Send data packet through the underlying connection (single-lock hot
     /// path). Fire-and-forget tier of the single send SPI: the enqueue result
     /// is the only signal.

@@ -1,13 +1,10 @@
-use crate::command::ConnectionInfo;
-use crate::packet::Packet;
+use crate::error::TransportError;
 #[cfg(feature = "quic")]
 use crate::protocol::{QuicClientConfig, QuicServerConfig};
 #[cfg(feature = "tcp")]
 use crate::protocol::{TcpClientConfig, TcpServerConfig};
 #[cfg(feature = "websocket")]
 use crate::protocol::{WebSocketClientConfig, WebSocketServerConfig};
-use crate::{error::TransportError, SessionId};
-use async_trait::async_trait;
 
 /// Adapter statistics information
 #[derive(Debug, Clone)]
@@ -59,59 +56,6 @@ impl AdapterStats {
     pub fn record_error(&mut self) {
         self.errors += 1;
         self.last_activity = std::time::SystemTime::now();
-    }
-}
-
-/// Protocol adapter trait
-///
-/// Defines the basic interface that all protocol adapters must implement
-/// This is the core abstraction of the event-driven architecture
-#[async_trait]
-pub trait ProtocolAdapter: Send + 'static {
-    type Config: ProtocolConfig;
-    type Error: Into<TransportError> + Send + std::fmt::Debug + 'static;
-
-    /// Send packet
-    async fn send(&mut self, packet: Packet) -> Result<(), Self::Error>;
-
-    /// Close connection
-    async fn close(&mut self) -> Result<(), Self::Error>;
-
-    /// Gracefully close connection
-    ///
-    /// Send protocol-specific close signal and wait for peer confirmation
-    async fn graceful_close(&mut self) -> Result<(), Self::Error> {
-        // Default implementation: directly call close()
-        self.close().await
-    }
-
-    /// Force close connection
-    ///
-    /// Immediately close connection without waiting for peer confirmation
-    async fn force_close(&mut self) -> Result<(), Self::Error> {
-        // Default implementation: directly call close()
-        self.close().await
-    }
-
-    /// Get connection information
-    fn connection_info(&self) -> ConnectionInfo;
-
-    /// Check connection status
-    fn is_connected(&self) -> bool;
-
-    /// Get adapter statistics information
-    fn stats(&self) -> AdapterStats;
-
-    /// Get session ID
-    fn session_id(&self) -> SessionId;
-
-    /// Set session ID
-    fn set_session_id(&mut self, session_id: SessionId);
-
-    /// Flush send buffer
-    async fn flush(&mut self) -> Result<(), Self::Error> {
-        // Default implementation: handled by internal event loop in event-driven mode
-        Ok(())
     }
 }
 

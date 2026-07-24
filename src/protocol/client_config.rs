@@ -10,9 +10,6 @@ use serde::{Deserialize, Serialize};
 #[cfg(any(feature = "tcp", feature = "websocket", feature = "quic"))]
 use std::time::Duration;
 
-use crate::{transport::transport::Transport, SessionId, TransportError};
-use std::sync::Arc;
-
 /// TCP客户端配置
 #[cfg(feature = "tcp")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -732,73 +729,5 @@ impl DynProtocolConfig for WebSocketClientConfig {
 
     fn clone_dyn(&self) -> Box<dyn DynProtocolConfig> {
         Box::new(self.clone())
-    }
-}
-
-/// 🔧 可连接配置的 trait
-pub trait ConnectableConfig {
-    async fn connect(self, transport: Arc<Transport>) -> Result<SessionId, TransportError>;
-}
-
-#[cfg(feature = "tcp")]
-impl ConnectableConfig for TcpClientConfig {
-    async fn connect(self, transport: Arc<Transport>) -> Result<SessionId, TransportError> {
-        tracing::info!("🔌 TCP 客户端开始连接到 {}", self.target_address);
-
-        let limits = transport.config().connection_limits;
-        let connection =
-            crate::protocol::adapter::ClientConfig::build_connection(&self, limits).await?;
-
-        // 将连接设置到 Transport 中
-        let session_id = transport.set_connection(Box::new(connection)).await;
-        tracing::info!(
-            "✅ TCP 客户端连接成功: {} -> 会话ID: {}",
-            self.target_address,
-            session_id
-        );
-
-        Ok(session_id)
-    }
-}
-
-#[cfg(feature = "websocket")]
-impl ConnectableConfig for WebSocketClientConfig {
-    async fn connect(self, transport: Arc<Transport>) -> Result<SessionId, TransportError> {
-        tracing::info!("🔌 WebSocket 客户端开始连接到 {}", self.target_url);
-
-        let limits = transport.config().connection_limits;
-        let connection =
-            crate::protocol::adapter::ClientConfig::build_connection(&self, limits).await?;
-
-        // 将连接设置到 Transport 中
-        let session_id = transport.set_connection(Box::new(connection)).await;
-        tracing::info!(
-            "✅ WebSocket 客户端连接成功: {} -> 会话ID: {}",
-            self.target_url,
-            session_id
-        );
-
-        Ok(session_id)
-    }
-}
-
-#[cfg(feature = "quic")]
-impl ConnectableConfig for QuicClientConfig {
-    async fn connect(self, transport: Arc<Transport>) -> Result<SessionId, TransportError> {
-        tracing::info!("🔌 QUIC 客户端开始连接到 {}", self.target_address);
-
-        let limits = transport.config().connection_limits;
-        let connection =
-            crate::protocol::adapter::ClientConfig::build_connection(&self, limits).await?;
-
-        // 将连接设置到 Transport 中
-        let session_id = transport.set_connection(Box::new(connection)).await;
-        tracing::info!(
-            "✅ QUIC 客户端连接成功: {} -> 会话ID: {}",
-            self.target_address,
-            session_id
-        );
-
-        Ok(session_id)
     }
 }
