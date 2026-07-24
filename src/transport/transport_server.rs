@@ -747,16 +747,8 @@ impl TransportServer {
             {
                 return true;
             }
-            // Register inbound requests so they get lifecycle treatment
-            // (timeout scan, batch-fail on session close) and idempotent respond.
-            if packet.header.packet_type == crate::packet::PacketType::Request {
-                self.request_registry.register(
-                    packet.header.message_id,
-                    Some(session_id),
-                    packet.header.biz_type,
-                    DEFAULT_REQUEST_LIFECYCLE_TIMEOUT,
-                );
-            }
+            // Inbound requests are registered by the ACTOR at dispatch time
+            // (the single place that mints the RequestToken + Responder).
         }
 
         // ConnectionClosed is the definitive end-of-stream marker: forward it,

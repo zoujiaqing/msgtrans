@@ -12,6 +12,15 @@ use bytes::Bytes;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
+/// One item of the client event queue: the event, the generation it came
+/// from, and — for inbound requests — the unforgeable registration token the
+/// respond path must present to the registry.
+pub struct TaggedClientEvent {
+    pub session_id: SessionId,
+    pub(crate) token: Option<crate::transport::request_registry::RequestToken>,
+    pub event: TransportEvent,
+}
+
 /// A connection bound to its generation. See `Transport::slot`.
 struct ConnectionSlot {
     session_id: SessionId,
@@ -39,8 +48,8 @@ pub struct Transport {
     /// Items carry the source generation's SessionId: consumers (the client's
     /// request contexts in particular) must bind responses to the connection
     /// the request arrived on, not to "whatever connection is current".
-    client_events_tx: mpsc::Sender<(SessionId, TransportEvent)>,
-    client_events_rx: Arc<Mutex<Option<mpsc::Receiver<(SessionId, TransportEvent)>>>>,
+    client_events_tx: mpsc::Sender<TaggedClientEvent>,
+    client_events_rx: Arc<Mutex<Option<mpsc::Receiver<TaggedClientEvent>>>>,
     request_registry: Arc<crate::transport::request_registry::RequestRegistry>,
     /// Monotonic connection generation. Each set_connection bumps it; the
     /// per-connection pipe consumer only acts while its epoch is current, so
@@ -477,9 +486,7 @@ impl Transport {
     /// Take the client event queue (single consumer, once). The queue spans
     /// reconnects: new connections' pipe consumers feed the same sender, and
     /// every item is tagged with the generation (SessionId) it came from.
-    pub async fn get_event_stream(
-        &self,
-    ) -> Option<tokio::sync::mpsc::Receiver<(SessionId, crate::event::TransportEvent)>> {
+    pub async fn get_event_stream(&self) -> Option<tokio::sync::mpsc::Receiver<TaggedClientEvent>> {
         self.client_events_rx.lock().await.take()
     }
 
@@ -602,12 +609,13 @@ impl Transport {
                         // responder, duplicate refusal, drain on session close).
                         // A refused registration (duplicate id from the peer) is
                         // still forwarded; its respond will observe AlreadyHandled.
-                        if !self.request_registry.register(
+                        let token = self.request_registry.register(
                             id,
                             Some(source_session),
                             packet.header.biz_type,
                             INBOUND_REQUEST_TIMEOUT,
-                        ) {
+                        );
+                        if token.is_none() {
                             tracing::debug!(
                                 "[PROC] Inbound request not registered (duplicate or closing session): ID={}, session={}",
                                 id,
@@ -619,8 +627,9 @@ impl Transport {
                             "[SEND] Sending unified MessageReceived event (Request): ID={}",
                             id
                         );
-                        self.forward_client_event(
+                        self.forward_client_event_with_token(
                             source_session,
+                            token,
                             crate::event::TransportEvent::MessageReceived(packet),
                         )
                         .await;
@@ -700,7 +709,24 @@ impl Transport {
     /// and socket); if the client dropped its receiver, events are discarded —
     /// there is no consumer to lose them.
     async fn forward_client_event(&self, source_session: SessionId, event: TransportEvent) {
-        let _ = self.client_events_tx.send((source_session, event)).await;
+        self.forward_client_event_with_token(source_session, None, event)
+            .await;
+    }
+
+    async fn forward_client_event_with_token(
+        &self,
+        source_session: SessionId,
+        token: Option<crate::transport::request_registry::RequestToken>,
+        event: TransportEvent,
+    ) {
+        let _ = self
+            .client_events_tx
+            .send(TaggedClientEvent {
+                session_id: source_session,
+                token,
+                event,
+            })
+            .await;
     }
 
     /// Send data packet and wait for response (with options)
@@ -1003,10 +1029,12 @@ mod generation_tests {
         // A request arrived on generation 1 and its respond was claimed.
         let registry = transport.request_registry().clone();
         registry.open_session(id1);
-        assert!(registry.register(9, Some(id1), 0, std::time::Duration::from_secs(5)));
         use crate::transport::request_registry::{MarkResult, RespondClaim};
-        assert_eq!(registry.begin_respond(Some(id1), 9), MarkResult::Updated);
-        let claim = RespondClaim::new(registry.clone(), Some(id1), 9);
+        let token = registry
+            .register(9, Some(id1), 0, std::time::Duration::from_secs(5))
+            .expect("registers");
+        assert_eq!(registry.begin_respond(&token), MarkResult::Updated);
+        let claim = RespondClaim::new(registry.clone(), token);
 
         // The respond runs after the reconnect: refused, nothing written.
         let err = transport

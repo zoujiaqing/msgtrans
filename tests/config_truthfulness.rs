@@ -7,10 +7,10 @@
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use msgtrans::{
-    packet::{Packet, PacketType},
+    packet::Packet,
     protocol::{QuicServerConfig, TcpServerConfig, WebSocketClientConfig, WebSocketServerConfig},
     transport::{
-        SessionHandler, SessionSender, TransportClientBuilder, TransportServer,
+        Responder, SessionHandler, SessionSender, TransportClientBuilder, TransportServer,
         TransportServerBuilder,
     },
     ClientTls, SessionId,
@@ -28,16 +28,10 @@ struct Echo;
 
 #[async_trait]
 impl SessionHandler for Echo {
-    async fn on_message(&self, _s: SessionId, packet: Packet, sender: SessionSender) {
-        if packet.header.packet_type == PacketType::Request {
-            let _ = sender
-                .respond(
-                    packet.header.message_id,
-                    packet.header.biz_type,
-                    packet.payload,
-                )
-                .await;
-        }
+    async fn on_message(&self, _s: SessionId, _packet: Packet, _sender: SessionSender) {}
+
+    async fn on_request(&self, _s: SessionId, request: Packet, responder: Responder) {
+        let _ = responder.respond(request.payload).await;
     }
 }
 

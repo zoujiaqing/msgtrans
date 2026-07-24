@@ -16,9 +16,9 @@
 
 use async_trait::async_trait;
 use msgtrans::{
-    packet::{Packet, PacketType},
+    packet::Packet,
     protocol::WebSocketServerConfig,
-    transport::{SessionHandler, SessionSender, TransportServerBuilder},
+    transport::{Responder, SessionHandler, SessionSender, TransportServerBuilder},
     SessionId,
 };
 use std::{env, sync::Arc};
@@ -38,16 +38,19 @@ impl SessionHandler for EchoHandler {
             return;
         }
 
-        if packet.header.packet_type == PacketType::Request {
-            let _ = sender
-                .respond(packet.header.message_id, biz_type, packet.payload)
-                .await;
-        } else {
-            // Mirror OneWay back with same biz_type and payload.
-            let mut echo = Packet::one_way(0, packet.payload);
-            echo.set_biz_type(biz_type);
-            let _ = sender.send(echo).await;
+        // Mirror OneWay back with same biz_type and payload.
+        let mut echo = Packet::one_way(0, packet.payload);
+        echo.set_biz_type(biz_type);
+        let _ = sender.send(echo).await;
+    }
+
+    async fn on_request(&self, _session_id: SessionId, request: Packet, responder: Responder) {
+        if request.header.biz_type == BIZ_DROP {
+            // Silent drop: the untouched responder leaves the request to the
+            // lifecycle machinery (timeout), as the TS tests expect.
+            return;
         }
+        let _ = responder.respond(request.payload).await;
     }
 }
 

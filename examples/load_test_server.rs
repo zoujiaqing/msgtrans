@@ -14,11 +14,11 @@
 
 use async_trait::async_trait;
 use msgtrans::{
-    packet::{Packet, PacketType},
+    packet::Packet,
     protocol::QuicServerConfig,
     protocol::TcpServerConfig,
     protocol::WebSocketServerConfig,
-    transport::{SessionHandler, SessionSender, TransportServerBuilder},
+    transport::{Responder, SessionHandler, SessionSender, TransportServerBuilder},
     SessionId,
 };
 use std::sync::Arc;
@@ -32,20 +32,11 @@ struct EchoHandler;
 #[async_trait]
 impl SessionHandler for EchoHandler {
     async fn on_message(&self, _session_id: SessionId, packet: Packet, sender: SessionSender) {
-        match packet.header.packet_type {
-            PacketType::Request => {
-                let _ = sender
-                    .respond(
-                        packet.header.message_id,
-                        packet.header.biz_type,
-                        packet.payload,
-                    )
-                    .await;
-            }
-            _ => {
-                let _ = sender.send_data(packet.payload).await;
-            }
-        }
+        let _ = sender.send_data(packet.payload).await;
+    }
+
+    async fn on_request(&self, _session_id: SessionId, request: Packet, responder: Responder) {
+        let _ = responder.respond(request.payload).await;
     }
 
     async fn on_connected(&self, session_id: SessionId, _info: msgtrans::command::ConnectionInfo) {

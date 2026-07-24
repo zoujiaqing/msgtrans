@@ -674,7 +674,10 @@ impl TransportClient {
             let handle = tokio::spawn(async move {
                 tracing::debug!("[LOOP] TransportClient event forwarding task started");
 
-                while let Some((source_session, transport_event)) = transport_events.recv().await {
+                while let Some(tagged) = transport_events.recv().await {
+                    let source_session = tagged.session_id;
+                    let request_token = tagged.token;
+                    let transport_event = tagged.event;
                     tracing::debug!("[RECV] TransportClient received Transport event");
 
                     // [TARGET] Special handling of Request packets in MessageReceived
@@ -756,6 +759,7 @@ impl TransportClient {
                                     },
                                 ),
                                 registry,
+                                request_token,
                             );
 
                             let client_event = crate::event::ClientEvent::MessageReceived(context);

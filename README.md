@@ -52,7 +52,7 @@ msgtrans = "1.0"
 ```rust,no_run
 use async_trait::async_trait;
 use msgtrans::{
-    transport::{SessionHandler, SessionSender, TransportServerBuilder},
+    transport::{Responder, SessionHandler, SessionSender, TransportServerBuilder},
     protocol::{TcpServerConfig, WebSocketServerConfig, QuicServerConfig},
     packet::Packet,
     SessionId,
@@ -67,9 +67,15 @@ struct Echo;
 #[async_trait]
 impl SessionHandler for Echo {
     async fn on_message(&self, _session: SessionId, packet: Packet, sender: SessionSender) {
-        // Echo the message back - protocol transparent.
+        // One-way traffic: echo it back - protocol transparent.
         let response = format!("Echo: {}", String::from_utf8_lossy(&packet.payload));
         let _ = sender.send_data(response.into_bytes()).await;
+    }
+
+    async fn on_request(&self, _session: SessionId, request: Packet, responder: Responder) {
+        // Requests carry an obligation to answer: the consuming Responder is
+        // the only way to do it, and Ok(Written) means the bytes were written.
+        let _ = responder.respond(request.payload).await;
     }
 }
 
@@ -181,6 +187,7 @@ config passed to `.protocol(..)` changes:
 # #[async_trait::async_trait]
 # impl SessionHandler for H {
 #     async fn on_message(&self, _s: SessionId, _p: Packet, _tx: SessionSender) {}
+#     async fn on_request(&self, _s: SessionId, _p: Packet, _r: msgtrans::transport::Responder) {}
 # }
 # async fn f() -> Result<(), Box<dyn std::error::Error>> {
 # let handler = Arc::new(H);
@@ -207,16 +214,21 @@ use msgtrans::{
     command::ConnectionInfo,
     error::{TransportError, CloseReason},
     packet::Packet,
-    transport::{SessionHandler, SessionSender},
+    transport::{Responder, SessionHandler, SessionSender},
     SessionId,
 };
 
-// Server side: implement the handler. Only `on_message` is required.
+// Server side: implement the handler. `on_message` (one-way traffic) and
+// `on_request` (requests, answered through the consuming Responder) are
+// required; the lifecycle hooks are optional.
 struct MyHandler;
 
 #[async_trait::async_trait]
 impl SessionHandler for MyHandler {
     async fn on_message(&self, session_id: SessionId, packet: Packet, sender: SessionSender) { /* ... */ }
+    async fn on_request(&self, session_id: SessionId, request: Packet, responder: Responder) {
+        let _ = responder.respond(request.payload).await; // Ok(Written) == bytes written
+    }
     async fn on_connected(&self, session_id: SessionId, info: ConnectionInfo) { /* ... */ }
     async fn on_disconnected(&self, session_id: SessionId, reason: CloseReason) { /* ... */ }
     async fn on_error(&self, session_id: SessionId, error: TransportError) { /* ... */ }
@@ -255,6 +267,12 @@ impl SessionHandler for Echo {
             let _ = server.send(session_id, response.as_bytes()).await;
         });
     }
+
+    async fn on_request(&self, _s: SessionId, request: Packet, responder: msgtrans::transport::Responder) {
+        // respond_detached hands the write off; the registry still records
+        // the true outcome.
+        responder.respond_detached(request.payload);
+    }
 }
 ```
 
@@ -285,7 +303,13 @@ pub struct MyAdapter { /* protocol-specific state */ }
 
 #[async_trait::async_trait]
 impl Connection for MyAdapter {
-    async fn send(&mut self, packet: Packet) -> Result<(), TransportError> { /* ... */ }
+    // The single send entry point: enqueue the packet and resolve the
+    // WriteCompletion from your write loop with the REAL write result.
+    async fn send_with_completion(
+        &mut self,
+        packet: Packet,
+        completion: msgtrans::WriteCompletion,
+    ) -> Result<(), TransportError> { /* ... */ }
     // ... remaining Connection methods
 }
 ```
@@ -297,7 +321,7 @@ impl Connection for MyAdapter {
 ```rust,no_run
 use async_trait::async_trait;
 use msgtrans::{
-    transport::{SessionHandler, SessionSender, TransportServerBuilder},
+    transport::{Responder, SessionHandler, SessionSender, TransportServerBuilder},
     protocol::WebSocketServerConfig,
     packet::Packet,
     SessionId,
@@ -311,6 +335,11 @@ impl SessionHandler for Chat {
     async fn on_message(&self, _session: SessionId, packet: Packet, sender: SessionSender) {
         let msg = String::from_utf8_lossy(&packet.payload);
         let _ = sender.send_data(format!("You said: {msg}").into_bytes()).await;
+    }
+
+    async fn on_request(&self, _session: SessionId, request: Packet, responder: Responder) {
+        let msg = String::from_utf8_lossy(&request.payload).to_string();
+        let _ = responder.respond(format!("You asked: {msg}").into_bytes()).await;
     }
 }
 
@@ -427,6 +456,7 @@ use std::sync::Arc;
 # #[async_trait::async_trait]
 # impl SessionHandler for H {
 #     async fn on_message(&self, _s: SessionId, _p: Packet, _tx: SessionSender) {}
+#     async fn on_request(&self, _s: SessionId, _p: Packet, _r: msgtrans::transport::Responder) {}
 # }
 # async fn f() -> Result<(), Box<dyn std::error::Error>> {
 let server = TransportServerBuilder::new()

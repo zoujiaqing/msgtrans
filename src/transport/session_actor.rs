@@ -11,7 +11,11 @@
 //! ```
 
 use crate::adapters::outbound::SEND_QUEUE_WAIT;
-use crate::transport::request_registry::{MarkResult, RequestRegistry};
+
+/// Lifecycle deadline for inbound requests: bounds how long an unanswered
+/// request stays tracked (the timeout scanner reaps Pending entries).
+const REQUEST_LIFECYCLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+use crate::transport::request_registry::{MarkResult, RequestRegistry, RequestToken};
 use crate::{
     command::ConnectionInfo, event::TransportEvent, packet::Packet,
     transport::transport::Transport, SessionId,
@@ -46,13 +50,21 @@ pub enum ActorMessage {
 /// Each session has its own handler invocation, no global fan-out.
 #[async_trait]
 pub trait SessionHandler: Send + Sync + 'static {
-    /// Called when a message is received from a session
+    /// Called when a NON-request message is received from a session
+    /// (one-way messages, unmatched responses).
     ///
     /// # Arguments
     /// * `session_id` - The session that sent the message
     /// * `packet` - The received packet
     /// * `sender` - Sender to send messages back to this session
     async fn on_message(&self, session_id: SessionId, packet: Packet, sender: SessionSender);
+
+    /// Called when a REQUEST is received from a session. REQUIRED — requests
+    /// carry an obligation to answer, and the consuming [`Responder`] is the
+    /// only way to answer it: `respond(self)` is write-confirmed,
+    /// `respond_detached(self)` is fire-and-forget, dropping it leaves the
+    /// request to the lifecycle machinery (timeout / session-close drain).
+    async fn on_request(&self, session_id: SessionId, request: Packet, responder: Responder);
 
     /// Called when a session is established
     ///
@@ -87,20 +99,13 @@ pub trait SessionHandler: Send + Sync + 'static {
 pub struct SessionSender {
     session_id: SessionId,
     transport: Arc<Transport>,
-    /// Inbound request registry (actor mode), used to mark responses idempotently.
-    inbound_registry: Option<Arc<RequestRegistry>>,
 }
 
 impl SessionSender {
-    pub(crate) fn new(
-        session_id: SessionId,
-        transport: Arc<Transport>,
-        inbound_registry: Option<Arc<RequestRegistry>>,
-    ) -> Self {
+    pub(crate) fn new(session_id: SessionId, transport: Arc<Transport>) -> Self {
         Self {
             session_id,
             transport,
-            inbound_registry,
         }
     }
 
@@ -118,130 +123,88 @@ impl SessionSender {
         self.transport.send(packet).await
     }
 
-    /// Send a response to a request, write-confirmed.
-    ///
-    /// `Ok(RespondOutcome::Written)` means the response bytes reached the
-    /// transport. Duplicate/late/unknown responses return
-    /// `Ok(RespondOutcome::AlreadyHandled)` without writing anything. The send
-    /// is bound to this session's generation: a response can never be written
-    /// onto a different connection than the request arrived on.
-    ///
-    /// Cancellation-safe: the respond claim travels with the queued write, so
-    /// wrapping this in `timeout`/`select!` cannot strand registry state.
-    pub async fn respond(
-        &self,
-        message_id: u32,
-        biz_type: u8,
-        data: impl Into<bytes::Bytes>,
-    ) -> Result<crate::event::RespondOutcome, crate::TransportError> {
-        let data: bytes::Bytes = data.into();
-        // Claim the respond (Pending -> Responding): exactly one responder
-        // wins. The claim is created in this same poll and handed to the send
-        // before any await, so every cancellation/failure path resolves it.
-        let claim = match &self.inbound_registry {
-            Some(registry) => {
-                if registry.begin_respond(Some(self.session_id), message_id) != MarkResult::Updated
-                {
-                    tracing::debug!(
-                        "[ACTOR] Skip duplicate/late/unknown response: session={}, id={}",
-                        self.session_id,
-                        message_id
-                    );
-                    return Ok(crate::event::RespondOutcome::AlreadyHandled);
-                }
-                Some(crate::transport::request_registry::RespondClaim::new(
-                    registry.clone(),
-                    Some(self.session_id),
-                    message_id,
-                ))
-            }
-            None => None,
-        };
-        let response_packet = Packet {
-            header: crate::packet::FixedHeader {
-                version: 1,
-                compression: crate::packet::CompressionType::None,
-                packet_type: crate::packet::PacketType::Response,
-                biz_type,
-                message_id,
-                ext_header_len: 0,
-                payload_len: data.len() as u32,
-                reserved: crate::packet::ReservedFlags::new(),
-            },
-            ext_header: Vec::new(),
-            payload: data,
-        };
-        self.transport
-            .send_confirmed_with(response_packet, Some(self.session_id), claim)
-            .await
-            .map(|()| crate::event::RespondOutcome::Written)
-    }
-
     /// Get the session ID
     pub fn session_id(&self) -> SessionId {
         self.session_id
     }
 }
 
-/// Responder for request-response pattern
+/// The obligation to answer ONE request, and the only way to do it.
 ///
-/// When a request packet is received, the handler gets a Responder
-/// that can be used to send the response back.
+/// Not `Clone`: exactly one responder exists per delivered request, minted by
+/// the dispatch layer together with the request's unforgeable
+/// [`RequestToken`]. `respond(self)` consumes it — a second response is a
+/// compile error, not a runtime dedup. Dropping it without responding leaves
+/// the request to the lifecycle machinery (timeout scan / session-close
+/// drain), which is the correct outcome for a request the business chose to
+/// ignore.
 pub struct Responder {
-    session_id: SessionId,
-    message_id: u32,
+    token: RequestToken,
     biz_type: u8,
+    session_id: SessionId,
     transport: Arc<Transport>,
-    responded: std::sync::atomic::AtomicBool,
+    registry: Arc<RequestRegistry>,
 }
 
 impl Responder {
     pub(crate) fn new(
-        session_id: SessionId,
-        message_id: u32,
+        token: RequestToken,
         biz_type: u8,
+        session_id: SessionId,
         transport: Arc<Transport>,
+        registry: Arc<RequestRegistry>,
     ) -> Self {
         Self {
-            session_id,
-            message_id,
+            token,
             biz_type,
+            session_id,
             transport,
-            responded: std::sync::atomic::AtomicBool::new(false),
+            registry,
         }
     }
 
-    /// Send response data back to the client
-    pub async fn respond(self, data: impl Into<bytes::Bytes>) -> Result<(), crate::TransportError> {
+    /// Respond, write-confirmed. `Ok(RespondOutcome::Written)` means the
+    /// response bytes reached the transport; `AlreadyHandled` means the
+    /// request is no longer live (timed out, session closed, or its id was
+    /// reused after this token's registration ended — the token's generation
+    /// check refuses cross-registration responses by construction).
+    ///
+    /// Cancellation-safe: the claim travels with the queued write, so
+    /// wrapping this in `timeout`/`select!` cannot strand registry state.
+    /// The send is bound to the request's connection generation: it can
+    /// never be written onto a replacement connection.
+    pub async fn respond(
+        self,
+        data: impl Into<bytes::Bytes>,
+    ) -> Result<crate::event::RespondOutcome, crate::TransportError> {
         let data: bytes::Bytes = data.into();
-        if self
-            .responded
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
-            return Err(crate::TransportError::protocol_error(
-                "session",
-                "Already responded to this request",
-            ));
+        if self.registry.begin_respond(&self.token) != MarkResult::Updated {
+            return Ok(crate::event::RespondOutcome::AlreadyHandled);
         }
-
-        let response_packet = Packet {
-            header: crate::packet::FixedHeader {
-                version: 1,
-                compression: crate::packet::CompressionType::None,
-                packet_type: crate::packet::PacketType::Response,
-                biz_type: self.biz_type,
-                message_id: self.message_id,
-                ext_header_len: 0,
-                payload_len: data.len() as u32,
-                reserved: crate::packet::ReservedFlags::new(),
-            },
-            ext_header: Vec::new(),
-            payload: data,
-        };
-
+        // Claim created in the same poll that won begin_respond: every
+        // cancellation/failure path from here resolves it.
+        let claim = crate::transport::request_registry::RespondClaim::new(
+            self.registry.clone(),
+            self.token,
+        );
+        let response_packet =
+            Packet::response_with_biz(self.token.request_id(), self.biz_type, data);
         self.transport
-            .send_confirmed_with(response_packet, Some(self.session_id), None)
+            .send_confirmed_with(response_packet, Some(self.session_id), Some(claim))
             .await
+            .map(|()| crate::event::RespondOutcome::Written)
+    }
+
+    /// Respond without awaiting the outcome. The registry state still
+    /// resolves truthfully (the claim rides the queued write); only the
+    /// caller's visibility is sacrificed.
+    pub fn respond_detached(self, data: impl Into<bytes::Bytes>) {
+        let data: bytes::Bytes = data.into();
+        tokio::spawn(async move {
+            if let Err(e) = self.respond(data).await {
+                tracing::debug!("[RESPOND] detached response send failed: {:?}", e);
+            }
+        });
     }
 
     /// Get the session ID
@@ -251,7 +214,7 @@ impl Responder {
 
     /// Get the request message ID
     pub fn message_id(&self) -> u32 {
-        self.message_id
+        self.token.request_id()
     }
 }
 
@@ -423,11 +386,7 @@ impl SessionActor {
         let mut batch: Vec<ActorMessage> = Vec::with_capacity(BATCH_SIZE);
 
         // Create sender once, reuse for all messages (it's Clone + cheap)
-        let sender = SessionSender::new(
-            self.session_id,
-            self.transport.clone(),
-            self.inbound_registry.clone(),
-        );
+        let sender = SessionSender::new(self.session_id, self.transport.clone());
 
         loop {
             batch.clear();
@@ -459,10 +418,52 @@ impl SessionActor {
                     ActorMessage::InboundEvent(event) => {
                         match event {
                             TransportEvent::MessageReceived(packet) => {
-                                // Direct handler call - no spawn, no extra allocation
-                                self.handler
-                                    .on_message(self.session_id, packet, sender.clone())
-                                    .await;
+                                if packet.header.packet_type == crate::packet::PacketType::Request {
+                                    // Register the request and mint its token +
+                                    // consuming Responder in one place. A refused
+                                    // registration (duplicate in-flight id from the
+                                    // peer) is a protocol violation: there is no
+                                    // honest way to answer it, so it is dropped.
+                                    let Some(registry) = self.inbound_registry.clone() else {
+                                        tracing::warn!(
+                                            "[ACTOR] Request received without a registry; dropping (session: {})",
+                                            self.session_id
+                                        );
+                                        continue;
+                                    };
+                                    let token = registry.register(
+                                        packet.header.message_id,
+                                        Some(self.session_id),
+                                        packet.header.biz_type,
+                                        REQUEST_LIFECYCLE_TIMEOUT,
+                                    );
+                                    match token {
+                                        Some(token) => {
+                                            let responder = Responder::new(
+                                                token,
+                                                packet.header.biz_type,
+                                                self.session_id,
+                                                self.transport.clone(),
+                                                registry,
+                                            );
+                                            self.handler
+                                                .on_request(self.session_id, packet, responder)
+                                                .await;
+                                        }
+                                        None => {
+                                            tracing::warn!(
+                                                "[ACTOR] Duplicate in-flight request id {} from session {}; dropping",
+                                                packet.header.message_id,
+                                                self.session_id
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    // Direct handler call - no spawn, no extra allocation
+                                    self.handler
+                                        .on_message(self.session_id, packet, sender.clone())
+                                        .await;
+                                }
                             }
                             TransportEvent::MessageSent { packet_id } => {
                                 self.handler

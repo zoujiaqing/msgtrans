@@ -22,6 +22,8 @@ struct SlowCounter {
 
 #[async_trait]
 impl SessionHandler for SlowCounter {
+    async fn on_request(&self, _s: SessionId, _p: Packet, _r: msgtrans::transport::Responder) {}
+
     async fn on_message(&self, _s: SessionId, _p: Packet, _tx: SessionSender) {
         // Slow enough that the sender vastly outpaces us: queues must fill.
         tokio::time::sleep(Duration::from_millis(1)).await;
@@ -103,6 +105,8 @@ struct GatedCounter {
 
 #[async_trait]
 impl SessionHandler for GatedCounter {
+    async fn on_request(&self, _s: SessionId, _p: Packet, _r: msgtrans::transport::Responder) {}
+
     async fn on_message(&self, _s: SessionId, p: Packet, _tx: SessionSender) {
         while !self.open.load(Ordering::SeqCst) {
             self.gate.notified().await;

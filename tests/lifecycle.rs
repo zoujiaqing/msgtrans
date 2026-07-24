@@ -5,11 +5,11 @@
 
 use async_trait::async_trait;
 use msgtrans::{
-    packet::{Packet, PacketType},
+    packet::Packet,
     protocol::{TcpClientConfig, TcpServerConfig},
     transport::{
-        SessionHandler, SessionSender, TransportClient, TransportClientBuilder, TransportServer,
-        TransportServerBuilder,
+        Responder, SessionHandler, SessionSender, TransportClient, TransportClientBuilder,
+        TransportServer, TransportServerBuilder,
     },
     SessionId,
 };
@@ -19,16 +19,10 @@ struct Echo;
 
 #[async_trait]
 impl SessionHandler for Echo {
-    async fn on_message(&self, _s: SessionId, packet: Packet, sender: SessionSender) {
-        if packet.header.packet_type == PacketType::Request {
-            let _ = sender
-                .respond(
-                    packet.header.message_id,
-                    packet.header.biz_type,
-                    packet.payload,
-                )
-                .await;
-        }
+    async fn on_message(&self, _s: SessionId, _packet: Packet, _sender: SessionSender) {}
+
+    async fn on_request(&self, _s: SessionId, request: Packet, responder: Responder) {
+        let _ = responder.respond(request.payload).await;
     }
 }
 
@@ -138,6 +132,13 @@ impl SessionHandler for GatedEcho {
         while !self.open.load(Ordering::SeqCst) {
             self.gate.notified().await;
         }
+    }
+
+    async fn on_request(&self, _s: SessionId, _p: Packet, responder: Responder) {
+        while !self.open.load(Ordering::SeqCst) {
+            self.gate.notified().await;
+        }
+        let _ = responder;
     }
 }
 
@@ -712,6 +713,10 @@ struct PanicOnce;
 #[async_trait]
 impl SessionHandler for PanicOnce {
     async fn on_message(&self, _s: SessionId, _p: Packet, _tx: SessionSender) {
+        panic!("handler exploded on purpose");
+    }
+
+    async fn on_request(&self, _s: SessionId, _p: Packet, _r: Responder) {
         panic!("handler exploded on purpose");
     }
 }

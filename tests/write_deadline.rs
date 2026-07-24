@@ -4,9 +4,9 @@
 
 use async_trait::async_trait;
 use msgtrans::{
-    packet::{Packet, PacketType},
+    packet::Packet,
     protocol::TcpServerConfig,
-    transport::{SessionHandler, SessionSender, TransportServerBuilder},
+    transport::{Responder, SessionHandler, SessionSender, TransportServerBuilder},
     SessionId,
 };
 use std::{sync::Arc, time::Duration};
@@ -20,16 +20,14 @@ struct HugeResponder {
 
 #[async_trait]
 impl SessionHandler for HugeResponder {
-    async fn on_message(&self, _s: SessionId, packet: Packet, sender: SessionSender) {
-        if packet.header.packet_type == PacketType::Request {
-            // 64 MiB: no loopback socket buffer absorbs this, so the write
-            // blocks once the peer stops reading.
-            let huge = vec![0u8; 64 * 1024 * 1024];
-            let result = sender
-                .respond(packet.header.message_id, packet.header.biz_type, huge)
-                .await;
-            let _ = self.outcome.send(result).await;
-        }
+    async fn on_message(&self, _s: SessionId, _packet: Packet, _sender: SessionSender) {}
+
+    async fn on_request(&self, _s: SessionId, _request: Packet, responder: Responder) {
+        // 64 MiB: no loopback socket buffer absorbs this, so the write
+        // blocks once the peer stops reading.
+        let huge = vec![0u8; 64 * 1024 * 1024];
+        let result = responder.respond(huge).await;
+        let _ = self.outcome.send(result).await;
     }
 }
 

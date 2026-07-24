@@ -383,6 +383,13 @@ impl Packet {
         packet
     }
 
+    /// Create response message carrying the request's biz_type.
+    pub fn response_with_biz(message_id: u32, biz_type: u8, payload: impl Into<Bytes>) -> Self {
+        let mut packet = Self::response(message_id, payload);
+        packet.header.biz_type = biz_type;
+        packet
+    }
+
     /// Set payload
     pub fn set_payload(&mut self, payload: impl Into<Bytes>) {
         self.payload = payload.into();

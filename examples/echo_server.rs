@@ -25,7 +25,7 @@
 use async_trait::async_trait;
 use msgtrans::{
     command::ConnectionInfo,
-    packet::{Packet, PacketType},
+    packet::Packet,
     protocol::{QuicServerConfig, TcpServerConfig, WebSocketServerConfig},
     transport::{SessionHandler, SessionSender, TransportServer, TransportServerBuilder},
     SessionId,
@@ -90,8 +90,6 @@ impl SessionHandler for EchoHandler {
 
     async fn on_message(&self, session_id: SessionId, packet: Packet, sender: SessionSender) {
         let biz_type = packet.header.biz_type;
-        let message_id = packet.header.message_id;
-        let is_request = packet.header.packet_type == PacketType::Request;
 
         if self.passive {
             // Byte-for-byte echo with biz_type preserved.
@@ -99,13 +97,9 @@ impl SessionHandler for EchoHandler {
             if biz_type == BIZ_DROP {
                 return;
             }
-            if is_request {
-                let _ = sender.respond(message_id, biz_type, packet.payload).await;
-            } else {
-                let mut echo = Packet::one_way(0, packet.payload);
-                echo.set_biz_type(biz_type);
-                let _ = sender.send(echo).await;
-            }
+            let mut echo = Packet::one_way(0, packet.payload);
+            echo.set_biz_type(biz_type);
+            let _ = sender.send(echo).await;
             return;
         }
 
@@ -113,23 +107,33 @@ impl SessionHandler for EchoHandler {
         let msg_text = String::from_utf8_lossy(&packet.payload).to_string();
         println!("[RECV] Message received");
         println!("   Session: {}", session_id);
-        println!("   Message ID: {}", message_id);
-        println!("   Size: {} bytes", packet.payload.len());
         println!("   Content: \"{}\"", msg_text);
 
         let echo_message = format!("Echo: {}", msg_text);
-        if is_request {
-            println!("[SEND] Responding to client request...");
-            let _ = sender
-                .respond(message_id, biz_type, echo_message.into_bytes())
-                .await;
-            println!("[SUCCESS] Client request responded (ID: {})", message_id);
-        } else {
-            match sender.send_data(echo_message.into_bytes()).await {
-                Ok(()) => println!("[SUCCESS] Echo sent -> session {}", session_id),
-                Err(e) => println!("[ERROR] Echo send failed: {:?}", e),
-            }
+        match sender.send_data(echo_message.into_bytes()).await {
+            Ok(()) => println!("[SUCCESS] Echo sent -> session {}", session_id),
+            Err(e) => println!("[ERROR] Echo send failed: {:?}", e),
         }
+    }
+
+    async fn on_request(
+        &self,
+        session_id: SessionId,
+        request: Packet,
+        responder: msgtrans::transport::Responder,
+    ) {
+        let biz_type = request.header.biz_type;
+        if self.passive {
+            if biz_type == BIZ_DROP {
+                return; // dropped responder -> request left to the lifecycle machinery
+            }
+            let _ = responder.respond(request.payload).await;
+            return;
+        }
+        let msg_text = String::from_utf8_lossy(&request.payload).to_string();
+        println!("[SEND] Responding to client request (session {session_id})...");
+        let echo_message = format!("Echo: {}", msg_text);
+        let _ = responder.respond(echo_message.into_bytes()).await;
     }
 
     async fn on_disconnected(&self, session_id: SessionId, reason: msgtrans::CloseReason) {

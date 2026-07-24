@@ -77,7 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if context.is_request() {
                         let message_id = context.message_id;
                         tracing::info!("[SEND] Responding to server request...");
-                        context.respond(b"Hello from WebSocket client response!".to_vec());
+                        context.respond_detached(b"Hello from WebSocket client response!".to_vec());
                         tracing::info!("[SUCCESS] Server request responded (ID: {})", message_id);
                     }
                 }

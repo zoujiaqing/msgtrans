@@ -89,6 +89,10 @@ pub struct RequestEntry {
     pub biz_type: u8,
     pub created_at: Instant,
     pub deadline_at: Instant,
+    /// Registration generation: stamped from a registry-wide counter so a
+    /// token minted for an earlier registration of the same key can never
+    /// act on a later one (ABA defense).
+    generation: u64,
     state: AtomicU8,
 }
 
@@ -123,6 +127,41 @@ pub enum MarkResult {
     NotFound,
 }
 
+/// Unforgeable handle to ONE registration of ONE request.
+///
+/// Carries the full identity — session, direction, message id AND the
+/// per-registration generation — so a token from an earlier life of a reused
+/// message id can never claim a later registration (the message-ID ABA
+/// window is closed by construction). Fields are crate-private and there is
+/// no public constructor: the only source of a token is the registry itself
+/// at registration time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestToken {
+    pub(crate) session_id: Option<SessionId>,
+    pub(crate) request_id: u32,
+    pub(crate) direction: RequestDirection,
+    pub(crate) generation: u64,
+}
+
+impl RequestToken {
+    /// The request (message) id this token belongs to.
+    pub fn request_id(&self) -> u32 {
+        self.request_id
+    }
+
+    /// The session the request arrived on, if session-scoped.
+    pub fn session_id(&self) -> Option<SessionId> {
+        self.session_id
+    }
+
+    pub(crate) fn key(&self) -> RequestKey {
+        match self.direction {
+            RequestDirection::Inbound => RequestKey::inbound(self.session_id, self.request_id),
+            RequestDirection::Outbound => RequestKey::outbound(self.session_id, self.request_id),
+        }
+    }
+}
+
 /// A claimed respond (`Pending -> Responding`) whose resolution CANNOT be lost.
 ///
 /// The claim is created in the same poll that wins `begin_respond` and then
@@ -141,29 +180,22 @@ pub enum MarkResult {
 #[derive(Debug)]
 pub(crate) struct RespondClaim {
     registry: Arc<RequestRegistry>,
-    session_id: Option<SessionId>,
-    request_id: u32,
+    token: RequestToken,
     resolved: bool,
 }
 
 impl RespondClaim {
-    pub(crate) fn new(
-        registry: Arc<RequestRegistry>,
-        session_id: Option<SessionId>,
-        request_id: u32,
-    ) -> Self {
+    pub(crate) fn new(registry: Arc<RequestRegistry>, token: RequestToken) -> Self {
         Self {
             registry,
-            session_id,
-            request_id,
+            token,
             resolved: false,
         }
     }
 
     pub(crate) fn resolve(mut self, write_confirmed: bool) {
         self.resolved = true;
-        self.registry
-            .finish_respond(self.session_id, self.request_id, write_confirmed);
+        self.registry.finish_respond(&self.token, write_confirmed);
     }
 }
 
@@ -172,8 +204,7 @@ impl Drop for RespondClaim {
         if !self.resolved {
             // Abandoned mid-flight (cancelled future / dropped queue entry /
             // dead connection): the write did not demonstrably happen.
-            self.registry
-                .finish_respond(self.session_id, self.request_id, false);
+            self.registry.finish_respond(&self.token, false);
         }
     }
 }
@@ -274,6 +305,8 @@ pub struct RequestRegistry {
     /// Allocator for outbound request ids (absorbed from the former
     /// RequestTracker, so the registry owns the whole request lifecycle).
     next_id: std::sync::atomic::AtomicU32,
+    /// Monotonic registration generation for RequestToken minting.
+    next_generation: AtomicU64,
 }
 
 impl Default for RequestRegistry {
@@ -334,6 +367,7 @@ impl RequestRegistry {
             tick_duration: safe_tick,
             current_tick: AtomicU64::new(0),
             next_id: std::sync::atomic::AtomicU32::new(1),
+            next_generation: AtomicU64::new(1),
         }
     }
 
@@ -344,7 +378,7 @@ impl RequestRegistry {
         session_id: Option<SessionId>,
         biz_type: u8,
         timeout: Duration,
-    ) -> bool {
+    ) -> Option<RequestToken> {
         // Inbound requests have no caller-side timeout, so they are scheduled into
         // the timeout wheel and reaped by the background scanner.
         self.register_impl(
@@ -361,24 +395,26 @@ impl RequestRegistry {
         biz_type: u8,
         timeout: Duration,
         schedule: bool,
-    ) -> bool {
+    ) -> Option<RequestToken> {
         // Resolve the session runtime up front. No runtime (never opened, or
         // already closed and removed) means refuse — registration can never
         // resurrect a session.
         let runtime = match key.session_id {
             Some(sid) => match self.sessions.get(&sid) {
                 Some(rt) if rt.is_open() => Some(rt.clone()),
-                _ => return false,
+                _ => return None,
             },
             None => None,
         };
 
         let now = Instant::now();
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let entry = Arc::new(RequestEntry {
             key,
             biz_type,
             created_at: now,
             deadline_at: now + timeout,
+            generation,
             state: AtomicU8::new(RequestState::Pending as u8),
         });
 
@@ -395,7 +431,7 @@ impl RequestRegistry {
                 self.counters
                     .pending_requests
                     .fetch_sub(1, Ordering::Relaxed);
-                return false; // duplicate: refuse, do not replace
+                return None; // duplicate: refuse, do not replace
             }
             Entry::Vacant(vacant) => {
                 vacant.insert(entry);
@@ -423,14 +459,19 @@ impl RequestRegistry {
                     }
                 }
                 self.waiters.remove(&key);
-                return false;
+                return None;
             }
         }
 
         if schedule {
             self.schedule_for_deadline(key, now + timeout);
         }
-        true
+        Some(RequestToken {
+            session_id: key.session_id,
+            request_id: key.request_id,
+            direction: key.direction,
+            generation,
+        })
     }
 
     /// Register a request together with a response waiter, returning the receiver
@@ -453,7 +494,7 @@ impl RequestRegistry {
         // scheduled into the timeout wheel. This also avoids unbounded bucket
         // growth on clients that run no timeout scanner.
         let key = RequestKey::outbound(session_id, request_id);
-        if !self.register_impl(key, biz_type, timeout, false) {
+        if self.register_impl(key, biz_type, timeout, false).is_none() {
             return Err(DuplicateRequest {
                 session_id,
                 request_id,
@@ -477,6 +518,37 @@ impl RequestRegistry {
     /// Complete a request with its response: wake the waiter (if any) and move
     /// lifecycle state to Responded. Returns true iff a pending request matched
     /// (same session + id), which is what prevents cross-session response injection.
+    /// Pending -> Responded for an entry addressed by key. Outbound-waiter
+    /// internal path only: the waiter channel is its own capability, so no
+    /// generation check is needed (each registration replaces the waiter).
+    fn mark_responded_key(&self, key: RequestKey) -> MarkResult {
+        let Some(entry) = self.entries.get(&key) else {
+            self.counters
+                .duplicate_response_total
+                .fetch_add(1, Ordering::Relaxed);
+            return MarkResult::NotFound;
+        };
+
+        match entry.try_transition(RequestState::Pending, RequestState::Responded) {
+            Ok(_) => {
+                self.counters
+                    .pending_requests
+                    .fetch_sub(1, Ordering::Relaxed);
+                drop(entry);
+                self.remove_terminal_entry(key);
+                MarkResult::Updated
+            }
+            Err(state) => {
+                if state == RequestState::Responded {
+                    self.counters
+                        .duplicate_response_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                MarkResult::Already(state)
+            }
+        }
+    }
+
     pub fn complete_waiter(
         &self,
         session_id: Option<SessionId>,
@@ -543,24 +615,28 @@ impl RequestRegistry {
         self.entries.len()
     }
 
-    /// Mark an *inbound* request as responded (the business layer sent its
-    /// reply). Outbound completions go through `complete_waiter`, which uses
-    /// the outbound key internally.
-    pub fn mark_responded(&self, session_id: Option<SessionId>, request_id: u32) -> MarkResult {
-        self.mark_responded_key(RequestKey::inbound(session_id, request_id))
-    }
-
     /// Claim an inbound request for responding: Pending -> Responding.
     /// Exactly one responder wins; duplicates (including a concurrent
     /// responder currently in flight) are refused with the observed state.
-    pub fn begin_respond(&self, session_id: Option<SessionId>, request_id: u32) -> MarkResult {
-        let key = RequestKey::inbound(session_id, request_id);
+    /// The token's registration generation must match the live entry — a
+    /// token minted for an earlier life of a reused message id observes
+    /// NotFound instead of claiming the new registration (ABA defense).
+    pub fn begin_respond(&self, token: &RequestToken) -> MarkResult {
+        let key = token.key();
         let Some(entry) = self.entries.get(&key) else {
             self.counters
                 .duplicate_response_total
                 .fetch_add(1, Ordering::Relaxed);
             return MarkResult::NotFound;
         };
+        if entry.generation != token.generation {
+            // Same key, different registration: the token's request is long
+            // gone and its id was reused. Refuse without touching the entry.
+            self.counters
+                .duplicate_response_total
+                .fetch_add(1, Ordering::Relaxed);
+            return MarkResult::NotFound;
+        }
         match entry.try_transition(RequestState::Pending, RequestState::Responding) {
             Ok(_) => MarkResult::Updated,
             Err(state) => {
@@ -577,16 +653,14 @@ impl RequestRegistry {
     /// Resolve a claimed respond: Responding -> Responded (write confirmed)
     /// or Responding -> SendFailed. Both are terminal; the entry is removed
     /// and the pending gauge decremented exactly once.
-    pub fn finish_respond(
-        &self,
-        session_id: Option<SessionId>,
-        request_id: u32,
-        write_confirmed: bool,
-    ) -> MarkResult {
-        let key = RequestKey::inbound(session_id, request_id);
+    pub fn finish_respond(&self, token: &RequestToken, write_confirmed: bool) -> MarkResult {
+        let key = token.key();
         let Some(entry) = self.entries.get(&key) else {
             return MarkResult::NotFound;
         };
+        if entry.generation != token.generation {
+            return MarkResult::NotFound;
+        }
         let target = if write_confirmed {
             RequestState::Responded
         } else {
@@ -607,34 +681,6 @@ impl RequestRegistry {
                 MarkResult::Updated
             }
             Err(state) => MarkResult::Already(state),
-        }
-    }
-
-    fn mark_responded_key(&self, key: RequestKey) -> MarkResult {
-        let Some(entry) = self.entries.get(&key) else {
-            self.counters
-                .duplicate_response_total
-                .fetch_add(1, Ordering::Relaxed);
-            return MarkResult::NotFound;
-        };
-
-        match entry.try_transition(RequestState::Pending, RequestState::Responded) {
-            Ok(_) => {
-                self.counters
-                    .pending_requests
-                    .fetch_sub(1, Ordering::Relaxed);
-                drop(entry);
-                self.remove_terminal_entry(key);
-                MarkResult::Updated
-            }
-            Err(state) => {
-                if state == RequestState::Responded {
-                    self.counters
-                        .duplicate_response_total
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                MarkResult::Already(state)
-            }
         }
     }
 
@@ -825,25 +871,22 @@ mod tests {
         let session_id = Some(SessionId(7));
         open(&registry, &[7]);
 
-        assert!(registry.register(request_id, session_id, 1, Duration::from_secs(3)));
+        let token = registry
+            .register(request_id, session_id, 1, Duration::from_secs(3))
+            .expect("registers");
         assert_eq!(
             registry.get_state(session_id, request_id, RequestDirection::Inbound),
             Some(RequestState::Pending)
         );
 
-        assert_eq!(
-            registry.mark_responded(session_id, request_id),
-            MarkResult::Updated
-        );
+        assert_eq!(registry.begin_respond(&token), MarkResult::Updated);
+        assert_eq!(registry.finish_respond(&token, true), MarkResult::Updated);
         assert_eq!(
             registry.get_state(session_id, request_id, RequestDirection::Inbound),
             None
         );
 
-        assert_eq!(
-            registry.mark_responded(session_id, request_id),
-            MarkResult::NotFound
-        );
+        assert_eq!(registry.begin_respond(&token), MarkResult::NotFound);
 
         let snapshot = registry.counters_snapshot();
         assert_eq!(snapshot.pending_requests, 0);
@@ -856,24 +899,26 @@ mod tests {
         let registry = RequestRegistry::new();
         let sid = Some(SessionId(7));
         open(&registry, &[7]);
-        assert!(registry.register(1, sid, 1, Duration::from_secs(3)));
+        let token = registry
+            .register(1, sid, 1, Duration::from_secs(3))
+            .expect("registers");
 
         // Claim: Pending -> Responding, exactly once.
-        assert_eq!(registry.begin_respond(sid, 1), MarkResult::Updated);
+        assert_eq!(registry.begin_respond(&token), MarkResult::Updated);
         assert_eq!(
             registry.get_state(sid, 1, RequestDirection::Inbound),
             Some(RequestState::Responding)
         );
         // Concurrent duplicate is refused and counted while in flight.
         assert_eq!(
-            registry.begin_respond(sid, 1),
+            registry.begin_respond(&token),
             MarkResult::Already(RequestState::Responding)
         );
 
         // Write confirmed: terminal, entry removed, gauge decremented once.
-        assert_eq!(registry.finish_respond(sid, 1, true), MarkResult::Updated);
+        assert_eq!(registry.finish_respond(&token, true), MarkResult::Updated);
         assert_eq!(registry.get_state(sid, 1, RequestDirection::Inbound), None);
-        assert_eq!(registry.finish_respond(sid, 1, true), MarkResult::NotFound);
+        assert_eq!(registry.finish_respond(&token, true), MarkResult::NotFound);
 
         let snapshot = registry.counters_snapshot();
         assert_eq!(snapshot.pending_requests, 0);
@@ -887,13 +932,15 @@ mod tests {
         let registry = RequestRegistry::new();
         let sid = Some(SessionId(7));
         open(&registry, &[7]);
-        assert!(registry.register(1, sid, 1, Duration::from_secs(3)));
+        let token = registry
+            .register(1, sid, 1, Duration::from_secs(3))
+            .expect("registers");
 
-        assert_eq!(registry.begin_respond(sid, 1), MarkResult::Updated);
-        assert_eq!(registry.finish_respond(sid, 1, false), MarkResult::Updated);
+        assert_eq!(registry.begin_respond(&token), MarkResult::Updated);
+        assert_eq!(registry.finish_respond(&token, false), MarkResult::Updated);
         // Terminal: no retry slot, entry gone.
         assert_eq!(registry.get_state(sid, 1, RequestDirection::Inbound), None);
-        assert_eq!(registry.begin_respond(sid, 1), MarkResult::NotFound);
+        assert_eq!(registry.begin_respond(&token), MarkResult::NotFound);
 
         let snapshot = registry.counters_snapshot();
         assert_eq!(snapshot.pending_requests, 0);
@@ -909,12 +956,14 @@ mod tests {
         let registry = RequestRegistry::new();
         let sid = Some(SessionId(7));
         open(&registry, &[7]);
-        assert!(registry.register(1, sid, 1, Duration::from_secs(3)));
-        assert_eq!(registry.begin_respond(sid, 1), MarkResult::Updated);
+        let token = registry
+            .register(1, sid, 1, Duration::from_secs(3))
+            .expect("registers");
+        assert_eq!(registry.begin_respond(&token), MarkResult::Updated);
 
         assert_eq!(registry.close_session_pending(SessionId(7)), 1);
         assert_eq!(registry.get_state(sid, 1, RequestDirection::Inbound), None);
-        assert_eq!(registry.finish_respond(sid, 1, true), MarkResult::NotFound);
+        assert_eq!(registry.finish_respond(&token, true), MarkResult::NotFound);
 
         let snapshot = registry.counters_snapshot();
         assert_eq!(snapshot.pending_requests, 0);
@@ -928,8 +977,10 @@ mod tests {
         let registry = RequestRegistry::new_with_timing(32, Duration::from_millis(10));
         let sid = Some(SessionId(7));
         open(&registry, &[7]);
-        assert!(registry.register(1, sid, 1, Duration::from_millis(1)));
-        assert_eq!(registry.begin_respond(sid, 1), MarkResult::Updated);
+        let token = registry
+            .register(1, sid, 1, Duration::from_millis(1))
+            .expect("registers");
+        assert_eq!(registry.begin_respond(&token), MarkResult::Updated);
 
         std::thread::sleep(Duration::from_millis(20));
         let mut timeout_total = 0usize;
@@ -942,7 +993,7 @@ mod tests {
             registry.get_state(sid, 1, RequestDirection::Inbound),
             Some(RequestState::Responding)
         );
-        assert_eq!(registry.finish_respond(sid, 1, true), MarkResult::Updated);
+        assert_eq!(registry.finish_respond(&token, true), MarkResult::Updated);
     }
 
     #[test]
@@ -950,13 +1001,15 @@ mod tests {
         let registry = RequestRegistry::new();
         open(&registry, &[1, 2]);
 
-        assert!(registry.register(77, Some(SessionId(1)), 0, Duration::from_secs(3)));
-        assert!(registry.register(77, Some(SessionId(2)), 0, Duration::from_secs(3)));
+        let token1 = registry
+            .register(77, Some(SessionId(1)), 0, Duration::from_secs(3))
+            .expect("registers");
+        assert!(registry
+            .register(77, Some(SessionId(2)), 0, Duration::from_secs(3))
+            .is_some());
 
-        assert_eq!(
-            registry.mark_responded(Some(SessionId(1)), 77),
-            MarkResult::Updated
-        );
+        assert_eq!(registry.begin_respond(&token1), MarkResult::Updated);
+        assert_eq!(registry.finish_respond(&token1, true), MarkResult::Updated);
         assert_eq!(
             registry.get_state(Some(SessionId(1)), 77, RequestDirection::Inbound),
             None
@@ -974,7 +1027,9 @@ mod tests {
         let request_id = 100;
         let key = RequestKey::inbound(None, request_id);
 
-        assert!(registry.register(request_id, None, 2, Duration::from_secs(1)));
+        assert!(registry
+            .register(request_id, None, 2, Duration::from_secs(1))
+            .is_some());
         assert_eq!(registry.mark_timed_out(key), MarkResult::Updated);
         assert_eq!(
             registry.get_state(None, request_id, RequestDirection::Inbound),
@@ -995,9 +1050,15 @@ mod tests {
         let sid = SessionId(999);
         open(&registry, &[999, 1000]);
 
-        assert!(registry.register(1, Some(sid), 0, Duration::from_secs(5)));
-        assert!(registry.register(2, Some(sid), 0, Duration::from_secs(5)));
-        assert!(registry.register(3, Some(SessionId(1000)), 0, Duration::from_secs(5)));
+        assert!(registry
+            .register(1, Some(sid), 0, Duration::from_secs(5))
+            .is_some());
+        assert!(registry
+            .register(2, Some(sid), 0, Duration::from_secs(5))
+            .is_some());
+        assert!(registry
+            .register(3, Some(SessionId(1000)), 0, Duration::from_secs(5))
+            .is_some());
 
         let closed = registry.close_session_pending(sid);
         assert_eq!(closed, 2);
@@ -1021,20 +1082,70 @@ mod tests {
         assert_eq!(registry.active_len(), 1);
     }
 
+    /// The ABA defense the token exists for: after a request terminates and
+    /// its message id is REUSED by a new registration, the OLD token must
+    /// not be able to claim (or resolve) the new request.
+    #[test]
+    fn stale_token_cannot_claim_a_reused_message_id() {
+        let registry = RequestRegistry::new();
+        let sid = Some(SessionId(7));
+        open(&registry, &[7]);
+
+        let old_token = registry
+            .register(5, sid, 0, Duration::from_secs(3))
+            .expect("first registration");
+        // First life ends (responded through its own token).
+        assert_eq!(registry.begin_respond(&old_token), MarkResult::Updated);
+        assert_eq!(
+            registry.finish_respond(&old_token, true),
+            MarkResult::Updated
+        );
+
+        // Same id, new registration, new generation.
+        let new_token = registry
+            .register(5, sid, 0, Duration::from_secs(3))
+            .expect("second registration");
+
+        // A stale responder replaying the old token is refused outright and
+        // the NEW request stays untouched and answerable.
+        assert_eq!(registry.begin_respond(&old_token), MarkResult::NotFound);
+        assert_eq!(
+            registry.finish_respond(&old_token, true),
+            MarkResult::NotFound
+        );
+        assert_eq!(
+            registry.get_state(sid, 5, RequestDirection::Inbound),
+            Some(RequestState::Pending)
+        );
+        assert_eq!(registry.begin_respond(&new_token), MarkResult::Updated);
+        assert_eq!(
+            registry.finish_respond(&new_token, true),
+            MarkResult::Updated
+        );
+    }
+
     #[test]
     fn duplicate_register_is_rejected_within_same_session() {
         let registry = RequestRegistry::new();
         let sid = Some(SessionId(9));
         open(&registry, &[9]);
-        assert!(registry.register(77, sid, 0, Duration::from_secs(2)));
-        assert!(!registry.register(77, sid, 0, Duration::from_secs(2)));
+        assert!(registry
+            .register(77, sid, 0, Duration::from_secs(2))
+            .is_some());
+        assert!(registry
+            .register(77, sid, 0, Duration::from_secs(2))
+            .is_none());
     }
 
     #[test]
     fn timeout_scanner_marks_due_requests_only() {
         let registry = RequestRegistry::new_with_timing(32, Duration::from_millis(10));
-        assert!(registry.register(1, None, 0, Duration::from_millis(15)));
-        assert!(registry.register(2, None, 0, Duration::from_secs(1)));
+        assert!(registry
+            .register(1, None, 0, Duration::from_millis(15))
+            .is_some());
+        assert!(registry
+            .register(2, None, 0, Duration::from_secs(1))
+            .is_some());
 
         std::thread::sleep(Duration::from_millis(20));
         let mut timeout_total = 0usize;
@@ -1176,13 +1287,16 @@ mod tests {
         let mut rx = registry
             .try_register_waiter(500, sid, 0, Duration::from_secs(5))
             .expect("outbound registers");
-        assert!(
-            registry.register(500, sid, 0, Duration::from_secs(5)),
-            "inbound with the same id must not be refused as a duplicate"
-        );
+        let inbound_token = registry
+            .register(500, sid, 0, Duration::from_secs(5))
+            .expect("inbound with the same id must not be refused as a duplicate");
 
         // Responding to the inbound request must not complete the outbound one.
-        assert_eq!(registry.mark_responded(sid, 500), MarkResult::Updated);
+        assert_eq!(registry.begin_respond(&inbound_token), MarkResult::Updated);
+        assert_eq!(
+            registry.finish_respond(&inbound_token, true),
+            MarkResult::Updated
+        );
         assert!(
             rx.try_recv().is_err(),
             "outbound waiter must still be pending"
@@ -1210,11 +1324,15 @@ mod tests {
         let sid = SessionId(300);
         open(&registry, &[300]);
 
-        assert!(registry.register(1, Some(sid), 0, Duration::from_secs(5)));
+        assert!(registry
+            .register(1, Some(sid), 0, Duration::from_secs(5))
+            .is_some());
         assert_eq!(registry.close_session_pending(sid), 1);
 
         assert!(
-            !registry.register(2, Some(sid), 0, Duration::from_secs(5)),
+            registry
+                .register(2, Some(sid), 0, Duration::from_secs(5))
+                .is_none(),
             "inbound register on a closing session must be refused"
         );
         assert!(
@@ -1320,14 +1438,20 @@ mod tests {
     fn unopened_or_closed_session_refuses_and_cannot_resurrect() {
         let registry = RequestRegistry::new();
         // Never opened: refused.
-        assert!(!registry.register(1, Some(SessionId(70)), 0, Duration::from_secs(5)));
+        assert!(registry
+            .register(1, Some(SessionId(70)), 0, Duration::from_secs(5))
+            .is_none());
         // Open -> works.
         registry.open_session(SessionId(70));
-        assert!(registry.register(1, Some(SessionId(70)), 0, Duration::from_secs(5)));
+        assert!(registry
+            .register(1, Some(SessionId(70)), 0, Duration::from_secs(5))
+            .is_some());
         // Closed: refused permanently — registration cannot recreate the
         // runtime, so there is no tombstone and nothing to age out.
         registry.close_session_pending(SessionId(70));
-        assert!(!registry.register(2, Some(SessionId(70)), 0, Duration::from_secs(5)));
+        assert!(registry
+            .register(2, Some(SessionId(70)), 0, Duration::from_secs(5))
+            .is_none());
         assert!(registry
             .try_register_waiter(3, Some(SessionId(70)), 0, Duration::from_secs(5))
             .is_err());

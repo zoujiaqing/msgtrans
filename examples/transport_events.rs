@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use msgtrans::{
     command::ConnectionInfo,
     event::ClientEvent,
-    packet::{Packet, PacketType},
+    packet::Packet,
     protocol::{TcpClientConfig, TcpServerConfig},
     transport::{
         SessionHandler, SessionSender, TransportClientBuilder, TransportServer,
@@ -24,6 +24,22 @@ struct DebugHandler {
 
 #[async_trait]
 impl SessionHandler for DebugHandler {
+    async fn on_request(
+        &self,
+        session_id: SessionId,
+        request: Packet,
+        responder: msgtrans::transport::Responder,
+    ) {
+        println!(
+            "[REQUEST] session={} id={} ({} bytes)",
+            session_id,
+            request.header.message_id,
+            request.payload.len()
+        );
+        let reply = format!("Echo: {}", String::from_utf8_lossy(&request.payload));
+        let _ = responder.respond(reply.into_bytes()).await;
+    }
+
     async fn on_connected(&self, session_id: SessionId, _info: ConnectionInfo) {
         println!("[CONNECT] New connection established: {}", session_id);
 
@@ -39,25 +55,12 @@ impl SessionHandler for DebugHandler {
         });
     }
 
-    async fn on_message(&self, session_id: SessionId, packet: Packet, sender: SessionSender) {
+    async fn on_message(&self, session_id: SessionId, packet: Packet, _sender: SessionSender) {
         let text = String::from_utf8_lossy(&packet.payload).to_string();
-        let is_request = packet.header.packet_type == PacketType::Request;
         println!(
-            "[RECV] Message received (session: {}, ID: {}, request: {}): {}",
-            session_id, packet.header.message_id, is_request, text
+            "[RECV] Message received (session: {}, ID: {}): {}",
+            session_id, packet.header.message_id, text
         );
-
-        if is_request {
-            println!("[SEND] Responding to request...");
-            let _ = sender
-                .respond(
-                    packet.header.message_id,
-                    packet.header.biz_type,
-                    format!("Echo: {}", text).into_bytes(),
-                )
-                .await;
-            println!("[SUCCESS] Request responded");
-        }
     }
 
     async fn on_disconnected(&self, session_id: SessionId, reason: msgtrans::CloseReason) {
@@ -138,7 +141,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     if context.is_request() {
                         println!("[SEND] Responding to server request...");
-                        context.respond(b"Client response!".to_vec());
+                        context.respond_detached(b"Client response!".to_vec());
                         println!("[SUCCESS] Server request responded");
                     }
                 }
