@@ -2,6 +2,7 @@
 use crate::adapters::tcp;
 #[cfg(any(feature = "tcp", feature = "websocket", feature = "quic"))]
 use crate::connection::{Connection, Server};
+#[cfg(any(feature = "tcp", feature = "websocket", feature = "quic"))]
 use crate::TransportError;
 #[cfg(any(feature = "tcp", feature = "websocket", feature = "quic"))]
 use async_trait::async_trait;

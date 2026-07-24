@@ -256,6 +256,9 @@ impl TransportClient {
         let mut last_error = None;
         let max_retries = self.retry_config.max_retries;
 
+        // never_loop fires only in a no-protocol-feature build (the match has
+        // no arms); with any protocol enabled the loop retries normally.
+        #[allow(clippy::never_loop)]
         for attempt in 0..=max_retries {
             if attempt > 0 {
                 let delay = self.calculate_retry_delay(attempt);
