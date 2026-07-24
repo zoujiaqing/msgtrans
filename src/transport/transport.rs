@@ -501,7 +501,13 @@ impl Transport {
             }
         };
 
-        if let Err(e) = self.send(packet).await {
+        // Confirm the WRITE before starting the response timeout: the waiter is
+        // already registered (so a fast response cannot be missed), and only
+        // once the request bytes have reached the socket do we begin the
+        // response deadline. This closes the ghost-RPC window where a request
+        // stuck in a congested outbound queue could time out for the caller
+        // and then still be written and executed at the peer.
+        if let Err(e) = self.send_confirmed_with(packet, session_id, None).await {
             self.request_registry
                 .abort_waiter(session_id, client_message_id);
             return Err(e);
@@ -767,8 +773,10 @@ impl Transport {
             options.timeout
         );
 
-        // Send packet
-        if let Err(e) = self.send(packet).await {
+        // Confirm the write before the response deadline (see `request`): no
+        // ghost RPCs from a request that timed out while queued and was then
+        // written.
+        if let Err(e) = self.send_confirmed_with(packet, session_id, None).await {
             self.request_registry.abort_waiter(session_id, message_id);
             return Err(e);
         }
