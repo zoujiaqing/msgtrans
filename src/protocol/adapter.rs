@@ -142,6 +142,7 @@ pub trait DynProtocolConfig: Send + Sync + 'static {
 /// 🔧 Server-specific dynamic configuration
 pub trait DynServerConfig: DynProtocolConfig {
     /// Dynamically build server (object-safe) with per-connection limits.
+    #[allow(clippy::type_complexity)]
     fn build_server_dyn(
         &self,
         limits: crate::transport::limits::ConnectionLimits,
@@ -164,6 +165,7 @@ pub trait DynServerConfig: DynProtocolConfig {
 /// 🔧 Client-specific dynamic configuration  
 pub trait DynClientConfig: DynProtocolConfig {
     /// Dynamically build connection (object-safe) with per-connection limits.
+    #[allow(clippy::type_complexity)]
     fn build_connection_dyn(
         &self,
         limits: crate::transport::limits::ConnectionLimits,

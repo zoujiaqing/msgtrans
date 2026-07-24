@@ -800,7 +800,7 @@ impl Transport {
                     resp.payload.len()
                 );
                 // [FIX] Decompress response data
-                self.decode_payload(&resp).map(Bytes::from)
+                self.decode_payload(&resp)
             }
             Ok(Err(_)) => {
                 tracing::warn!("[WARN] Response channel closed: message_id={}", message_id);

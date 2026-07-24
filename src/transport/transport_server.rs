@@ -1123,7 +1123,7 @@ impl TransportServer {
         // a shutdown during a slow build cancels the root token and we stop.
         let mut built = Vec::new();
         for (protocol_name, protocol_config) in &self.protocol_configs {
-            let address = self.get_protocol_bind_address(protocol_config);
+            let address = self.get_protocol_bind_address(protocol_config.as_ref());
             tracing::info!(
                 "[BIND] Protocol {} bind address: {}",
                 protocol_name,
@@ -1351,7 +1351,7 @@ impl TransportServer {
     /// [INTERNAL] Internal method: extract listen address from protocol configuration
     fn get_protocol_bind_address(
         &self,
-        protocol_config: &Box<dyn crate::protocol::adapter::DynServerConfig>,
+        protocol_config: &dyn crate::protocol::adapter::DynServerConfig,
     ) -> std::net::SocketAddr {
         protocol_config.get_bind_address()
     }

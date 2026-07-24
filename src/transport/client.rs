@@ -225,7 +225,9 @@ impl TransportClient {
         })?;
 
         // Connect using stored protocol configuration
-        let session_id = self.connect_with_stored_config(&protocol_config).await?;
+        let session_id = self
+            .connect_with_stored_config(protocol_config.as_ref())
+            .await?;
 
         // Apply the configured frame policy to the freshly-established connection.
         self.inner.set_frame_policy(self.frame_policy).await;
@@ -249,7 +251,7 @@ impl TransportClient {
     /// [CONFIG] Internal method: Connect using stored protocol configuration
     async fn connect_with_stored_config(
         &mut self,
-        protocol_config: &Box<dyn DynClientConfig>,
+        protocol_config: &dyn DynClientConfig,
     ) -> Result<SessionId, TransportError> {
         let mut last_error = None;
         let max_retries = self.retry_config.max_retries;

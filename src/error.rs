@@ -176,13 +176,13 @@ impl From<std::io::Error> for TransportError {
             return TransportError::timeout_error("io", Duration::from_secs(0));
         }
 
-        let retryable = match error.kind() {
+        let retryable = matches!(
+            error.kind(),
             std::io::ErrorKind::ConnectionRefused
-            | std::io::ErrorKind::ConnectionAborted
-            | std::io::ErrorKind::ConnectionReset
-            | std::io::ErrorKind::Interrupted => true,
-            _ => false,
-        };
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::Interrupted
+        );
 
         TransportError::Connection {
             reason: format!("IO error: {}", error),

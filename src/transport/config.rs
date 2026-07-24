@@ -10,7 +10,7 @@ pub struct TransportConfig {
 impl Default for TransportConfig {
     fn default() -> Self {
         Self {
-            global: GlobalConfig::default(),
+            global: GlobalConfig,
             graceful_timeout: std::time::Duration::from_secs(5),
             connection_limits: crate::transport::limits::ConnectionLimits::default(),
         }

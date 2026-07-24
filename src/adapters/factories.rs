@@ -38,7 +38,7 @@ impl Server for TcpServerWrapper {
         self.inner
             .shutdown()
             .await
-            .map_err(|e| TransportError::config_error("tcp", &e.to_string()))
+            .map_err(|e| TransportError::config_error("tcp", e.to_string()))
     }
 }
 
@@ -64,21 +64,21 @@ impl Server for WebSocketServerWrapper {
             .inner
             .accept()
             .await
-            .map_err(|e| TransportError::config_error("websocket", &e.to_string()))?;
+            .map_err(|e| TransportError::config_error("websocket", e.to_string()))?;
         Ok(Box::new(adapter))
     }
 
     fn local_addr(&self) -> Result<std::net::SocketAddr, TransportError> {
         self.inner
             .local_addr()
-            .map_err(|e| TransportError::config_error("websocket", &e.to_string()))
+            .map_err(|e| TransportError::config_error("websocket", e.to_string()))
     }
 
     async fn shutdown(&mut self) -> Result<(), TransportError> {
         self.inner
             .shutdown()
             .await
-            .map_err(|e| TransportError::config_error("websocket", &e.to_string()))
+            .map_err(|e| TransportError::config_error("websocket", e.to_string()))
     }
 }
 
@@ -102,20 +102,20 @@ impl Server for QuicServerWrapper {
             .inner
             .accept()
             .await
-            .map_err(|e| TransportError::config_error("quic", &e.to_string()))?;
+            .map_err(|e| TransportError::config_error("quic", e.to_string()))?;
         Ok(Box::new(adapter))
     }
 
     fn local_addr(&self) -> Result<std::net::SocketAddr, TransportError> {
         self.inner
             .local_addr()
-            .map_err(|e| TransportError::config_error("quic", &e.to_string()))
+            .map_err(|e| TransportError::config_error("quic", e.to_string()))
     }
 
     async fn shutdown(&mut self) -> Result<(), TransportError> {
         self.inner
             .shutdown()
             .await
-            .map_err(|e| TransportError::config_error("quic", &e.to_string()))
+            .map_err(|e| TransportError::config_error("quic", e.to_string()))
     }
 }

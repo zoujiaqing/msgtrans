@@ -474,21 +474,21 @@ impl OptimizedMemoryPool {
         let mut cleared_memory = 0u64;
 
         // Clear small buffer cache
-        while let Some(_) = self.small_buffers.pop() {
+        while self.small_buffers.pop().is_some() {
             cleared_count += 1;
             cleared_memory += BufferSize::Small.capacity() as u64;
             self.stats.small_cached.fetch_sub(1, Ordering::Relaxed);
         }
 
         // Clear medium buffer cache
-        while let Some(_) = self.medium_buffers.pop() {
+        while self.medium_buffers.pop().is_some() {
             cleared_count += 1;
             cleared_memory += BufferSize::Medium.capacity() as u64;
             self.stats.medium_cached.fetch_sub(1, Ordering::Relaxed);
         }
 
         // Clear large buffer cache
-        while let Some(_) = self.large_buffers.pop() {
+        while self.large_buffers.pop().is_some() {
             cleared_count += 1;
             cleared_memory += BufferSize::Large.capacity() as u64;
             self.stats.large_cached.fetch_sub(1, Ordering::Relaxed);
@@ -514,5 +514,11 @@ impl OptimizedMemoryPool {
     /// [PERF] Get memory pool status (compatible with old API)
     pub async fn status(&self) -> OptimizedMemoryStatsSnapshot {
         self.get_stats()
+    }
+}
+
+impl Default for OptimizedMemoryPool {
+    fn default() -> Self {
+        Self::new()
     }
 }

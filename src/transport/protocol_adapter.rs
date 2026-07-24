@@ -38,6 +38,12 @@ pub struct LockFreeProtocolStats {
     pub cache_misses: AtomicU64,
 }
 
+impl Default for LockFreeProtocolStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LockFreeProtocolStats {
     pub fn new() -> Self {
         Self {

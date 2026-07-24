@@ -12,6 +12,10 @@
 #![allow(dead_code)]
 #![allow(private_bounds)]
 #![allow(private_interfaces)]
+// Idiomatic builder patterns (`let mut x = Default::default(); x.field = ..`)
+// and the transport::transport module name are intentional.
+#![allow(clippy::field_reassign_with_default)]
+#![allow(clippy::module_inception)]
 #![allow(async_fn_in_trait)]
 #![allow(unused_must_use)]
 #![allow(non_upper_case_globals)]

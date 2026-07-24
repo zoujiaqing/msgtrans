@@ -101,8 +101,6 @@ pub trait Connection: Send + Sync + std::any::Any {
     /// Flush send buffer
     async fn flush(&mut self) -> Result<(), TransportError>;
 
-    /// Get event stream
-
     /// Take the bounded event pipe: the connection's single event channel
     /// (single consumer, take-once). All queued data events are delivered
     /// first, then exactly one ConnectionClosed.

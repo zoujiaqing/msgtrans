@@ -20,8 +20,8 @@
 //!     - `MSGTRANS_ECHO_WS_PORT`   (default 18092)
 //!     - `MSGTRANS_ECHO_QUIC_PORT` (default 18093)
 //!
-//!   Ready line written to stdout after `serve()` is invoked:
-//!     `MSGTRANS_E2E_READY ws://127.0.0.1:<ws_port>`
+//! Ready line written to stdout after `serve()` is invoked:
+//! `MSGTRANS_E2E_READY ws://127.0.0.1:<ws_port>`
 use async_trait::async_trait;
 use msgtrans::{
     command::ConnectionInfo,

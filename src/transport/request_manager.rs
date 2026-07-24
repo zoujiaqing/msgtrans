@@ -33,6 +33,12 @@ pub struct RequestManager {
     message_id_counter: AtomicU32,
 }
 
+impl Default for RequestManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RequestManager {
     pub fn new() -> Self {
         Self {

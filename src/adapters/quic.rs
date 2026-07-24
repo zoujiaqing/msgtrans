@@ -458,9 +458,7 @@ impl<C> QuicAdapter<C> {
         })
     }
 
-    /// Get event stream receiver
-    ///
-
+    /// Get event stream receiver.
     /// Start event loop with single bidirectional stream multiplexing
     ///
     /// This is the optimized version that uses a single long-lived bidirectional stream
@@ -475,6 +473,7 @@ impl<C> QuicAdapter<C> {
     ///
     /// This version uses separate tasks for reading and writing to avoid blocking issues
     /// under high load where one direction could starve the other in a select! loop.
+    #[allow(clippy::too_many_arguments)]
     async fn start_event_loop(
         connection: QuinnConnection,
         state: crate::adapters::core::ConnState,

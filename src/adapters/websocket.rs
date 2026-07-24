@@ -293,6 +293,7 @@ impl<C> WebSocketAdapter<C> {
     }
 
     /// Start event loop based on tokio::select!
+    #[allow(clippy::too_many_arguments)]
     async fn start_event_loop(
         mut stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
         state: crate::adapters::core::ConnState,

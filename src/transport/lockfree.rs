@@ -314,6 +314,25 @@ impl LockFreeCounter {
     }
 }
 
+impl<K, V> Default for LockFreeHashMap<K, V>
+where
+    K: Hash + Eq + Clone + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T> Default for LockFreeQueue<T>
+where
+    T: Send + Sync + 'static,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

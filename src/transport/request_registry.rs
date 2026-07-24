@@ -841,7 +841,7 @@ impl RequestRegistry {
         } else {
             let remaining = deadline_at.duration_since(now).as_nanos();
             let tick_ns = self.tick_duration.as_nanos();
-            (((remaining + tick_ns - 1) / tick_ns) as u64).max(1)
+            (remaining.div_ceil(tick_ns) as u64).max(1)
         };
 
         let base_tick = self.current_tick.load(Ordering::Relaxed);
@@ -1377,7 +1377,7 @@ mod tests {
                     let base = cursor.load(Ordering::Relaxed);
                     let sid = SessionId(base + (id as u64 + t) % WINDOW);
                     id = id.wrapping_add(1);
-                    if id % 2 == 0 {
+                    if id.is_multiple_of(2) {
                         let _ = reg.register(id, Some(sid), 0, Duration::from_secs(5));
                     } else if let Ok(_rx) =
                         reg.try_register_waiter(id, Some(sid), 0, Duration::from_secs(5))

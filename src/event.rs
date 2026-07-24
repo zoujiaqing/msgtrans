@@ -620,6 +620,7 @@ impl TransportContext {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_request_with_registry(
         peer: Option<SessionId>,
         message_id: u32,
