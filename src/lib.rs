@@ -107,6 +107,7 @@ pub use protocol::{QuicClientConfig, QuicServerConfig};
 pub use protocol::{TcpClientConfig, TcpServerConfig};
 // Re-export new abstractions
 pub use connection::{Connection, ConnectionFactory, Server, WriteCompletion};
+pub use transport::limits::{ClientLimits, ConnectionLimits, ServerLimits};
 
 // Convenient type aliases
 pub type Result<T> = std::result::Result<T, TransportError>;

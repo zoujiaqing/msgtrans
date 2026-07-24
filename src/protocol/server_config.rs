@@ -73,6 +73,7 @@ impl DynProtocolConfig for TcpServerConfig {
 impl crate::protocol::adapter::DynServerConfig for TcpServerConfig {
     fn build_server_dyn(
         &self,
+        limits: crate::transport::limits::ConnectionLimits,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
@@ -82,7 +83,7 @@ impl crate::protocol::adapter::DynServerConfig for TcpServerConfig {
         >,
     > {
         Box::pin(async move {
-            let server = crate::protocol::adapter::ServerConfig::build_server(self).await?;
+            let server = crate::protocol::adapter::ServerConfig::build_server(self, limits).await?;
             Ok(Box::new(server) as Box<dyn crate::Server>)
         })
     }
@@ -229,6 +230,7 @@ impl DynProtocolConfig for WebSocketServerConfig {
 impl crate::protocol::adapter::DynServerConfig for WebSocketServerConfig {
     fn build_server_dyn(
         &self,
+        limits: crate::transport::limits::ConnectionLimits,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
@@ -238,7 +240,7 @@ impl crate::protocol::adapter::DynServerConfig for WebSocketServerConfig {
         >,
     > {
         Box::pin(async move {
-            let server = crate::protocol::adapter::ServerConfig::build_server(self).await?;
+            let server = crate::protocol::adapter::ServerConfig::build_server(self, limits).await?;
             Ok(Box::new(server) as Box<dyn crate::Server>)
         })
     }
@@ -437,6 +439,7 @@ impl DynProtocolConfig for QuicServerConfig {
 impl crate::protocol::adapter::DynServerConfig for QuicServerConfig {
     fn build_server_dyn(
         &self,
+        limits: crate::transport::limits::ConnectionLimits,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
@@ -446,7 +449,7 @@ impl crate::protocol::adapter::DynServerConfig for QuicServerConfig {
         >,
     > {
         Box::pin(async move {
-            let server = crate::protocol::adapter::ServerConfig::build_server(self).await?;
+            let server = crate::protocol::adapter::ServerConfig::build_server(self, limits).await?;
             Ok(Box::new(server) as Box<dyn crate::Server>)
         })
     }

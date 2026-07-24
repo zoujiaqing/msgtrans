@@ -30,6 +30,7 @@ pub mod client;
 ///   automatically use high-performance implementations
 pub mod config;
 pub mod connection_state;
+pub mod limits;
 pub mod request_manager;
 pub mod request_registry;
 pub mod server;

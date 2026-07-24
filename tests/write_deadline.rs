@@ -36,14 +36,12 @@ impl SessionHandler for HugeResponder {
 /// connection must be reaped.
 #[tokio::test(flavor = "multi_thread")]
 async fn stalled_write_fails_the_respond_within_the_deadline() {
-    // Test hook (process-global; this file has a single test): a deadline the
-    // test can actually wait out. Restored before the test ends.
-    msgtrans::adapters::outbound::set_write_deadline(Duration::from_millis(300));
-
+    // Per-connection write deadline via ServerLimits — no process-global hook.
     let addr = "127.0.0.1:28971";
     let (outcome_tx, mut outcome_rx) = tokio::sync::mpsc::channel(1);
     let server = TransportServerBuilder::new()
         .protocol(TcpServerConfig::new(addr).expect("cfg"))
+        .limits(msgtrans::ServerLimits::new().write_deadline(Duration::from_millis(300)))
         .build(Arc::new(HugeResponder {
             outcome: outcome_tx,
         }))
@@ -94,5 +92,4 @@ async fn stalled_write_fails_the_respond_within_the_deadline() {
 
     drop(stream);
     let _ = server.shutdown_with_timeout(Duration::from_secs(5)).await;
-    msgtrans::adapters::outbound::set_write_deadline(Duration::from_secs(30));
 }

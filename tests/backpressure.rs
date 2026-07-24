@@ -33,7 +33,6 @@ impl SessionHandler for SlowCounter {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn slow_handler_loses_nothing() {
-    let _capacity = shrink_pipe(8192); // serialize with the saturation test
     const TOTAL: u64 = 300;
     let addr = "127.0.0.1:28876";
     let seen = Arc::new(AtomicU64::new(0));
@@ -79,22 +78,6 @@ async fn slow_handler_loses_nothing() {
 
 use tokio::sync::Notify;
 
-/// The capacity override is process-global, so tests touching it serialize
-/// through this lock and restore the default via guard (panic-safe).
-static CAPACITY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-struct CapacityGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
-impl Drop for CapacityGuard {
-    fn drop(&mut self) {
-        msgtrans::adapters::events::set_default_pipe_capacity(8192);
-    }
-}
-fn shrink_pipe(capacity: usize) -> CapacityGuard {
-    let guard = CAPACITY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    msgtrans::adapters::events::set_default_pipe_capacity(capacity);
-    CapacityGuard(guard)
-}
-
 struct GatedCounter {
     seen: Arc<AtomicU64>,
     gate: Arc<Notify>,
@@ -128,7 +111,6 @@ impl SessionHandler for GatedCounter {
 /// therefore saturated nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn saturated_queues_block_then_deliver_everything_in_order() {
-    let _capacity = shrink_pipe(8);
     const TOTAL: u64 = 100;
     let addr = "127.0.0.1:28877";
     let seen = Arc::new(AtomicU64::new(0));
@@ -143,7 +125,13 @@ async fn saturated_queues_block_then_deliver_everything_in_order() {
         ordered: ordered.clone(),
     };
     let server = TransportServerBuilder::new()
-        .actor_buffer_size(4)
+        // Per-server limits: pipe=8 + actor mailbox=4 so the 100-message burst
+        // saturates both (no process-global capacity hook anymore).
+        .limits(
+            msgtrans::ServerLimits::new()
+                .pipe_capacity(8)
+                .mailbox_capacity(4),
+        )
         .protocol(TcpServerConfig::new(addr).expect("cfg"))
         .build(Arc::new(handler))
         .await
@@ -202,7 +190,6 @@ async fn saturated_queues_block_then_deliver_everything_in_order() {
 /// connect with "does not support event streams".
 #[tokio::test(flavor = "multi_thread")]
 async fn same_client_reconnects_and_still_delivers() {
-    let _capacity = shrink_pipe(8192); // serialize with the saturation test
     let addr = "127.0.0.1:28878";
     let seen = Arc::new(AtomicU64::new(0));
     let server = TransportServerBuilder::new()

@@ -20,8 +20,6 @@ use crate::{
     packet::Packet, protocol::AdapterStats, ConnectionInfo, SessionId,
 };
 
-use crate::adapters::outbound::SEND_QUEUE_CAPACITY;
-
 /// WebSocket message processing result
 #[derive(Debug)]
 enum MessageProcessResult {
@@ -236,31 +234,11 @@ pub struct WebSocketAdapter<C> {
 }
 
 impl<C> WebSocketAdapter<C> {
-    pub fn new(config: C) -> Self {
-        let (send_queue_tx, _) = mpsc::channel(SEND_QUEUE_CAPACITY);
-        let (shutdown_tx, _) = mpsc::unbounded_channel();
-
-        Self {
-            state: crate::adapters::core::ConnState::new(
-                crate::adapters::core::ConnStatus::Connecting,
-            ),
-            config,
-            stats: AdapterStats::new(),
-            connection_info: ConnectionInfo::default(),
-            send_queue: send_queue_tx,
-            event_pipe_rx: None,
-            shutdown_sender: shutdown_tx,
-            event_loop_handle: None,
-            frame_policy: Arc::new(std::sync::atomic::AtomicU8::new(
-                crate::packet::FramePolicy::default() as u8,
-            )),
-        }
-    }
-
     /// Create adapter with WebSocket stream
     pub async fn new_with_stream(
         config: C,
         stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
+        limits: crate::transport::limits::ConnectionLimits,
     ) -> Result<Self, WebSocketError>
     where
         C: std::any::Any,
@@ -278,12 +256,11 @@ impl<C> WebSocketAdapter<C> {
         ));
 
         // Create communication channels
-        let (send_queue_tx, send_queue_rx) = mpsc::channel(SEND_QUEUE_CAPACITY);
+        let (send_queue_tx, send_queue_rx) = mpsc::channel(limits.outbound_capacity);
         let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel();
         // Bounded event backbone: the loop task owns the sender half; when the
         // loop ends the pipe drops and the consumer sees end-of-data.
-        let (event_pipe, event_pipe_rx) =
-            crate::adapters::events::event_pipe(crate::adapters::events::default_pipe_capacity());
+        let (event_pipe, event_pipe_rx) = crate::adapters::events::event_pipe(limits.pipe_capacity);
 
         // Keepalive/idle enforcement parameters from the config (previously
         // declared but never enforced).
@@ -298,6 +275,7 @@ impl<C> WebSocketAdapter<C> {
             event_pipe,
             frame_policy.clone(),
             keepalive,
+            limits.write_deadline,
         )
         .await;
 
@@ -323,6 +301,7 @@ impl<C> WebSocketAdapter<C> {
         event_pipe: crate::adapters::events::EventPipe,
         frame_policy: Arc<std::sync::atomic::AtomicU8>,
         keepalive: WsKeepalive,
+        write_deadline: std::time::Duration,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let current_session_id = state.session_id();
@@ -474,7 +453,7 @@ impl<C> WebSocketAdapter<C> {
                             // Deadline: a peer that stops draining kills the
                             // connection instead of blocking queued senders.
                             let write = tokio::time::timeout(
-                                crate::adapters::outbound::write_deadline(),
+                                write_deadline,
                                 stream.send(message),
                             ).await;
                             match write {
@@ -691,11 +670,20 @@ impl<C: Send + Sync + 'static> Connection for WebSocketAdapter<C> {
 
 pub(crate) struct WebSocketServerBuilder<C> {
     config: Option<C>,
+    limits: crate::transport::limits::ConnectionLimits,
 }
 
 impl<C> WebSocketServerBuilder<C> {
     pub(crate) fn new() -> Self {
-        Self { config: None }
+        Self {
+            config: None,
+            limits: crate::transport::limits::ConnectionLimits::default(),
+        }
+    }
+
+    pub(crate) fn limits(mut self, limits: crate::transport::limits::ConnectionLimits) -> Self {
+        self.limits = limits;
+        self
     }
 
     pub(crate) fn config(mut self, config: C) -> Self {
@@ -725,6 +713,7 @@ impl<C> WebSocketServerBuilder<C> {
         Ok(WebSocketServer {
             config,
             listener: None,
+            limits: self.limits,
         })
     }
 }
@@ -732,6 +721,7 @@ impl<C> WebSocketServerBuilder<C> {
 pub(crate) struct WebSocketServer<C> {
     config: C,
     listener: Option<TcpListener>,
+    limits: crate::transport::limits::ConnectionLimits,
 }
 
 impl<C: 'static> WebSocketServer<C> {
@@ -810,7 +800,7 @@ impl<C: 'static> WebSocketServer<C> {
             .await?;
 
             // Create WebSocket adapter
-            WebSocketAdapter::new_with_stream(self.config.clone(), ws_stream).await
+            WebSocketAdapter::new_with_stream(self.config.clone(), ws_stream, self.limits).await
         } else {
             Err(WebSocketError::Config("No listener available".to_string()))
         }
@@ -833,11 +823,20 @@ impl<C: 'static> WebSocketServer<C> {
 
 pub(crate) struct WebSocketClientBuilder<C> {
     config: Option<C>,
+    limits: crate::transport::limits::ConnectionLimits,
 }
 
 impl<C> WebSocketClientBuilder<C> {
     pub(crate) fn new() -> Self {
-        Self { config: None }
+        Self {
+            config: None,
+            limits: crate::transport::limits::ConnectionLimits::default(),
+        }
+    }
+
+    pub(crate) fn limits(mut self, limits: crate::transport::limits::ConnectionLimits) -> Self {
+        self.limits = limits;
+        self
     }
 
     pub(crate) fn config(mut self, config: C) -> Self {
@@ -933,7 +932,7 @@ impl<C> WebSocketClientBuilder<C> {
         tracing::debug!("[SUCCESS] WebSocket client connected to: {}", url);
 
         // Create WebSocket adapter
-        WebSocketAdapter::new_with_stream(config, ws_stream).await
+        WebSocketAdapter::new_with_stream(config, ws_stream, self.limits).await
     }
 }
 

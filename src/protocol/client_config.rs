@@ -612,6 +612,7 @@ impl DynProtocolConfig for QuicClientConfig {
 impl crate::protocol::adapter::DynClientConfig for WebSocketClientConfig {
     fn build_connection_dyn(
         &self,
+        limits: crate::transport::limits::ConnectionLimits,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
@@ -621,7 +622,8 @@ impl crate::protocol::adapter::DynClientConfig for WebSocketClientConfig {
         >,
     > {
         Box::pin(async move {
-            let connection = crate::protocol::adapter::ClientConfig::build_connection(self).await?;
+            let connection =
+                crate::protocol::adapter::ClientConfig::build_connection(self, limits).await?;
             Ok(Box::new(connection) as Box<dyn crate::Connection>)
         })
     }
@@ -640,6 +642,7 @@ impl crate::protocol::adapter::DynClientConfig for WebSocketClientConfig {
 impl crate::protocol::adapter::DynClientConfig for TcpClientConfig {
     fn build_connection_dyn(
         &self,
+        limits: crate::transport::limits::ConnectionLimits,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
@@ -649,7 +652,8 @@ impl crate::protocol::adapter::DynClientConfig for TcpClientConfig {
         >,
     > {
         Box::pin(async move {
-            let connection = crate::protocol::adapter::ClientConfig::build_connection(self).await?;
+            let connection =
+                crate::protocol::adapter::ClientConfig::build_connection(self, limits).await?;
             Ok(Box::new(connection) as Box<dyn crate::Connection>)
         })
     }
@@ -668,6 +672,7 @@ impl crate::protocol::adapter::DynClientConfig for TcpClientConfig {
 impl crate::protocol::adapter::DynClientConfig for QuicClientConfig {
     fn build_connection_dyn(
         &self,
+        limits: crate::transport::limits::ConnectionLimits,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
@@ -677,7 +682,8 @@ impl crate::protocol::adapter::DynClientConfig for QuicClientConfig {
         >,
     > {
         Box::pin(async move {
-            let connection = crate::protocol::adapter::ClientConfig::build_connection(self).await?;
+            let connection =
+                crate::protocol::adapter::ClientConfig::build_connection(self, limits).await?;
             Ok(Box::new(connection) as Box<dyn crate::Connection>)
         })
     }
@@ -739,7 +745,9 @@ impl ConnectableConfig for TcpClientConfig {
     async fn connect(self, transport: Arc<Transport>) -> Result<SessionId, TransportError> {
         tracing::info!("🔌 TCP 客户端开始连接到 {}", self.target_address);
 
-        let connection = crate::protocol::adapter::ClientConfig::build_connection(&self).await?;
+        let limits = transport.config().connection_limits;
+        let connection =
+            crate::protocol::adapter::ClientConfig::build_connection(&self, limits).await?;
 
         // 将连接设置到 Transport 中
         let session_id = transport.set_connection(Box::new(connection)).await;
@@ -758,7 +766,9 @@ impl ConnectableConfig for WebSocketClientConfig {
     async fn connect(self, transport: Arc<Transport>) -> Result<SessionId, TransportError> {
         tracing::info!("🔌 WebSocket 客户端开始连接到 {}", self.target_url);
 
-        let connection = crate::protocol::adapter::ClientConfig::build_connection(&self).await?;
+        let limits = transport.config().connection_limits;
+        let connection =
+            crate::protocol::adapter::ClientConfig::build_connection(&self, limits).await?;
 
         // 将连接设置到 Transport 中
         let session_id = transport.set_connection(Box::new(connection)).await;
@@ -777,7 +787,9 @@ impl ConnectableConfig for QuicClientConfig {
     async fn connect(self, transport: Arc<Transport>) -> Result<SessionId, TransportError> {
         tracing::info!("🔌 QUIC 客户端开始连接到 {}", self.target_address);
 
-        let connection = crate::protocol::adapter::ClientConfig::build_connection(&self).await?;
+        let limits = transport.config().connection_limits;
+        let connection =
+            crate::protocol::adapter::ClientConfig::build_connection(&self, limits).await?;
 
         // 将连接设置到 Transport 中
         let session_id = transport.set_connection(Box::new(connection)).await;

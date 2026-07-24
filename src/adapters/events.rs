@@ -37,28 +37,6 @@ pub struct EventPipeRx {
     close_emitted: bool,
 }
 
-static PIPE_CAPACITY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(8192);
-
-/// Data-plane capacity used by adapters when creating their pipe.
-pub fn default_pipe_capacity() -> usize {
-    PIPE_CAPACITY.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Override the data-plane capacity (clamped to [1, 65536]).
-///
-/// Test hook: lets saturation tests shrink the queue to a size a burst can
-/// actually fill. Process-global — tests using it must serialize themselves
-/// and restore the default. Slated to become ServerLimits/ClientLimits
-/// configuration at the API freeze; environment variables are deliberately
-/// not consulted, so production behavior cannot be changed from outside.
-#[doc(hidden)]
-pub fn set_default_pipe_capacity(capacity: usize) {
-    PIPE_CAPACITY.store(
-        capacity.clamp(1, 65536),
-        std::sync::atomic::Ordering::Relaxed,
-    );
-}
-
 /// Create a connected pipe with the given data-plane capacity.
 pub fn event_pipe(capacity: usize) -> (EventPipe, EventPipeRx) {
     let (data_tx, data_rx) = mpsc::channel(capacity);

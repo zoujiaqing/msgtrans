@@ -1137,7 +1137,7 @@ impl TransportServer {
                         "startup cancelled by shutdown",
                     )); // built drops -> bound endpoints close
                 }
-                r = protocol_config.build_server_dyn() => r,
+                r = protocol_config.build_server_dyn(self.config.connection_limits) => r,
             };
             match build {
                 Ok(server) => built.push((protocol_name.clone(), server)),

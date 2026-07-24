@@ -141,9 +141,10 @@ pub trait DynProtocolConfig: Send + Sync + 'static {
 
 /// 🔧 Server-specific dynamic configuration
 pub trait DynServerConfig: DynProtocolConfig {
-    /// Dynamically build server (object-safe)
+    /// Dynamically build server (object-safe) with per-connection limits.
     fn build_server_dyn(
         &self,
+        limits: crate::transport::limits::ConnectionLimits,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
@@ -162,9 +163,10 @@ pub trait DynServerConfig: DynProtocolConfig {
 
 /// 🔧 Client-specific dynamic configuration  
 pub trait DynClientConfig: DynProtocolConfig {
-    /// Dynamically build connection (object-safe)
+    /// Dynamically build connection (object-safe) with per-connection limits.
     fn build_connection_dyn(
         &self,
+        limits: crate::transport::limits::ConnectionLimits,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
@@ -226,12 +228,16 @@ impl ServerConfig for TcpServerConfig {
         })
     }
 
-    async fn build_server(&self) -> Result<Self::Server, TransportError> {
+    async fn build_server(
+        &self,
+        limits: crate::transport::limits::ConnectionLimits,
+    ) -> Result<Self::Server, TransportError> {
         use crate::adapters::tcp::TcpServerBuilder;
 
         let server = TcpServerBuilder::new()
             .bind_address(self.bind_address)
             .config(self.clone())
+            .limits(limits)
             .build()
             .await
             .map_err(|e| {
@@ -262,12 +268,16 @@ impl ClientConfig for TcpClientConfig {
         })
     }
 
-    async fn build_connection(&self) -> Result<Self::Connection, TransportError> {
+    async fn build_connection(
+        &self,
+        limits: crate::transport::limits::ConnectionLimits,
+    ) -> Result<Self::Connection, TransportError> {
         use crate::adapters::tcp::TcpClientBuilder;
 
         TcpClientBuilder::new()
             .target_address(self.target_address)
             .config(self.clone())
+            .limits(limits)
             .connect()
             .await
             .map_err(|e| {
@@ -296,10 +306,14 @@ impl ServerConfig for WebSocketServerConfig {
         })
     }
 
-    async fn build_server(&self) -> Result<Self::Server, TransportError> {
+    async fn build_server(
+        &self,
+        limits: crate::transport::limits::ConnectionLimits,
+    ) -> Result<Self::Server, TransportError> {
         use crate::adapters::websocket::WebSocketServerBuilder;
 
         let server = WebSocketServerBuilder::new()
+            .limits(limits)
             .bind_address(self.bind_address)
             .config(self.clone())
             .build()
@@ -334,10 +348,14 @@ impl ClientConfig for WebSocketClientConfig {
         })
     }
 
-    async fn build_connection(&self) -> Result<Self::Connection, TransportError> {
+    async fn build_connection(
+        &self,
+        limits: crate::transport::limits::ConnectionLimits,
+    ) -> Result<Self::Connection, TransportError> {
         use crate::adapters::websocket::WebSocketClientBuilder;
 
         WebSocketClientBuilder::new()
+            .limits(limits)
             .target_url(&self.target_url)
             .config(self.clone())
             .connect()
@@ -368,10 +386,14 @@ impl ServerConfig for QuicServerConfig {
         })
     }
 
-    async fn build_server(&self) -> Result<Self::Server, TransportError> {
+    async fn build_server(
+        &self,
+        limits: crate::transport::limits::ConnectionLimits,
+    ) -> Result<Self::Server, TransportError> {
         use crate::adapters::quic::QuicServerBuilder;
 
         let server = QuicServerBuilder::new()
+            .limits(limits)
             .bind_address(self.bind_address)
             .config(self.clone())
             .build()
@@ -404,10 +426,14 @@ impl ClientConfig for QuicClientConfig {
         })
     }
 
-    async fn build_connection(&self) -> Result<Self::Connection, TransportError> {
+    async fn build_connection(
+        &self,
+        limits: crate::transport::limits::ConnectionLimits,
+    ) -> Result<Self::Connection, TransportError> {
         use crate::adapters::quic::QuicClientBuilder;
 
         QuicClientBuilder::new()
+            .limits(limits)
             .target_address(self.target_address)
             .config(self.clone())
             .connect()
@@ -432,9 +458,10 @@ pub trait ServerConfig: Send + Sync + 'static {
     /// Validate configuration correctness
     fn validate(&self) -> Result<(), TransportError>;
 
-    /// Build server instance
+    /// Build server instance with the per-connection resource limits.
     fn build_server(
         &self,
+        limits: crate::transport::limits::ConnectionLimits,
     ) -> impl std::future::Future<Output = Result<Self::Server, TransportError>> + Send;
 
     /// Get protocol name
@@ -448,9 +475,10 @@ pub trait ClientConfig: Send + Sync + 'static {
     /// Validate configuration correctness
     fn validate(&self) -> Result<(), TransportError>;
 
-    /// Build connection instance
+    /// Build connection instance with the per-connection resource limits.
     fn build_connection(
         &self,
+        limits: crate::transport::limits::ConnectionLimits,
     ) -> impl std::future::Future<Output = Result<Self::Connection, TransportError>> + Send;
 
     /// Get protocol name

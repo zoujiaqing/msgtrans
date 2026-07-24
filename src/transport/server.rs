@@ -64,9 +64,20 @@ impl TransportServerBuilder {
         self
     }
 
-    /// Set buffer size for actor channels (default: 2048)
+    /// Set buffer size for actor channels (default: 2048).
+    ///
+    /// Prefer [`Self::limits`] with [`ServerLimits::mailbox_capacity`]; this
+    /// remains as a focused shortcut.
     pub fn actor_buffer_size(mut self, size: usize) -> Self {
         self.actor_buffer_size = Some(size);
+        self
+    }
+
+    /// Apply per-connection resource limits (write deadline, event-pipe and
+    /// outbound-queue capacity) plus the per-session actor mailbox capacity.
+    pub fn limits(mut self, limits: crate::transport::limits::ServerLimits) -> Self {
+        self.transport_config.connection_limits = limits.connection;
+        self.actor_buffer_size = Some(limits.mailbox_capacity);
         self
     }
 

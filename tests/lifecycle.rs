@@ -790,6 +790,7 @@ impl DynProtocolConfig for GatedBuildConfig {
 impl DynServerConfig for GatedBuildConfig {
     fn build_server_dyn(
         &self,
+        _limits: msgtrans::ConnectionLimits,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
@@ -878,6 +879,7 @@ impl DynProtocolConfig for PanicBuildConfig {
 impl DynServerConfig for PanicBuildConfig {
     fn build_server_dyn(
         &self,
+        _limits: msgtrans::ConnectionLimits,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<

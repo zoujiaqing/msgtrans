@@ -29,8 +29,6 @@ use crate::{
     SessionId,
 };
 
-use crate::adapters::outbound::SEND_QUEUE_CAPACITY;
-
 #[derive(Debug, thiserror::Error)]
 pub enum QuicError {
     #[error("Quinn connection error: {0}")]
@@ -405,6 +403,7 @@ impl<C> QuicAdapter<C> {
         connection: QuinnConnection,
         config: C,
         is_server: bool,
+        limits: crate::transport::limits::ConnectionLimits,
     ) -> Result<Self, QuicError> {
         let state =
             crate::adapters::core::ConnState::new(crate::adapters::core::ConnStatus::Connecting);
@@ -422,7 +421,7 @@ impl<C> QuicAdapter<C> {
         }
 
         // Create communication channels
-        let (send_queue_tx, send_queue_rx) = mpsc::channel(SEND_QUEUE_CAPACITY);
+        let (send_queue_tx, send_queue_rx) = mpsc::channel(limits.outbound_capacity);
         let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel();
         let frame_policy = Arc::new(std::sync::atomic::AtomicU8::new(
             crate::packet::FramePolicy::default() as u8,
@@ -432,8 +431,7 @@ impl<C> QuicAdapter<C> {
         // Bounded event backbone shared by the supervisor/read/write tasks;
         // whichever ends first publishes the close, and when all clones drop
         // the consumer sees end-of-data.
-        let (event_pipe, event_pipe_rx) =
-            crate::adapters::events::event_pipe(crate::adapters::events::default_pipe_capacity());
+        let (event_pipe, event_pipe_rx) = crate::adapters::events::event_pipe(limits.pipe_capacity);
         let event_pipe = std::sync::Arc::new(event_pipe);
         let event_loop_handle = Self::start_event_loop(
             connection,
@@ -443,6 +441,7 @@ impl<C> QuicAdapter<C> {
             event_pipe,
             is_server,
             frame_policy.clone(),
+            limits.write_deadline,
         )
         .await;
 
@@ -484,6 +483,7 @@ impl<C> QuicAdapter<C> {
         event_pipe: std::sync::Arc<crate::adapters::events::EventPipe>,
         is_server: bool,
         frame_policy: Arc<std::sync::atomic::AtomicU8>,
+        write_deadline: std::time::Duration,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let current_session_id = state.session_id();
@@ -731,11 +731,9 @@ impl<C> QuicAdapter<C> {
                     // Single write for entire batch, bounded by the write
                     // deadline: a stalled stream fails the batch instead of
                     // blocking every queued sender indefinitely.
-                    let batch_write = tokio::time::timeout(
-                        crate::adapters::outbound::write_deadline(),
-                        send_stream.write_all(&write_buf),
-                    )
-                    .await;
+                    let batch_write =
+                        tokio::time::timeout(write_deadline, send_stream.write_all(&write_buf))
+                            .await;
                     let batch_error = match batch_write {
                         Ok(Ok(())) => None,
                         Ok(Err(e)) => Some(format!("Write error: {:?}", e)),
@@ -832,7 +830,11 @@ impl<C> QuicAdapter<C> {
 // Client adapter implementation
 impl QuicAdapter<QuicClientConfig> {
     /// Connect to QUIC server
-    pub async fn connect(addr: SocketAddr, config: QuicClientConfig) -> Result<Self, QuicError> {
+    pub async fn connect(
+        addr: SocketAddr,
+        config: QuicClientConfig,
+        limits: crate::transport::limits::ConnectionLimits,
+    ) -> Result<Self, QuicError> {
         tracing::debug!("[CONNECT] QUIC client connecting to: {}", addr);
 
         // Create client configuration based on config
@@ -865,7 +867,7 @@ impl QuicAdapter<QuicClientConfig> {
             config.connect_timeout
         );
 
-        Self::new_with_connection(connection, config, false).await
+        Self::new_with_connection(connection, config, false, limits).await
     }
 }
 
@@ -939,6 +941,7 @@ impl<C: Send + Sync + 'static> Connection for QuicAdapter<C> {
 pub(crate) struct QuicServerBuilder {
     config: QuicServerConfig,
     bind_address: Option<SocketAddr>,
+    limits: crate::transport::limits::ConnectionLimits,
 }
 
 impl QuicServerBuilder {
@@ -946,7 +949,13 @@ impl QuicServerBuilder {
         Self {
             config: QuicServerConfig::default(),
             bind_address: None,
+            limits: crate::transport::limits::ConnectionLimits::default(),
         }
+    }
+
+    pub(crate) fn limits(mut self, limits: crate::transport::limits::ConnectionLimits) -> Self {
+        self.limits = limits;
+        self
     }
 
     pub(crate) fn bind_address(mut self, addr: SocketAddr) -> Self {
@@ -996,6 +1005,7 @@ impl QuicServerBuilder {
         Ok(QuicServer {
             config: self.config,
             endpoint,
+            limits: self.limits,
         })
     }
 }
@@ -1009,6 +1019,7 @@ impl Default for QuicServerBuilder {
 pub(crate) struct QuicServer {
     config: QuicServerConfig,
     endpoint: Endpoint,
+    limits: crate::transport::limits::ConnectionLimits,
 }
 
 impl QuicServer {
@@ -1033,6 +1044,7 @@ impl QuicServer {
             connection,
             self.config.clone(),
             true, // is_server = true
+            self.limits,
         )
         .await
     }
@@ -1055,6 +1067,7 @@ impl QuicServer {
 pub(crate) struct QuicClientBuilder {
     config: QuicClientConfig,
     target_address: Option<std::net::SocketAddr>,
+    limits: crate::transport::limits::ConnectionLimits,
 }
 
 impl QuicClientBuilder {
@@ -1062,7 +1075,13 @@ impl QuicClientBuilder {
         Self {
             config: QuicClientConfig::default(),
             target_address: None,
+            limits: crate::transport::limits::ConnectionLimits::default(),
         }
+    }
+
+    pub(crate) fn limits(mut self, limits: crate::transport::limits::ConnectionLimits) -> Self {
+        self.limits = limits;
+        self
     }
 
     pub(crate) fn target_address(mut self, addr: std::net::SocketAddr) -> Self {
@@ -1079,7 +1098,7 @@ impl QuicClientBuilder {
         let addr = self
             .target_address
             .ok_or_else(|| QuicError::Config("Target address not set".to_string()))?;
-        QuicAdapter::connect(addr, self.config).await
+        QuicAdapter::connect(addr, self.config, self.limits).await
     }
 }
 

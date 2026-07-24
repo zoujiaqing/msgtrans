@@ -41,29 +41,6 @@ impl Outbound {
     }
 }
 
-/// How long a single socket write may take before the connection is declared
-/// dead. A peer that stops draining for this long has stalled the whole
-/// connection (the outbound queue is already full behind it); failing the
-/// write closes the connection and resolves every queued completion instead
-/// of blocking respond callers indefinitely.
-static WRITE_DEADLINE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(30_000);
-
-pub(crate) fn write_deadline() -> Duration {
-    Duration::from_millis(WRITE_DEADLINE_MS.load(std::sync::atomic::Ordering::Relaxed))
-}
-
-/// Override the per-write deadline (clamped to [10ms, 10min]).
-///
-/// Test hook: lets stall tests use a deadline a test can actually wait out.
-/// Process-global — tests using it must serialize themselves and restore the
-/// default. Slated to become ServerLimits/ClientLimits configuration at the
-/// API freeze.
-#[doc(hidden)]
-pub fn set_write_deadline(deadline: Duration) {
-    let ms = deadline.as_millis().clamp(10, 600_000) as u64;
-    WRITE_DEADLINE_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
-}
-
 /// Depth of each connection's outbound queue.
 ///
 /// Bounds per-connection memory while leaving enough headroom to absorb bursts.

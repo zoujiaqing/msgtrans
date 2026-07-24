@@ -79,7 +79,6 @@ const MAX_EXT_HEADER_SIZE: usize = 64 * 1024;
 const MAX_RESYNC_SCAN_DISTANCE: usize = 4096;
 /// Fixed header size
 const FIXED_HEADER_SIZE: usize = 16;
-use crate::adapters::outbound::SEND_QUEUE_CAPACITY;
 
 /// Optimized TCP read buffer with frame resync and memory-pool recycling.
 struct OptimizedReadBuffer {
@@ -360,7 +359,12 @@ pub struct TcpAdapter<C> {
 }
 
 impl<C> TcpAdapter<C> {
-    pub async fn new(stream: TcpStream, config: C, nodelay: bool) -> Result<Self, TcpError>
+    pub async fn new(
+        stream: TcpStream,
+        config: C,
+        nodelay: bool,
+        limits: crate::transport::limits::ConnectionLimits,
+    ) -> Result<Self, TcpError>
     where
         C: std::any::Any,
     {
@@ -382,12 +386,11 @@ impl<C> TcpAdapter<C> {
         let state =
             crate::adapters::core::ConnState::new(crate::adapters::core::ConnStatus::Connected);
 
-        let (send_queue_tx, send_queue_rx) = mpsc::channel(SEND_QUEUE_CAPACITY);
+        let (send_queue_tx, send_queue_rx) = mpsc::channel(limits.outbound_capacity);
         let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel();
         // Bounded event backbone: the loop task owns the sender half; when the
         // loop ends the pipe drops and the consumer sees end-of-data.
-        let (event_pipe, event_pipe_rx) =
-            crate::adapters::events::event_pipe(crate::adapters::events::default_pipe_capacity());
+        let (event_pipe, event_pipe_rx) = crate::adapters::events::event_pipe(limits.pipe_capacity);
 
         let memory_pool = shared_memory_pool();
         let frame_policy = Arc::new(std::sync::atomic::AtomicU8::new(
@@ -408,6 +411,7 @@ impl<C> TcpAdapter<C> {
             memory_pool,
             frame_policy.clone(),
             idle_timeout,
+            limits.write_deadline,
         )
         .await;
 
@@ -434,6 +438,7 @@ impl<C> TcpAdapter<C> {
         memory_pool: Arc<OptimizedMemoryPool>,
         frame_policy: Arc<std::sync::atomic::AtomicU8>,
         idle_timeout: Option<std::time::Duration>,
+        write_deadline: std::time::Duration,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let current_session_id = state.session_id();
@@ -519,7 +524,7 @@ impl<C> TcpAdapter<C> {
                             // draining: the connection is declared dead rather than
                             // blocking every queued sender behind it.
                             let write = tokio::time::timeout(
-                                crate::adapters::outbound::write_deadline(),
+                                write_deadline,
                                 Self::write_packet_to_stream(&mut write_half, &packet),
                             ).await;
                             match write {
@@ -610,6 +615,7 @@ impl TcpAdapter<TcpClientConfig> {
     pub async fn connect(
         addr: std::net::SocketAddr,
         config: TcpClientConfig,
+        limits: crate::transport::limits::ConnectionLimits,
     ) -> Result<Self, TcpError> {
         tracing::debug!("[CONNECT] TCP client connecting to: {}", addr);
 
@@ -645,7 +651,7 @@ impl TcpAdapter<TcpClientConfig> {
         }
 
         let nodelay = config.nodelay;
-        Self::new(stream, config, nodelay).await
+        Self::new(stream, config, nodelay, limits).await
     }
 }
 
@@ -713,6 +719,7 @@ impl<C: Send + Sync + 'static> Connection for TcpAdapter<C> {
 pub(crate) struct TcpServerBuilder {
     config: TcpServerConfig,
     bind_address: Option<std::net::SocketAddr>,
+    limits: crate::transport::limits::ConnectionLimits,
 }
 
 impl TcpServerBuilder {
@@ -720,7 +727,13 @@ impl TcpServerBuilder {
         Self {
             config: TcpServerConfig::default(),
             bind_address: None,
+            limits: crate::transport::limits::ConnectionLimits::default(),
         }
+    }
+
+    pub(crate) fn limits(mut self, limits: crate::transport::limits::ConnectionLimits) -> Self {
+        self.limits = limits;
+        self
     }
 
     pub(crate) fn bind_address(mut self, addr: std::net::SocketAddr) -> Self {
@@ -758,6 +771,7 @@ impl TcpServerBuilder {
         Ok(TcpServer {
             listener: Some(listener),
             config: self.config,
+            limits: self.limits,
         })
     }
 }
@@ -772,6 +786,7 @@ impl Default for TcpServerBuilder {
 pub(crate) struct TcpServer {
     listener: Option<TcpListener>,
     config: TcpServerConfig,
+    limits: crate::transport::limits::ConnectionLimits,
 }
 
 impl TcpServer {
@@ -792,7 +807,13 @@ impl TcpServer {
             apply_tcp_keepalive(&stream, keepalive);
         }
 
-        TcpAdapter::new(stream, self.config.clone(), self.config.nodelay).await
+        TcpAdapter::new(
+            stream,
+            self.config.clone(),
+            self.config.nodelay,
+            self.limits,
+        )
+        .await
     }
 
     pub(crate) fn local_addr(&self) -> Result<std::net::SocketAddr, TcpError> {
@@ -814,6 +835,7 @@ impl TcpServer {
 pub(crate) struct TcpClientBuilder {
     config: TcpClientConfig,
     target_address: Option<std::net::SocketAddr>,
+    limits: crate::transport::limits::ConnectionLimits,
 }
 
 impl TcpClientBuilder {
@@ -821,7 +843,13 @@ impl TcpClientBuilder {
         Self {
             config: TcpClientConfig::default(),
             target_address: None,
+            limits: crate::transport::limits::ConnectionLimits::default(),
         }
+    }
+
+    pub(crate) fn limits(mut self, limits: crate::transport::limits::ConnectionLimits) -> Self {
+        self.limits = limits;
+        self
     }
 
     pub(crate) fn target_address(mut self, addr: std::net::SocketAddr) -> Self {
@@ -836,7 +864,7 @@ impl TcpClientBuilder {
 
     pub(crate) async fn connect(self) -> Result<TcpAdapter<TcpClientConfig>, TcpError> {
         let target_addr = self.target_address.unwrap_or(self.config.target_address);
-        TcpAdapter::connect(target_addr, self.config).await
+        TcpAdapter::connect(target_addr, self.config, self.limits).await
     }
 }
 

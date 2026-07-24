@@ -103,6 +103,13 @@ impl TransportClientBuilder {
         self
     }
 
+    /// Apply per-connection resource limits (write deadline, event-pipe and
+    /// outbound-queue capacity).
+    pub fn limits(mut self, limits: crate::transport::limits::ClientLimits) -> Self {
+        self.transport_config.connection_limits = limits.connection;
+        self
+    }
+
     /// Build client transport layer - return TransportClient
     pub async fn build(self) -> Result<TransportClient, TransportError> {
         let ctx = crate::transport::context::TransportContext::new().await?;
