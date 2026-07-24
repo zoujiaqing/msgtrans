@@ -141,7 +141,16 @@ WebSocketClientConfig::new(url)?.tls(ClientTls::SystemRoots)     // default
 The 1.x `verify_tls` flag was never wired (the client could not establish TLS).
 `ClientTls` variants are all real; TLS is consulted only for `wss://`.
 
-## 8. Removed public machinery
+## 8. Sealed implementation modules
+
+The `transport::*` and `adapters::*` implementation submodules are now
+`pub(crate)`. Reach everything through the crate root: `msgtrans::Packet`, not
+`msgtrans::packet::Packet` deep paths into internals like
+`msgtrans::transport::request_registry::RequestState` no longer resolve (they
+were never meant to be public). The request-lifecycle state machine and the
+session-actor internals are fully crate-private.
+
+## 9. Removed public machinery
 
 The internal performance types are no longer re-exported at the crate root:
 `LockFreeCounter/HashMap/Queue`, `MemoryPool`/`MemoryStats`, `ProtocolStats`,

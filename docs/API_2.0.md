@@ -1,7 +1,10 @@
 # msgtrans 2.0 public API surface
 
-The frozen crate-root surface (`msgtrans::*`). Types behind `#[cfg(feature)]`
-are noted. Everything not listed here is crate-internal.
+The frozen crate-root surface (`msgtrans::*`). Types behind `#[cfg(feature)]` are noted. Everything not listed here is
+crate-internal: the implementation modules (transport::*, adapters::*) are
+`pub(crate)`, so paths like `msgtrans::transport::request_registry::*` do not
+resolve — the public API is exactly the crate root plus the feature-gated
+protocol configs.
 
 ## Core types
 
@@ -24,9 +27,10 @@ are noted. Everything not listed here is crate-internal.
 - Mutators: `set_payload/set_ext_header(impl Into<Bytes>)`, `set_biz_type`,
   `set_message_id`, `set_packet_type`, `set_compression`, `set_reserved`,
   `set_fragmented/set_priority/set_route_tag`, `compress_payload/decompress_payload`
-- Codec: `try_encode() -> Result<Bytes>`, `decode_one[_with]`,
-  `decode_exact[_with]` (`from_bytes` == `decode_exact`), `DecodeLimits`,
-  `DEFAULT_MAX_FRAME_SIZE`
+- Codec: `try_encode() -> Result<Bytes>`; borrowed decoders `decode_one[_with]`
+  and `decode_exact[_with]` (`from_bytes` == `decode_exact`, copies the body);
+  owned zero-copy decoder `decode_one_from(&Bytes)` (slices the body);
+  `DecodeLimits`, `DEFAULT_MAX_FRAME_SIZE`
 
 ## Server
 
