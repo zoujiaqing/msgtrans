@@ -856,20 +856,10 @@ impl QuicAdapter<QuicClientConfig> {
 
 #[async_trait]
 impl<C: Send + Sync + 'static> Connection for QuicAdapter<C> {
-    async fn send(&mut self, packet: Packet) -> Result<(), TransportError> {
-        crate::adapters::outbound::send_bounded(
-            &self.send_queue,
-            packet,
-            "quic_outbound_queue",
-            "QUIC connection closed",
-        )
-        .await
-    }
-
     async fn send_with_completion(
         &mut self,
         packet: Packet,
-        completion: crate::adapters::outbound::WriteCompletion,
+        completion: crate::connection::WriteCompletion,
     ) -> Result<(), TransportError> {
         crate::adapters::outbound::send_with_completion_bounded(
             &self.send_queue,

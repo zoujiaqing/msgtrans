@@ -13,50 +13,12 @@
 //! are absorbed like before, while a genuinely stuck consumer fails fast and
 //! cannot block the caller indefinitely.
 
+use crate::connection::WriteCompletion;
 use crate::error::TransportError;
 use crate::packet::Packet;
-use crate::transport::request_registry::RespondClaim;
 use std::time::Duration;
 use tokio::sync::mpsc::{self, error::SendTimeoutError};
 use tokio::sync::oneshot;
-
-/// The completion of one confirmed write. Carried by the outbound queue item
-/// through to the write loop, which resolves it with the REAL write result.
-///
-/// Resolution cannot be lost: `complete()` reports the write outcome to both
-/// the optional observer (a caller awaiting the receipt) and the optional
-/// [`RespondClaim`] (the registry's `Responding` entry). If the completion is
-/// dropped instead — queue entry discarded, connection died, enqueue future
-/// cancelled — the observer's channel closes (a connection error to the
-/// awaiter) and the claim's own drop guard records a send failure. Observers
-/// are therefore pure observers: cancelling the caller's future never strands
-/// registry state.
-#[derive(Debug)]
-pub struct WriteCompletion {
-    observer: Option<oneshot::Sender<Result<(), TransportError>>>,
-    claim: Option<RespondClaim>,
-}
-
-impl WriteCompletion {
-    pub(crate) fn new(
-        observer: Option<oneshot::Sender<Result<(), TransportError>>>,
-        claim: Option<RespondClaim>,
-    ) -> Self {
-        Self { observer, claim }
-    }
-
-    /// Resolve with the actual write outcome. Adapters MUST call this from the
-    /// write loop after the socket write; a completion they cannot write must
-    /// be dropped (which reports failure) — never completed with a made-up Ok.
-    pub fn complete(mut self, result: Result<(), TransportError>) {
-        if let Some(claim) = self.claim.take() {
-            claim.resolve(result.is_ok());
-        }
-        if let Some(tx) = self.observer.take() {
-            let _ = tx.send(result);
-        }
-    }
-}
 
 /// One outbound queue item: the packet, plus an optional write completion.
 ///
@@ -150,12 +112,17 @@ pub(crate) async fn send_with_completion_bounded(
     queue_name: &'static str,
     closed_msg: &'static str,
 ) -> Result<(), TransportError> {
+    // Fire-and-forget completions carry no observer and no claim: skip the
+    // per-item Option payload entirely so the single SPI entry point costs
+    // the same as the old dedicated send() path.
+    let completion = if completion.is_detached() {
+        None
+    } else {
+        Some(completion)
+    };
     send_item(
         queue,
-        Outbound {
-            packet,
-            completion: Some(completion),
-        },
+        Outbound { packet, completion },
         queue_name,
         closed_msg,
     )

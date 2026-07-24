@@ -87,11 +87,17 @@ impl Transport {
         config.connect(Arc::clone(self)).await
     }
 
-    /// Send data packet through the underlying connection (single-lock hot path).
+    /// Send data packet through the underlying connection (single-lock hot
+    /// path). Fire-and-forget tier of the single send SPI: the enqueue result
+    /// is the only signal.
     pub async fn send(&self, packet: Packet) -> Result<(), TransportError> {
         let mut guard = self.slot.lock().await;
         match guard.as_mut() {
-            Some(slot) => slot.connection.send(packet).await,
+            Some(slot) => {
+                slot.connection
+                    .send_with_completion(packet, crate::connection::WriteCompletion::detached())
+                    .await
+            }
             None => Err(TransportError::connection_error("Not connected", false)),
         }
     }
@@ -124,7 +130,7 @@ impl Transport {
         let (observer_tx, observer_rx) = tokio::sync::oneshot::channel();
         // Created before the first await: cancellation from here on drops the
         // completion, which reports failure to the claim and the observer.
-        let completion = crate::adapters::outbound::WriteCompletion::new(Some(observer_tx), claim);
+        let completion = crate::connection::WriteCompletion::new(Some(observer_tx), claim);
         {
             let mut guard = self.slot.lock().await;
             match guard.as_mut() {
@@ -888,16 +894,12 @@ mod generation_tests {
 
     #[async_trait::async_trait]
     impl Connection for MockConn {
-        async fn send(&mut self, _packet: Packet) -> Result<(), TransportError> {
-            self.sent.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
         async fn send_with_completion(
             &mut self,
-            packet: Packet,
-            completion: crate::adapters::outbound::WriteCompletion,
+            _packet: Packet,
+            completion: crate::connection::WriteCompletion,
         ) -> Result<(), TransportError> {
-            self.send(packet).await?;
+            self.sent.fetch_add(1, Ordering::SeqCst);
             completion.complete(Ok(()));
             Ok(())
         }

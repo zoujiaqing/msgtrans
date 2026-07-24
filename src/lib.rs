@@ -106,7 +106,7 @@ pub use protocol::{QuicClientConfig, QuicServerConfig};
 #[cfg(feature = "tcp")]
 pub use protocol::{TcpClientConfig, TcpServerConfig};
 // Re-export new abstractions
-pub use connection::{Connection, ConnectionFactory, Server};
+pub use connection::{Connection, ConnectionFactory, Server, WriteCompletion};
 
 // Convenient type aliases
 pub type Result<T> = std::result::Result<T, TransportError>;
