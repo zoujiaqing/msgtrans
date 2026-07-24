@@ -690,42 +690,11 @@ impl<C> QuicAdapter<C> {
 
                     let current_session_id = write_state.session_id();
 
-                    // Batch serialize all packets into write buffer
+                    // Batch serialize all packets into write buffer. Per-item
+                    // encode failures resolve their OWN completion and are
+                    // excluded from the batch (see prepare_quic_batch).
                     write_buf.clear();
-                    let mut packet_ids = Vec::with_capacity(count);
-                    let mut completions = Vec::new();
-
-                    for item in batch.drain(..) {
-                        let packet = item.packet;
-                        if let Some(completion) = item.completion {
-                            completions.push(completion);
-                        }
-                        let packet_id = packet.header.message_id;
-                        packet_ids.push(packet_id);
-
-                        // Fallible encode: an unencodable packet fails its own
-                        // completion and is skipped, without poisoning the batch.
-                        let data = match packet.try_encode() {
-                            Ok(bytes) => bytes,
-                            Err(e) => {
-                                if let Some(completion) = completions.pop() {
-                                    completion.complete(Err(
-                                        crate::error::TransportError::protocol_error(
-                                            "quic",
-                                            format!("encode failed: {e}"),
-                                        ),
-                                    ));
-                                }
-                                packet_ids.pop();
-                                continue;
-                            }
-                        };
-                        let frame_len = data.len() as u32;
-
-                        // Append header + payload to write buffer
-                        write_buf.extend_from_slice(&frame_len.to_be_bytes());
-                        write_buf.extend_from_slice(&data);
-                    }
+                    let (packet_ids, completions) = prepare_quic_batch(batch.drain(..), &mut write_buf);
 
                     // Single write for entire batch, bounded by the write
                     // deadline: a stalled stream fails the batch instead of
@@ -937,6 +906,44 @@ impl<C: Send + Sync + 'static> Connection for QuicAdapter<C> {
 }
 
 // Server builder and related structures remain unchanged...
+/// Encode one drained outbound batch into `write_buf`, returning the packet ids
+/// and the completions to resolve AFTER the socket write. A packet that fails
+/// to encode resolves its OWN completion with the error and is excluded — it is
+/// never added to `write_buf` and can never resolve another packet's
+/// completion.
+fn prepare_quic_batch(
+    items: impl IntoIterator<Item = crate::adapters::outbound::Outbound>,
+    write_buf: &mut bytes::BytesMut,
+) -> (Vec<u32>, Vec<crate::connection::WriteCompletion>) {
+    let mut packet_ids = Vec::new();
+    let mut completions = Vec::new();
+    for item in items {
+        let packet = item.packet;
+        let completion = item.completion;
+        let packet_id = packet.header.message_id;
+        let data = match packet.try_encode() {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                if let Some(completion) = completion {
+                    completion.complete(Err(crate::error::TransportError::protocol_error(
+                        "quic",
+                        format!("encode failed: {e}"),
+                    )));
+                }
+                continue;
+            }
+        };
+        if let Some(completion) = completion {
+            completions.push(completion);
+        }
+        packet_ids.push(packet_id);
+        let frame_len = data.len() as u32;
+        write_buf.extend_from_slice(&frame_len.to_be_bytes());
+        write_buf.extend_from_slice(&data);
+    }
+    (packet_ids, completions)
+}
+
 pub(crate) struct QuicServerBuilder {
     config: QuicServerConfig,
     bind_address: Option<SocketAddr>,
@@ -1104,5 +1111,83 @@ impl QuicClientBuilder {
 impl Default for QuicClientBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::prepare_quic_batch;
+    use crate::adapters::outbound::Outbound;
+    use crate::connection::WriteCompletion;
+    use crate::packet::Packet;
+    use tokio::sync::oneshot;
+
+    fn confirmed(packet: Packet) -> (Outbound, oneshot::Receiver<Result<(), crate::TransportError>>) {
+        let (tx, rx) = oneshot::channel();
+        (
+            Outbound {
+                packet,
+                completion: Some(WriteCompletion::new(Some(tx), None)),
+            },
+            rx,
+        )
+    }
+
+    /// Regression: a valid confirmed packet followed by a DETACHED packet that
+    /// fails to encode must NOT resolve the confirmed packet's completion. The
+    /// earlier pop()-based writer failed the previous packet's receipt while
+    /// its bytes stayed in the write buffer and were written — breaking
+    /// RespondOutcome::Written.
+    #[test]
+    fn encode_failure_of_one_item_never_touches_another() {
+        // Detached packet with an ext header over u16::MAX: try_encode fails.
+        let mut bad = Packet::one_way(2, b"x".to_vec());
+        bad.set_ext_header(vec![0u8; u16::MAX as usize + 1]);
+        let bad_item = Outbound {
+            packet: bad,
+            completion: None, // detached
+        };
+
+        let (good_item, mut good_rx) = confirmed(Packet::one_way(1, b"ok".to_vec()));
+
+        let mut buf = bytes::BytesMut::new();
+        let (ids, completions) = prepare_quic_batch([good_item, bad_item], &mut buf);
+
+        // Only the good packet is in the batch; the bad one is excluded.
+        assert_eq!(ids, vec![1]);
+        assert_eq!(completions.len(), 1);
+        // The good packet's receipt is still PENDING (not mis-failed).
+        assert!(good_rx.try_recv().is_err(), "good receipt must not be resolved by the bad packet");
+
+        // Simulate a successful socket write: resolve the batch completions Ok.
+        for completion in completions {
+            completion.complete(Ok(()));
+        }
+        assert!(matches!(good_rx.try_recv(), Ok(Ok(()))), "good packet must confirm Written");
+    }
+
+    /// A confirmed packet that itself fails to encode resolves its OWN receipt
+    /// with an error, and does not appear in the batch.
+    #[test]
+    fn encode_failure_resolves_its_own_receipt() {
+        let (good_item, mut good_rx) = confirmed(Packet::one_way(1, b"ok".to_vec()));
+
+        let mut bad = Packet::one_way(2, b"y".to_vec());
+        bad.set_ext_header(vec![0u8; u16::MAX as usize + 1]);
+        let (bad_item, mut bad_rx) = confirmed(bad);
+
+        let mut buf = bytes::BytesMut::new();
+        let (ids, completions) = prepare_quic_batch([good_item, bad_item], &mut buf);
+
+        assert_eq!(ids, vec![1]);
+        assert_eq!(completions.len(), 1);
+        // Bad packet's own receipt failed immediately.
+        assert!(matches!(bad_rx.try_recv(), Ok(Err(_))));
+        // Good packet still pending until the write.
+        assert!(good_rx.try_recv().is_err());
+        for completion in completions {
+            completion.complete(Ok(()));
+        }
+        assert!(matches!(good_rx.try_recv(), Ok(Ok(()))));
     }
 }
