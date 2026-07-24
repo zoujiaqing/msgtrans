@@ -8,6 +8,7 @@
 use crate::SessionId;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
+#[cfg(feature = "quic")]
 use tokio::task::JoinHandle;
 
 /// Lifecycle state of a connection.
@@ -72,11 +73,13 @@ impl ConnState {
 /// drops the losing handle, and dropping a `JoinHandle` does *not* cancel its
 /// task -- it becomes an orphan. Handing tasks to a `TaskGroup` means teardown
 /// (explicit `abort_all` or `Drop`) actively aborts every remaining task.
+#[cfg(feature = "quic")]
 #[derive(Default)]
 pub(crate) struct TaskGroup {
     handles: Vec<JoinHandle<()>>,
 }
 
+#[cfg(feature = "quic")]
 impl TaskGroup {
     pub(crate) fn new() -> Self {
         Self {
@@ -96,6 +99,7 @@ impl TaskGroup {
     }
 }
 
+#[cfg(feature = "quic")]
 impl Drop for TaskGroup {
     fn drop(&mut self) {
         self.abort_all();
@@ -105,6 +109,7 @@ impl Drop for TaskGroup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "quic")]
     use std::time::Duration;
 
     #[test]
@@ -126,6 +131,7 @@ mod tests {
         assert!(!clone.is_connected());
     }
 
+    #[cfg(feature = "quic")]
     #[tokio::test]
     async fn task_group_aborts_remaining_tasks_on_teardown() {
         let flag = Arc::new(AtomicU8::new(0));
@@ -150,6 +156,7 @@ mod tests {
         assert_eq!(flag.load(Ordering::SeqCst), after_abort);
     }
 
+    #[cfg(feature = "quic")]
     #[tokio::test]
     async fn task_group_drop_aborts() {
         let flag = Arc::new(AtomicU8::new(0));

@@ -11,6 +11,14 @@
 // and the transport::transport module name are intentional.
 #![allow(clippy::field_reassign_with_default)]
 #![allow(clippy::module_inception)]
+// Adapter infrastructure (core/events/outbound) is only exercised when at
+// least one protocol adapter is compiled in; a no-protocol build is a
+// degenerate config nobody ships. Allow its dead code ONLY there — every
+// real (>=1 protocol) build keeps -D warnings strict.
+#![cfg_attr(
+    not(any(feature = "tcp", feature = "websocket", feature = "quic")),
+    allow(dead_code)
+)]
 #![allow(async_fn_in_trait)]
 #![allow(non_upper_case_globals)]
 
