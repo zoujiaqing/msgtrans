@@ -17,14 +17,6 @@ use crate::{
 // Internal use of new Transport structure
 use super::transport::Transport;
 
-/// Connection config trait - Local definition
-pub trait ConnectableConfig {
-    async fn connect(&self, transport: &mut Transport) -> Result<SessionId, TransportError>;
-    fn validate(&self) -> Result<(), TransportError>;
-    fn protocol_name(&self) -> &'static str;
-    fn as_any(&self) -> &dyn std::any::Any;
-}
-
 /// Retry configuration
 #[derive(Debug, Clone)]
 pub struct RetryConfig {

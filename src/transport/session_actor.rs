@@ -40,8 +40,6 @@ pub enum ActorMessage {
         packet: Packet,
         reply: tokio::sync::oneshot::Sender<Result<(), crate::TransportError>>,
     },
-    /// Command: gracefully close the connection
-    Close,
 }
 
 /// Session handler trait - business layer implements this to receive messages
@@ -226,7 +224,8 @@ impl Responder {
 pub struct SessionHandle {
     /// Channel to send messages (events + commands) to the actor
     pub(crate) tx: Sender<ActorMessage>,
-    /// Reference to the transport (kept for backward compatibility / connection status checks)
+    /// Reference to the transport (kept alive with the handle).
+    #[allow(dead_code)]
     pub(crate) transport: Arc<Transport>,
 }
 
@@ -296,11 +295,6 @@ impl SessionHandle {
         reply_rx.await.map_err(|_| {
             crate::TransportError::connection_error("Actor dropped before reply", false)
         })?
-    }
-
-    /// Get the transport for this session
-    pub fn transport(&self) -> &Arc<Transport> {
-        &self.transport
     }
 }
 
@@ -521,13 +515,6 @@ impl SessionActor {
                     ActorMessage::SendWithReply { packet, reply } => {
                         let result = self.transport.send(packet).await;
                         let _ = reply.send(result);
-                    }
-                    ActorMessage::Close => {
-                        tracing::debug!(
-                            "[ACTOR] Session {} received close command",
-                            self.session_id
-                        );
-                        should_break = true;
                     }
                 }
             }

@@ -2,9 +2,7 @@
 //!
 //! [TARGET] Demonstrates simplified API: byte-only version, users handle string conversion
 
-use msgtrans::{
-    event::ClientEvent, protocol::TcpClientConfig, transport::client::TransportClientBuilder,
-};
+use msgtrans::{event::ClientEvent, protocol::TcpClientConfig, transport::TransportClientBuilder};
 use std::time::Duration;
 use tracing::{error, info, warn};
 

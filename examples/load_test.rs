@@ -15,7 +15,7 @@
 use msgtrans::{
     event::{ClientEvent, TransportStatus},
     protocol::{QuicClientConfig, TcpClientConfig, WebSocketClientConfig},
-    transport::client::TransportClientBuilder,
+    transport::TransportClientBuilder,
 };
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;

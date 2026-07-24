@@ -1,3 +1,6 @@
+// Internal request-lifecycle state machine: some accessors (counters/
+// snapshots/entry getters) are exercised only by tests or diagnostics.
+#![allow(dead_code)]
 use crate::packet::Packet;
 use crate::SessionId;
 use dashmap::{DashMap, DashSet};

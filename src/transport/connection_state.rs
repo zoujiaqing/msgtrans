@@ -1,3 +1,5 @@
+// Internal connection-state store: get_state is a diagnostic accessor.
+#![allow(dead_code)]
 use crate::SessionId;
 /// Connection state management
 ///

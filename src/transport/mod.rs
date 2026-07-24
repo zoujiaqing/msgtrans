@@ -1,4 +1,4 @@
-pub mod client;
+pub(crate) mod client;
 /// [TRANSPORT] High-performance transport layer module
 ///
 /// Provides unified transport abstraction with support for multiple protocols,
@@ -28,18 +28,18 @@ pub mod client;
 /// - **Full Backward Compatibility**: Existing code works without modification
 /// - **Transparent Performance**: Memory allocation and connection management
 ///   automatically use high-performance implementations
-pub mod config;
-pub mod connection_state;
-pub mod limits;
-pub mod request_registry;
-pub mod server;
-pub mod transport;
-pub mod transport_server;
+pub(crate) mod config;
+pub(crate) mod connection_state;
+pub(crate) mod limits;
+pub(crate) mod request_registry;
+pub(crate) mod server;
+pub(crate) mod transport;
+pub(crate) mod transport_server;
 
-pub mod context;
+pub(crate) mod context;
 pub(crate) mod lockfree;
 pub(crate) mod memory_pool;
-pub mod session_actor;
+pub(crate) mod session_actor;
 
 // [EXPORTS] Re-export core APIs with unified architecture
 pub use client::{RetryConfig, TransportClient, TransportClientBuilder};
@@ -47,6 +47,7 @@ pub use context::TransportContext;
 pub use server::TransportServerBuilder;
 pub use transport::Transport;
 pub use transport_server::{ShutdownReport, TransportServer};
+// Extension SPI (used by custom protocol adapters) reachable via the crate root.
 
 // [CONFIG] Configuration exports
 pub use config::TransportConfig;
@@ -57,11 +58,7 @@ pub use config::TransportConfig;
 // [CONNECTION] Lock-free connection exports
 
 // [STATE] Connection state management exports
-pub use connection_state::{ConnectionState, ConnectionStateManager};
-pub use request_registry::{
-    MarkResult as RequestMarkResult, RequestCountersSnapshot, RequestDirection, RequestEntry,
-    RequestKey, RequestRegistry, RequestState,
-};
+// Request lifecycle state machine is internal (crate::transport::request_registry).
 
 use crate::packet::CompressionType;
 use bytes::Bytes;
@@ -120,7 +117,6 @@ impl TransportOptions {
 }
 
 // [ACTOR] Session actor model exports
-pub use session_actor::{
-    create_session_actor, ActorMessage, Responder, SessionActor, SessionHandle, SessionHandler,
-    SessionSender, DEFAULT_ACTOR_BUFFER_SIZE,
-};
+// Public handler API: Responder / SessionHandler / SessionSender.
+pub use session_actor::{Responder, SessionHandler, SessionSender};
+// Actor internals stay crate-private (crate::transport::session_actor).

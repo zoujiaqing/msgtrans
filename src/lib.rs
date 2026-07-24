@@ -18,7 +18,7 @@
 pub mod transport;
 
 // Protocol adapters
-pub mod adapters;
+pub(crate) mod adapters;
 
 // Protocol abstraction
 pub mod protocol;

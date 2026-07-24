@@ -1,5 +1,5 @@
 use msgtrans::{
-    event::ClientEvent, protocol::WebSocketClientConfig, transport::client::TransportClientBuilder,
+    event::ClientEvent, protocol::WebSocketClientConfig, transport::TransportClientBuilder,
 };
 /// WebSocket Echo client - simplified API demonstration
 /// [TARGET] Demonstrates simplified byte API, hiding all Packet complexity
