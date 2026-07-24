@@ -47,18 +47,6 @@ impl ProtocolConfig for TcpServerConfig {
     fn default_config() -> Self {
         Self::default()
     }
-
-    fn merge(mut self, other: Self) -> Self {
-        // Simplified merge logic
-        if other.bind_address.to_string() != "127.0.0.1:8080" {
-            self.bind_address = other.bind_address;
-        }
-        self.nodelay = other.nodelay;
-        if other.keepalive.is_some() {
-            self.keepalive = other.keepalive;
-        }
-        self
-    }
 }
 
 #[cfg(feature = "tcp")]
@@ -214,37 +202,6 @@ impl ProtocolConfig for WebSocketServerConfig {
 
     fn default_config() -> Self {
         Self::default()
-    }
-
-    // Overlay semantics against the computed default; see the client-side
-    // merge for the known limitation (resolved at the #24 API freeze).
-    fn merge(mut self, other: Self) -> Self {
-        let def = Self::default();
-        if other.bind_address != def.bind_address {
-            self.bind_address = other.bind_address;
-        }
-        if other.path != def.path {
-            self.path = other.path;
-        }
-        if other.subprotocols != def.subprotocols {
-            self.subprotocols = other.subprotocols;
-        }
-        if other.max_frame_size != def.max_frame_size {
-            self.max_frame_size = other.max_frame_size;
-        }
-        if other.max_message_size != def.max_message_size {
-            self.max_message_size = other.max_message_size;
-        }
-        if other.ping_interval != def.ping_interval {
-            self.ping_interval = other.ping_interval;
-        }
-        if other.pong_timeout != def.pong_timeout {
-            self.pong_timeout = other.pong_timeout;
-        }
-        if other.idle_timeout != def.idle_timeout {
-            self.idle_timeout = other.idle_timeout;
-        }
-        self
     }
 }
 
@@ -454,40 +411,6 @@ impl ProtocolConfig for QuicServerConfig {
     fn default_config() -> Self {
         Self::default()
     }
-
-    // Overlay semantics against the computed default; see the client-side
-    // merge for the known limitation (resolved at the #24 API freeze).
-    fn merge(mut self, other: Self) -> Self {
-        let def = Self::default();
-        if other.bind_address != def.bind_address {
-            self.bind_address = other.bind_address;
-        }
-        if other.cert_pem.is_some() {
-            self.cert_pem = other.cert_pem;
-        }
-        if other.key_pem.is_some() {
-            self.key_pem = other.key_pem;
-        }
-        if other.max_concurrent_streams != def.max_concurrent_streams {
-            self.max_concurrent_streams = other.max_concurrent_streams;
-        }
-        if other.max_idle_timeout != def.max_idle_timeout {
-            self.max_idle_timeout = other.max_idle_timeout;
-        }
-        if other.keep_alive_interval != def.keep_alive_interval {
-            self.keep_alive_interval = other.keep_alive_interval;
-        }
-        if other.initial_rtt != def.initial_rtt {
-            self.initial_rtt = other.initial_rtt;
-        }
-        if other.receive_window != def.receive_window {
-            self.receive_window = other.receive_window;
-        }
-        if other.send_window != def.send_window {
-            self.send_window = other.send_window;
-        }
-        self
-    }
 }
 
 #[cfg(feature = "quic")]
@@ -632,45 +555,6 @@ impl QuicServerConfig {
 mod merge_and_validate_tests {
     use super::*;
     use crate::protocol::ProtocolConfig;
-
-    /// Overlaying a DEFAULT config must be a no-op: the 1.x merge compared
-    /// against stale hardcoded defaults and clobbered customized values.
-    #[test]
-    fn ws_server_merge_default_overlay_preserves_customization() {
-        let custom = WebSocketServerConfig::default()
-            .path("/api")
-            .max_message_size(4096)
-            .ping_interval(None)
-            .idle_timeout(Some(Duration::from_secs(7)));
-        let merged = custom.clone().merge(WebSocketServerConfig::default());
-        assert_eq!(merged.path, "/api");
-        assert_eq!(merged.max_message_size, 4096);
-        assert_eq!(merged.ping_interval, None);
-        assert_eq!(merged.idle_timeout, Some(Duration::from_secs(7)));
-
-        // And a real overlay still wins for the fields it changes.
-        let overlay = WebSocketServerConfig::default().max_message_size(9999);
-        let merged = custom.merge(overlay);
-        assert_eq!(merged.max_message_size, 9999);
-        assert_eq!(merged.path, "/api", "untouched fields must survive");
-    }
-
-    #[test]
-    fn quic_server_merge_covers_transport_fields() {
-        let custom = QuicServerConfig::default()
-            .receive_window(111)
-            .send_window(222)
-            .max_concurrent_streams(3);
-        let merged = custom.merge(QuicServerConfig::default());
-        assert_eq!(merged.receive_window, 111);
-        assert_eq!(merged.send_window, 222);
-        assert_eq!(merged.max_concurrent_streams, 3);
-
-        let overlay = QuicServerConfig::default().initial_rtt(Duration::from_millis(5));
-        let merged = merged.merge(overlay);
-        assert_eq!(merged.initial_rtt, Duration::from_millis(5));
-        assert_eq!(merged.receive_window, 111);
-    }
 
     /// User configuration must be REJECTED by validate, never panic later in
     /// the factory path.

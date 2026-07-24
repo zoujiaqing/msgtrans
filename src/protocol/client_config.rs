@@ -50,25 +50,6 @@ impl ProtocolConfig for TcpClientConfig {
     fn default_config() -> Self {
         Self::default()
     }
-
-    fn merge(mut self, other: Self) -> Self {
-        if other.target_address.port() != 80 {
-            self.target_address = other.target_address;
-        }
-        if other.connect_timeout != Duration::from_secs(10) {
-            self.connect_timeout = other.connect_timeout;
-        }
-        if !other.nodelay {
-            self.nodelay = other.nodelay;
-        }
-        if other.keepalive.is_some() {
-            self.keepalive = other.keepalive;
-        }
-        if other.local_bind_address.is_some() {
-            self.local_bind_address = other.local_bind_address;
-        }
-        self
-    }
 }
 
 #[cfg(feature = "tcp")]
@@ -265,45 +246,6 @@ impl ProtocolConfig for WebSocketClientConfig {
 
     fn default_config() -> Self {
         Self::default()
-    }
-
-    // Overlay semantics: a field from `other` wins only when it differs from
-    // the type's CURRENT default (computed, never hardcoded — the 1.x version
-    // compared against stale literal defaults and mis-merged after defaults
-    // changed). KNOWN LIMIT: a field explicitly set to its default value (or
-    // an Option explicitly set to its default Some/None) cannot be expressed;
-    // the #24 API freeze either deletes merge() or replaces it with an
-    // Option-per-field overlay type.
-    fn merge(mut self, other: Self) -> Self {
-        let def = Self::default();
-        if other.target_url != def.target_url {
-            self.target_url = other.target_url;
-        }
-        if other.connect_timeout != def.connect_timeout {
-            self.connect_timeout = other.connect_timeout;
-        }
-        if other.headers != def.headers {
-            self.headers = other.headers;
-        }
-        if other.subprotocols != def.subprotocols {
-            self.subprotocols = other.subprotocols;
-        }
-        if other.max_frame_size != def.max_frame_size {
-            self.max_frame_size = other.max_frame_size;
-        }
-        if other.max_message_size != def.max_message_size {
-            self.max_message_size = other.max_message_size;
-        }
-        if other.ping_interval != def.ping_interval {
-            self.ping_interval = other.ping_interval;
-        }
-        if other.pong_timeout != def.pong_timeout {
-            self.pong_timeout = other.pong_timeout;
-        }
-        if other.tls != def.tls {
-            self.tls = other.tls.clone();
-        }
-        self
     }
 }
 
@@ -509,40 +451,6 @@ impl ProtocolConfig for QuicClientConfig {
 
     fn default_config() -> Self {
         Self::default()
-    }
-
-    fn merge(mut self, other: Self) -> Self {
-        if other.target_address.port() != 443 {
-            self.target_address = other.target_address;
-        }
-        if other.server_name.is_some() {
-            self.server_name = other.server_name;
-        }
-        if other.connect_timeout != Duration::from_secs(10) {
-            self.connect_timeout = other.connect_timeout;
-        }
-        if !other.verify_certificate {
-            self.verify_certificate = other.verify_certificate;
-        }
-        if other.ca_cert_pem.is_some() {
-            self.ca_cert_pem = other.ca_cert_pem;
-        }
-        if other.max_concurrent_streams != 100 {
-            self.max_concurrent_streams = other.max_concurrent_streams;
-        }
-        if other.max_idle_timeout != Duration::from_secs(30) {
-            self.max_idle_timeout = other.max_idle_timeout;
-        }
-        if other.keep_alive_interval.is_some() {
-            self.keep_alive_interval = other.keep_alive_interval;
-        }
-        if other.initial_rtt != Duration::from_millis(100) {
-            self.initial_rtt = other.initial_rtt;
-        }
-        if other.local_bind_address.is_some() {
-            self.local_bind_address = other.local_bind_address;
-        }
-        self
     }
 }
 

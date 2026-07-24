@@ -122,9 +122,6 @@ pub trait ProtocolConfig: Send + Sync + Clone + std::fmt::Debug + 'static {
 
     /// Get default configuration
     fn default_config() -> Self;
-
-    /// Merge configurations
-    fn merge(self, other: Self) -> Self;
 }
 
 /// Object-safe protocol configuration trait for unified Builder interface

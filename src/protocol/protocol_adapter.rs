@@ -12,8 +12,4 @@ impl ProtocolConfig for EmptyConfig {
     fn default_config() -> Self {
         Self
     }
-
-    fn merge(self, _other: Self) -> Self {
-        self
-    }
 }

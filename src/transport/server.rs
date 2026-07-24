@@ -99,6 +99,15 @@ impl TransportServerBuilder {
                 ));
             }
         }
+        // Validate every protocol config on the ONE construction path (the
+        // config-driven builder) — the deleted legacy factory SPI used to be
+        // the only place that ran validation, so a zero-stream / oversized
+        // config could reach a running server through the builder.
+        for (name, config) in &self.protocol_configs {
+            config
+                .validate_dyn()
+                .map_err(|e| TransportError::config_error(name.as_str(), e.to_string()))?;
+        }
         let transport_server = super::transport_server::TransportServer::new(
             self.transport_config.clone(),
             self.protocol_configs,

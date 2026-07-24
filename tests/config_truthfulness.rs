@@ -519,103 +519,31 @@ async fn plain_ws_ignores_tls_configuration() {
     let _ = server.shutdown_with_timeout(Duration::from_secs(5)).await;
 }
 
-/// The public WebSocket factory must honor the requested bind address and
-/// target uri instead of the config defaults (both were silently ignored).
+/// The config-driven builder is the SINGLE construction path and validates
+/// every protocol config before building: an invalid config is rejected
+/// instead of producing a server that cannot carry data (the legacy factory
+/// SPI that duplicated this path is gone).
 #[tokio::test(flavor = "multi_thread")]
-async fn ws_factory_honors_bind_addr_and_uri() {
-    use msgtrans::adapters::WebSocketFactory;
-    use msgtrans::protocol::ProtocolFactory;
-
-    let factory = WebSocketFactory::new();
-    // No config given: the default config binds 127.0.0.1:8080 and targets
-    // ws://localhost:80/ — the factory arguments must win over both. The
-    // server binds lazily on accept, so the proof is behavioral: a handshake
-    // against the REQUESTED address completes end-to-end.
-    let addr = "127.0.0.1:29021";
-    let mut server = factory
-        .create_server(addr, None)
-        .await
-        .expect("create_server");
-    let accept_task = tokio::spawn(async move {
-        let conn = server.accept().await;
-        (server, conn)
-    });
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    let uri = format!("ws://{addr}/");
-    let conn = factory
-        .create_connection(&uri, None)
-        .await
-        .expect("factory uri must override the config default");
-    assert!(conn.is_connected());
-    let (server, accepted) = accept_task.await.expect("accept task");
-    assert!(
-        accepted.is_ok(),
-        "server bound to the requested address must accept the connection"
-    );
-    assert_eq!(
-        server.local_addr().expect("local addr").to_string(),
-        addr,
-        "factory bind_addr must override the config default"
-    );
-    drop(conn);
-}
-
-/// The public factory is a second construction path and must enforce the
-/// same validation as the builder path: an invalid config is rejected
-/// instead of building a server that cannot carry data.
-#[tokio::test(flavor = "multi_thread")]
-async fn factories_validate_configs_before_building() {
-    use msgtrans::adapters::{QuicFactory, WebSocketFactory};
-    use msgtrans::protocol::ProtocolFactory;
-
-    let bad_quic = QuicServerConfig::new("127.0.0.1:29022")
-        .expect("cfg")
-        .max_concurrent_streams(0);
-    let result = QuicFactory::new()
-        .create_server("127.0.0.1:29022", Some(Box::new(bad_quic)))
+async fn builder_validates_configs_before_building() {
+    // Zero-stream QUIC: rejected at build, never a running data-less server.
+    let bad = TransportServerBuilder::new()
+        .protocol(
+            QuicServerConfig::new("127.0.0.1:29022")
+                .expect("cfg")
+                .max_concurrent_streams(0),
+        )
+        .build(Arc::new(Echo))
         .await;
     assert!(
-        result.is_err(),
-        "factory must reject a zero-stream QUIC config like the builder does"
+        bad.is_err(),
+        "zero-stream QUIC config must be rejected at build"
     );
 
-    // Valid config still builds.
-    let ok_quic = QuicServerConfig::new("127.0.0.1:29023").expect("cfg");
-    assert!(QuicFactory::new()
-        .create_server("127.0.0.1:29023", Some(Box::new(ok_quic)))
-        .await
-        .is_ok());
-
-    // WS factory path validates too (trivially Ok for the default config).
-    assert!(WebSocketFactory::new()
-        .create_server("127.0.0.1:29024", None)
-        .await
-        .is_ok());
-}
-
-/// The factory uri is authoritative: a stale INVALID target_url left in the
-/// config must not reject a call that provided a valid uri (validation runs
-/// after the override).
-#[tokio::test(flavor = "multi_thread")]
-async fn ws_factory_uri_override_wins_over_stale_invalid_config_url() {
-    use msgtrans::adapters::WebSocketFactory;
-    use msgtrans::protocol::ProtocolFactory;
-
-    let addr = "127.0.0.1:29025";
-    let server = TransportServerBuilder::new()
-        .protocol(WebSocketServerConfig::new(addr).expect("cfg"))
+    // A valid config still builds and serves.
+    let ok = TransportServerBuilder::new()
+        .protocol(QuicServerConfig::new("127.0.0.1:29023").expect("cfg"))
         .build(Arc::new(Echo))
         .await
-        .expect("server");
-    serve(&server).await;
-
-    let stale = WebSocketClientConfig::default().target_url("this is not a url at all");
-    let conn = WebSocketFactory::new()
-        .create_connection(&format!("ws://{addr}/"), Some(Box::new(stale)))
-        .await
-        .expect("valid factory uri must win over the stale invalid config url");
-    assert!(conn.is_connected());
-    drop(conn);
-    let _ = server.shutdown_with_timeout(Duration::from_secs(5)).await;
+        .expect("valid config builds");
+    let _ = ok.shutdown_with_timeout(Duration::from_secs(5)).await;
 }

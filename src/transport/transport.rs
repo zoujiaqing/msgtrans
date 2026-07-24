@@ -1,7 +1,6 @@
 use crate::{
     connection::Connection,
     event::TransportEvent,
-    protocol::ProtocolRegistry,
     transport::{
         config::TransportConfig, connection_state::ConnectionStateManager,
         context::TransportContext, memory_pool::OptimizedMemoryPool,
@@ -33,7 +32,6 @@ struct ConnectionSlot {
 /// which is created once by the builder and shared across all Transport instances.
 pub struct Transport {
     config: TransportConfig,
-    protocol_registry: Arc<ProtocolRegistry>,
     memory_pool: Arc<OptimizedMemoryPool>,
     /// The connection and its generation id live in ONE slot under ONE lock:
     /// validating the generation and taking/replacing the connection is a
@@ -72,7 +70,6 @@ impl Transport {
         let (client_events_tx, client_events_rx) = mpsc::channel(8192);
         Self {
             config,
-            protocol_registry: ctx.protocol_registry.clone(),
             memory_pool: ctx.memory_pool.clone(),
             slot: Arc::new(Mutex::new(None)),
             state_manager: ConnectionStateManager::new(),
@@ -467,11 +464,6 @@ impl Transport {
             "[SUCCESS] Transport connection set (no consumer): {}",
             session_id
         );
-    }
-
-    /// Get protocol registry
-    pub fn protocol_registry(&self) -> &ProtocolRegistry {
-        &self.protocol_registry
     }
 
     /// Get configuration
@@ -870,7 +862,6 @@ impl Clone for Transport {
     fn clone(&self) -> Self {
         Self {
             config: self.config.clone(),
-            protocol_registry: self.protocol_registry.clone(),
             memory_pool: self.memory_pool.clone(),
             slot: self.slot.clone(),
             state_manager: self.state_manager.clone(),

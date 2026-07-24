@@ -21,10 +21,9 @@ pub use tcp::{TcpAdapter, TcpError};
 #[cfg(feature = "websocket")]
 pub use websocket::{WebSocketAdapter, WebSocketError};
 
-pub use factories::create_standard_registry;
 #[cfg(feature = "quic")]
-pub use factories::{QuicFactory, QuicServerWrapper};
+pub use factories::QuicServerWrapper;
 #[cfg(feature = "tcp")]
-pub use factories::{TcpFactory, TcpServerWrapper};
+pub use factories::TcpServerWrapper;
 #[cfg(feature = "websocket")]
-pub use factories::{WebSocketFactory, WebSocketServerWrapper};
+pub use factories::WebSocketServerWrapper;

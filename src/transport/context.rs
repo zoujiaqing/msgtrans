@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use crate::protocol::ProtocolRegistry;
 use crate::transport::memory_pool::{
     init_shared_memory_pool, shared_memory_pool, OptimizedMemoryPool,
 };
@@ -14,19 +13,14 @@ use crate::TransportError;
 /// global OnceLock pool.
 #[derive(Clone)]
 pub struct TransportContext {
-    pub(crate) protocol_registry: Arc<ProtocolRegistry>,
     pub(crate) memory_pool: Arc<OptimizedMemoryPool>,
 }
 
 impl TransportContext {
     /// Create a new context with the standard protocol registry and the shared memory pool.
     pub async fn new() -> Result<Self, TransportError> {
-        let registry = crate::adapters::create_standard_registry().await?;
         let pool = shared_memory_pool();
-        Ok(Self {
-            protocol_registry: Arc::new(registry),
-            memory_pool: pool,
-        })
+        Ok(Self { memory_pool: pool })
     }
 
     /// Create with a custom memory pool (e.g. pre-allocated).
@@ -36,18 +30,10 @@ impl TransportContext {
     pub async fn with_memory_pool(pool: OptimizedMemoryPool) -> Result<Self, TransportError> {
         let pool = Arc::new(pool);
         init_shared_memory_pool(pool.clone());
-        let registry = crate::adapters::create_standard_registry().await?;
-        Ok(Self {
-            protocol_registry: Arc::new(registry),
-            memory_pool: pool,
-        })
+        Ok(Self { memory_pool: pool })
     }
 
     pub fn memory_pool(&self) -> &Arc<OptimizedMemoryPool> {
         &self.memory_pool
-    }
-
-    pub fn protocol_registry(&self) -> &Arc<ProtocolRegistry> {
-        &self.protocol_registry
     }
 }
