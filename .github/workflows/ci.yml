@@ -62,12 +62,10 @@ jobs:
         env:
           RUSTFLAGS: -D warnings
 
-  # Style gates are advisory for now: the crate predates a clean fmt/clippy pass,
-  # so these run but do not block. Tighten to required once the backlog is clear.
+  # Style gates are BLOCKING as of the 2.0 freeze.
   fmt:
-    name: rustfmt (advisory)
+    name: rustfmt
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -77,9 +75,8 @@ jobs:
         run: cargo fmt --all -- --check
 
   clippy:
-    name: clippy (advisory)
+    name: clippy
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -87,4 +84,4 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Clippy
-        run: cargo clippy --all-targets
+        run: cargo clippy --all-features --all-targets -- -D warnings

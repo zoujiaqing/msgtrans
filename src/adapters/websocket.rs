@@ -215,9 +215,11 @@ impl From<WebSocketError> for TransportError {
 pub struct WebSocketAdapter<C> {
     /// Connection liveness + session id, shared with the event loop.
     state: crate::adapters::core::ConnState,
-    /// Configuration
+    /// Configuration (retained to keep the generic `C` and for diagnostics).
+    #[allow(dead_code)]
     config: C,
-    /// Statistics information
+    /// Statistics information (diagnostics; not on the hot path).
+    #[allow(dead_code)]
     stats: AdapterStats,
     /// Connection information
     connection_info: ConnectionInfo,

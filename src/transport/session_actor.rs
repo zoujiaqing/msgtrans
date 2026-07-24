@@ -414,6 +414,18 @@ impl SessionActor {
             // Process batch
             let mut should_break = false;
             for msg in batch.drain(..) {
+                // A terminal event (ConnectionClosed / Close) earlier in this
+                // batch stops the actor: do NOT run the remaining commands
+                // against a dead connection. Pending replies fail deterministically.
+                if should_break {
+                    if let ActorMessage::SendWithReply { reply, .. } = msg {
+                        let _ = reply.send(Err(crate::TransportError::connection_error(
+                            "session closed",
+                            true,
+                        )));
+                    }
+                    continue;
+                }
                 match msg {
                     ActorMessage::InboundEvent(event) => {
                         match event {

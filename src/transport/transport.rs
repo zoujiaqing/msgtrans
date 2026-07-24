@@ -108,14 +108,6 @@ impl Transport {
         }
     }
 
-    /// Send with a write completion: resolves only once the packet was actually
-    /// written (or the write/connection failed). The slot lock is held ONLY
-    /// for the bounded enqueue; the observer is awaited after releasing it, so
-    /// a slow write cannot serialize other senders or block the close paths.
-    pub(crate) async fn send_confirmed(&self, packet: Packet) -> Result<(), TransportError> {
-        self.send_confirmed_with(packet, None, None).await
-    }
-
     /// Confirmed send bound to a connection generation and (optionally) a
     /// respond claim.
     ///

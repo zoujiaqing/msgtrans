@@ -28,13 +28,17 @@ pub trait ConnectableConfig {
 /// Retry configuration
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
-    pub max_retries: usize,
-    pub initial_delay: Duration,
-    pub max_delay: Duration,
-    pub backoff_multiplier: f64,
+    max_retries: usize,
+    initial_delay: Duration,
+    max_delay: Duration,
+    backoff_multiplier: f64,
 }
 
 impl RetryConfig {
+    /// Exponential backoff with the given retry count and base delay. The
+    /// multiplier defaults to 2.0 and the cap to 30s; the delay math cannot
+    /// produce a non-finite value (the 1.x public `backoff_multiplier` field
+    /// accepted NaN/Inf/negatives, which panicked `Duration::from_secs_f64`).
     pub fn exponential_backoff(max_retries: usize, initial_delay: Duration) -> Self {
         Self {
             max_retries,
@@ -42,6 +46,29 @@ impl RetryConfig {
             max_delay: Duration::from_secs(30),
             backoff_multiplier: 2.0,
         }
+    }
+
+    /// Set the backoff multiplier. Non-finite or non-positive values are
+    /// rejected (clamped to 1.0), so the delay computation can never panic.
+    pub fn backoff_multiplier(mut self, multiplier: f64) -> Self {
+        self.backoff_multiplier = if multiplier.is_finite() && multiplier >= 1.0 {
+            multiplier
+        } else {
+            1.0
+        };
+        self
+    }
+
+    /// Set the maximum delay between retries.
+    pub fn max_delay(mut self, max_delay: Duration) -> Self {
+        self.max_delay = max_delay;
+        self
+    }
+
+    /// Set the maximum number of retries.
+    pub fn max_retries(mut self, max_retries: usize) -> Self {
+        self.max_retries = max_retries;
+        self
     }
 }
 
@@ -363,7 +390,14 @@ impl TransportClient {
     fn calculate_retry_delay(&self, attempt: usize) -> std::time::Duration {
         let delay = self.retry_config.initial_delay.as_secs_f64()
             * self.retry_config.backoff_multiplier.powi(attempt as i32);
-        let delay = delay.min(self.retry_config.max_delay.as_secs_f64());
+        // Clamp to [0, max_delay]; guard against any non-finite result so
+        // Duration::from_secs_f64 cannot panic.
+        let max = self.retry_config.max_delay.as_secs_f64();
+        let delay = if delay.is_finite() {
+            delay.clamp(0.0, max)
+        } else {
+            max
+        };
         std::time::Duration::from_secs_f64(delay)
     }
 
@@ -620,12 +654,6 @@ impl TransportClient {
         self.inner.is_connected().await
     }
 
-    /// Get connection status information
-    pub async fn connection_info(&self) -> Option<crate::command::ConnectionInfo> {
-        // TODO: Implement connection information retrieval
-        None
-    }
-
     /// Get current session ID
     pub async fn current_session_id(&self) -> Option<SessionId> {
         self.inner.current_session_id().await
@@ -646,21 +674,6 @@ impl TransportClient {
                 false,
             )),
         }
-    }
-
-    /// [DEBUG] Internal method: Get current session ID (for internal debugging only)
-    async fn current_session(&self) -> Option<SessionId> {
-        self.inner.current_session_id().await
-    }
-
-    /// Get client connection statistics
-    /// TODO: Transport needs to implement statistics functionality
-    pub async fn stats(&self) -> Result<crate::command::TransportStats, TransportError> {
-        // Temporarily return error, waiting for Transport to implement statistics
-        Err(TransportError::connection_error(
-            "Stats not implemented for Transport yet",
-            false,
-        ))
     }
 
     /// [START] Start event forwarding task

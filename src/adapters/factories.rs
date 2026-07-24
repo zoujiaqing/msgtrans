@@ -15,7 +15,7 @@ pub struct TcpServerWrapper {
 
 #[cfg(feature = "tcp")]
 impl TcpServerWrapper {
-    pub fn new(server: tcp::TcpServer) -> Self {
+    pub(crate) fn new(server: tcp::TcpServer) -> Self {
         Self { inner: server }
     }
 }
@@ -50,7 +50,7 @@ pub struct WebSocketServerWrapper {
 
 #[cfg(feature = "websocket")]
 impl WebSocketServerWrapper {
-    pub fn new(
+    pub(crate) fn new(
         server: crate::adapters::websocket::WebSocketServer<crate::protocol::WebSocketServerConfig>,
     ) -> Self {
         Self { inner: server }
@@ -90,7 +90,7 @@ pub struct QuicServerWrapper {
 
 #[cfg(feature = "quic")]
 impl QuicServerWrapper {
-    pub fn new(server: crate::adapters::quic::QuicServer) -> Self {
+    pub(crate) fn new(server: crate::adapters::quic::QuicServer) -> Self {
         Self { inner: server }
     }
 }

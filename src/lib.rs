@@ -7,17 +7,11 @@
     all(feature = "tcp", feature = "websocket", feature = "quic"),
     doc = include_str!("../README.md")
 )]
-#![allow(unused_variables)]
-#![allow(unused_mut)]
-#![allow(dead_code)]
-#![allow(private_bounds)]
-#![allow(private_interfaces)]
 // Idiomatic builder patterns (`let mut x = Default::default(); x.field = ..`)
 // and the transport::transport module name are intentional.
 #![allow(clippy::field_reassign_with_default)]
 #![allow(clippy::module_inception)]
 #![allow(async_fn_in_trait)]
-#![allow(unused_must_use)]
 #![allow(non_upper_case_globals)]
 
 /// Transport layer: client, server, session actors and request lifecycle.
@@ -92,7 +86,7 @@ pub use event::TcpEvent;
 pub use event::WebSocketEvent;
 pub use event::{ClientEvent, RespondOutcome, TransportEvent};
 pub use packet::{FramePolicy, Packet, PacketError, PacketType};
-pub use stream::{ClientEvents, EventStream, PacketStream};
+pub use stream::ClientEvents;
 
 pub use transport::{
     RetryConfig, ShutdownReport, Transport, TransportClient, TransportClientBuilder,

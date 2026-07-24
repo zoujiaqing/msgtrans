@@ -4,6 +4,7 @@ use bytes::{Bytes, BytesMut};
 /// Simplified, efficient packet format designed for unified architecture
 use std::sync::atomic::{AtomicU32, Ordering};
 
+#[cfg(any(feature = "flate2", feature = "zstd"))]
 const MAX_DECOMPRESSED_PAYLOAD_SIZE: usize = 16 * 1024 * 1024;
 
 /// Packet types - simplified to 3 core types
@@ -732,7 +733,7 @@ impl Packet {
                     use flate2::read::ZlibDecoder;
                     use std::io::Read;
 
-                    let mut decoder = ZlibDecoder::new(data);
+                    let decoder = ZlibDecoder::new(data);
                     let mut result = Vec::new();
                     let limit = (MAX_DECOMPRESSED_PAYLOAD_SIZE + 1) as u64;
                     decoder

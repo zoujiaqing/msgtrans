@@ -324,25 +324,17 @@ impl OptimizedReadBuffer {
 
         Ok(bytes_read)
     }
-
-    /// Get buffer statistics
-    fn stats(&self) -> &ReadBufferStats {
-        &self.stats
-    }
-
-    /// Clear buffer (preserving capacity)
-    fn clear(&mut self) {
-        self.buffer.clear();
-    }
 }
 
 /// TCP protocol adapter - event-driven version
 pub struct TcpAdapter<C> {
     /// Connection liveness + session id, shared with the event loop.
     state: crate::adapters::core::ConnState,
-    /// Configuration
+    /// Configuration (retained to keep the generic `C` and for diagnostics).
+    #[allow(dead_code)]
     config: C,
-    /// Statistics
+    /// Adapter statistics (diagnostics; not on the hot path).
+    #[allow(dead_code)]
     stats: AdapterStats,
     /// Connection information
     connection_info: ConnectionInfo,
@@ -790,10 +782,6 @@ pub(crate) struct TcpServer {
 }
 
 impl TcpServer {
-    pub(crate) fn builder() -> TcpServerBuilder {
-        TcpServerBuilder::new()
-    }
-
     pub(crate) async fn accept(&mut self) -> Result<TcpAdapter<TcpServerConfig>, TcpError> {
         let listener = self
             .listener

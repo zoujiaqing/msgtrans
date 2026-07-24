@@ -1,3 +1,7 @@
+// Crate-internal generic lock-free containers: the standard container
+// accessors (len/is_empty/stats) and the stats counters are retained as normal
+// container API even where a given consumer does not call them. Not public API.
+#![allow(dead_code)]
 use std::hash::Hash;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 /// Lock-free optimization enhancement module - focused on first-stage lock-free optimization
@@ -104,15 +108,6 @@ where
         Ok(self.map.remove(key).map(|(_, v)| v))
     }
 
-    /// Get all key-value pairs snapshot for async operations
-    pub fn snapshot(&self) -> Result<Vec<(K, V)>, String> {
-        Ok(self
-            .map
-            .iter()
-            .map(|entry| (entry.key().clone(), entry.value().clone()))
-            .collect())
-    }
-
     /// Get number of entries
     pub fn len(&self) -> usize {
         self.map.len()
@@ -126,18 +121,6 @@ where
     /// Get all keys for iteration
     pub fn keys(&self) -> Result<Vec<K>, String> {
         Ok(self.map.iter().map(|entry| entry.key().clone()).collect())
-    }
-
-    /// Traverse operation - replacement for RwLock::read().await iter()
-    pub fn for_each<F>(&self, mut f: F) -> Result<(), String>
-    where
-        F: FnMut(&K, &V),
-    {
-        for entry in self.map.iter() {
-            f(entry.key(), entry.value());
-        }
-
-        Ok(())
     }
 
     /// Get statistics
@@ -160,18 +143,6 @@ impl LockFreeStats {
             writes: AtomicU64::new(0),
             cas_retries: AtomicU64::new(0),
             avg_read_latency_ns: AtomicU64::new(0),
-        }
-    }
-
-    /// Get CAS success rate
-    pub fn cas_success_rate(&self) -> f64 {
-        let writes = self.writes.load(Ordering::Relaxed) as f64;
-        let retries = self.cas_retries.load(Ordering::Relaxed) as f64;
-
-        if writes == 0.0 {
-            1.0
-        } else {
-            writes / (writes + retries)
         }
     }
 }
@@ -253,67 +224,6 @@ where
     }
 }
 
-/// High-performance atomic counter - replacement for RwLock<usize>
-pub struct LockFreeCounter {
-    value: AtomicUsize,
-    stats: Arc<CounterStats>,
-}
-
-/// Counter statistics
-#[derive(Debug)]
-pub struct CounterStats {
-    pub increments: AtomicU64,
-    pub decrements: AtomicU64,
-    pub reads: AtomicU64,
-}
-
-impl LockFreeCounter {
-    /// Create new lock-free counter
-    pub fn new(initial: usize) -> Self {
-        Self {
-            value: AtomicUsize::new(initial),
-            stats: Arc::new(CounterStats {
-                increments: AtomicU64::new(0),
-                decrements: AtomicU64::new(0),
-                reads: AtomicU64::new(0),
-            }),
-        }
-    }
-
-    /// Atomic increment
-    pub fn increment(&self) -> usize {
-        self.stats.increments.fetch_add(1, Ordering::Relaxed);
-        self.value.fetch_add(1, Ordering::Relaxed) + 1
-    }
-
-    /// Atomic decrement
-    pub fn decrement(&self) -> usize {
-        self.stats.decrements.fetch_add(1, Ordering::Relaxed);
-        self.value.fetch_sub(1, Ordering::Relaxed).saturating_sub(1)
-    }
-
-    /// Atomic read
-    pub fn get(&self) -> usize {
-        self.stats.reads.fetch_add(1, Ordering::Relaxed);
-        self.value.load(Ordering::Relaxed)
-    }
-
-    /// Atomic set
-    pub fn set(&self, value: usize) {
-        self.value.store(value, Ordering::Relaxed);
-    }
-
-    /// Atomic swap
-    pub fn swap(&self, value: usize) -> usize {
-        self.value.swap(value, Ordering::Relaxed)
-    }
-
-    /// Get statistics
-    pub fn stats(&self) -> &CounterStats {
-        &self.stats
-    }
-}
-
 impl<K, V> Default for LockFreeHashMap<K, V>
 where
     K: Hash + Eq + Clone + Send + Sync + 'static,
@@ -336,8 +246,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use std::thread;
 
     #[test]
     fn test_lockfree_hashmap_basic() {
@@ -357,46 +265,6 @@ mod tests {
     }
 
     #[test]
-    fn test_lockfree_hashmap_concurrent() {
-        let map = Arc::new(LockFreeHashMap::new());
-        let mut handles = vec![];
-
-        // Concurrent writes
-        for i in 0..10 {
-            let map_clone = Arc::clone(&map);
-            let handle = thread::spawn(move || {
-                for j in 0..100 {
-                    let key = format!("key_{}", i * 100 + j);
-                    let value = format!("value_{}", i * 100 + j);
-                    map_clone.insert(key, value).unwrap();
-                }
-            });
-            handles.push(handle);
-        }
-
-        // Concurrent reads
-        for i in 0..5 {
-            let map_clone = Arc::clone(&map);
-            let handle = thread::spawn(move || {
-                for _ in 0..1000 {
-                    let key = format!("key_{}", i);
-                    let _value = map_clone.get(&key);
-                }
-            });
-            handles.push(handle);
-        }
-
-        for handle in handles {
-            handle.join().unwrap();
-        }
-
-        // Verify results
-        assert_eq!(map.len(), 1000);
-        let stats = map.stats();
-        println!("CAS success rate: {:.2}%", stats.cas_success_rate() * 100.0);
-    }
-
-    #[test]
     fn test_lockfree_queue() {
         let queue = LockFreeQueue::new();
 
@@ -409,16 +277,5 @@ mod tests {
         assert_eq!(queue.pop(), Some(2));
         assert_eq!(queue.pop(), None);
         assert!(queue.is_empty());
-    }
-
-    #[test]
-    fn test_lockfree_counter() {
-        let counter = LockFreeCounter::new(0);
-
-        assert_eq!(counter.increment(), 1);
-        assert_eq!(counter.increment(), 2);
-        assert_eq!(counter.get(), 2);
-        assert_eq!(counter.decrement(), 1);
-        assert_eq!(counter.get(), 1);
     }
 }

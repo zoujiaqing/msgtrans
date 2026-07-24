@@ -100,18 +100,6 @@ impl ConnectionStateManager {
             );
         }
     }
-
-    /// Get all connection states (for debugging)
-    pub async fn get_all_states(&self) -> Vec<(SessionId, ConnectionState)> {
-        let mut result = Vec::new();
-        self.states.for_each(|session_id, state_lock| {
-            // Note: cannot use await here, so can only return currently accessible states
-            if let Ok(state) = state_lock.try_lock() {
-                result.push((*session_id, state.clone()));
-            }
-        });
-        result
-    }
 }
 
 impl Default for ConnectionStateManager {

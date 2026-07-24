@@ -209,25 +209,6 @@ fn apply_server_transport(
     Ok(())
 }
 
-/// Configure client without certificate verification (insecure for development)
-fn configure_client_insecure() -> ClientConfig {
-    let mut crypto = ring_client_builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
-        .with_no_client_auth();
-    crypto.alpn_protocols = vec![ALPN_MSGTRANS.to_vec()];
-
-    let mut client_config = ClientConfig::new(Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(crypto).unwrap(),
-    ));
-
-    let mut transport_config = quinn::TransportConfig::default();
-    transport_config.max_idle_timeout(Some(Duration::from_secs(20).try_into().unwrap()));
-    client_config.transport_config(Arc::new(transport_config));
-
-    client_config
-}
-
 /// Configure client with QuicClientConfig parameters
 fn configure_client_with_config(config: &QuicClientConfig) -> Result<ClientConfig, QuicError> {
     let crypto = if config.verify_certificate {
@@ -330,12 +311,6 @@ fn configure_server_insecure_with_config(
     Ok((server_config, cert))
 }
 
-/// Configure server with self-signed certificate (legacy function for backward compatibility)
-fn configure_server_insecure() -> (ServerConfig, CertificateDer<'static>) {
-    let default_config = QuicServerConfig::default();
-    configure_server_insecure_with_config(&default_config).expect("default QUIC config is valid")
-}
-
 /// Configure server with PEM certificate and key
 fn configure_server_with_pem(
     cert_pem: &str,
@@ -383,8 +358,12 @@ fn configure_server_with_pem(
 pub struct QuicAdapter<C> {
     /// Connection liveness + session id, shared with the event loop.
     state: crate::adapters::core::ConnState,
+    // Retained for the generic `C` / diagnostics; not read on the hot path.
+    #[allow(dead_code)]
     config: C,
+    #[allow(dead_code)]
     stats: AdapterStats,
+    #[allow(dead_code)]
     connection_info: ConnectionInfo,
     /// Send queue
     send_queue: mpsc::Sender<crate::adapters::outbound::Outbound>,
@@ -694,7 +673,8 @@ impl<C> QuicAdapter<C> {
                     // encode failures resolve their OWN completion and are
                     // excluded from the batch (see prepare_quic_batch).
                     write_buf.clear();
-                    let (packet_ids, completions) = prepare_quic_batch(batch.drain(..), &mut write_buf);
+                    let (packet_ids, completions) =
+                        prepare_quic_batch(batch.drain(..), &mut write_buf);
 
                     // Single write for entire batch, bounded by the write
                     // deadline: a stalled stream fails the batch instead of
@@ -1029,10 +1009,6 @@ pub(crate) struct QuicServer {
 }
 
 impl QuicServer {
-    pub(crate) fn builder() -> QuicServerBuilder {
-        QuicServerBuilder::new()
-    }
-
     pub(crate) async fn accept(&mut self) -> Result<QuicAdapter<QuicServerConfig>, QuicError> {
         let incoming = self
             .endpoint
@@ -1122,7 +1098,12 @@ mod batch_tests {
     use crate::packet::Packet;
     use tokio::sync::oneshot;
 
-    fn confirmed(packet: Packet) -> (Outbound, oneshot::Receiver<Result<(), crate::TransportError>>) {
+    fn confirmed(
+        packet: Packet,
+    ) -> (
+        Outbound,
+        oneshot::Receiver<Result<(), crate::TransportError>>,
+    ) {
         let (tx, rx) = oneshot::channel();
         (
             Outbound {
@@ -1157,13 +1138,19 @@ mod batch_tests {
         assert_eq!(ids, vec![1]);
         assert_eq!(completions.len(), 1);
         // The good packet's receipt is still PENDING (not mis-failed).
-        assert!(good_rx.try_recv().is_err(), "good receipt must not be resolved by the bad packet");
+        assert!(
+            good_rx.try_recv().is_err(),
+            "good receipt must not be resolved by the bad packet"
+        );
 
         // Simulate a successful socket write: resolve the batch completions Ok.
         for completion in completions {
             completion.complete(Ok(()));
         }
-        assert!(matches!(good_rx.try_recv(), Ok(Ok(()))), "good packet must confirm Written");
+        assert!(
+            matches!(good_rx.try_recv(), Ok(Ok(()))),
+            "good packet must confirm Written"
+        );
     }
 
     /// A confirmed packet that itself fails to encode resolves its OWN receipt

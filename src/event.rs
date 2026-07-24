@@ -42,8 +42,6 @@ pub enum TransportEvent {
         address: SocketAddr,
     },
     ClientDisconnected,
-
-    RequestReceived(RequestContext),
 }
 
 /// Protocol specific event trait
@@ -89,7 +87,6 @@ impl TransportEvent {
             TransportEvent::ServerStopped => None,
             TransportEvent::ClientConnected { .. } => None,
             TransportEvent::ClientDisconnected => None,
-            TransportEvent::RequestReceived(context) => context.peer,
         }
     }
 
@@ -103,10 +100,7 @@ impl TransportEvent {
 
     /// Check if it's a data transmission event
     pub fn is_data_event(&self) -> bool {
-        matches!(
-            self,
-            TransportEvent::MessageReceived(..) | TransportEvent::RequestReceived(..)
-        )
+        matches!(self, TransportEvent::MessageReceived(..))
     }
 
     /// Check if it's an error event
@@ -151,7 +145,7 @@ impl ProtocolEvent for TcpEvent {
                     true,
                 ),
             },
-            TcpEvent::ConnectionTimeout { session_id } => TransportEvent::ConnectionClosed {
+            TcpEvent::ConnectionTimeout { session_id: _ } => TransportEvent::ConnectionClosed {
                 reason: CloseReason::Timeout,
             },
         }
@@ -196,13 +190,16 @@ pub enum WebSocketEvent {
 impl ProtocolEvent for WebSocketEvent {
     fn into_transport_event(self) -> TransportEvent {
         match self {
-            WebSocketEvent::HandshakeCompleted { session_id } => {
+            WebSocketEvent::HandshakeCompleted { session_id: _ } => {
                 // This should already be handled through ConnectionEstablished
                 TransportEvent::ConnectionEstablished {
                     info: ConnectionInfo::default(), // Temporary implementation
                 }
             }
-            WebSocketEvent::InvalidFrame { session_id, error } => TransportEvent::TransportError {
+            WebSocketEvent::InvalidFrame {
+                session_id: _,
+                error,
+            } => TransportEvent::TransportError {
                 error: TransportError::protocol_error("generic", error),
             },
             _ => {
@@ -263,13 +260,13 @@ pub enum QuicEvent {
 impl ProtocolEvent for QuicEvent {
     fn into_transport_event(self) -> TransportEvent {
         match self {
-            QuicEvent::StreamOpened { session_id, .. } => {
+            QuicEvent::StreamOpened { .. } => {
                 // QUIC stream opening doesn't equal connection establishment, may need special handling
                 TransportEvent::ConnectionEstablished {
                     info: ConnectionInfo::default(),
                 }
             }
-            QuicEvent::StreamClosed { session_id, .. } => TransportEvent::ConnectionClosed {
+            QuicEvent::StreamClosed { .. } => TransportEvent::ConnectionClosed {
                 reason: CloseReason::Normal,
             },
             _ => {
@@ -327,132 +324,6 @@ impl Message {
     /// Get raw byte data
     pub fn as_bytes(&self) -> &[u8] {
         &self.data
-    }
-}
-
-/// [SIMPLE] User-friendly request context - unpacked, provides simple response interface
-pub struct RequestContext {
-    /// Request source session (None for client, Some for server)
-    pub peer: Option<SessionId>,
-    /// Decompressed and unpacked request data
-    pub data: Bytes,
-    /// Request ID (for debugging and logging)
-    pub request_id: u32,
-    /// Business type from packet header
-    pub biz_type: u8,
-    /// Response callback (handles all protocol details internally)
-    responder: Arc<dyn Fn(Bytes) + Send + Sync + 'static>,
-    /// Ensure response only once (using Arc shared state)
-    responded: Arc<std::sync::atomic::AtomicBool>,
-    /// [FLAG] Mark: whether it's the primary instance responsible for checking response (prevents clone instances from triggering warnings)
-    is_primary: bool,
-}
-
-impl RequestContext {
-    /// Create new request context
-    pub fn new(
-        peer: Option<SessionId>,
-        data: impl Into<Bytes>,
-        request_id: u32,
-        biz_type: u8,
-        responder: Arc<dyn Fn(Bytes) + Send + Sync + 'static>,
-    ) -> Self {
-        Self {
-            peer,
-            data: data.into(),
-            request_id,
-            biz_type,
-            responder,
-            responded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            is_primary: false, // [FLAG] New instances default to non-primary, waiting for event forwarding to set
-        }
-    }
-
-    /// Try to convert request data to UTF-8 string
-    pub fn as_text(&self) -> Result<String, std::string::FromUtf8Error> {
-        String::from_utf8(self.data.to_vec())
-    }
-
-    /// Convert request data to UTF-8 string (lossy)
-    pub fn as_text_lossy(&self) -> String {
-        String::from_utf8_lossy(&self.data).to_string()
-    }
-
-    /// Get raw byte data
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.data
-    }
-
-    /// [SIMPLE] Respond to request using string
-    pub fn respond_text(&mut self, response: &str) {
-        self.respond_bytes(response.as_bytes());
-    }
-
-    /// [SIMPLE] Respond to request using byte data
-    pub fn respond_bytes(&mut self, response: &[u8]) {
-        if self
-            .responded
-            .compare_exchange(
-                false,
-                true,
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-            )
-            .is_ok()
-        {
-            (self.responder)(Bytes::copy_from_slice(response));
-        } else {
-            tracing::warn!(
-                "[WARN] RequestContext already responded (ID: {})",
-                self.request_id
-            );
-        }
-    }
-
-    /// [FLAG] Set as primary instance (responsible for checking response status)
-    pub(crate) fn set_primary(&mut self) {
-        self.is_primary = true;
-    }
-}
-
-impl Clone for RequestContext {
-    fn clone(&self) -> Self {
-        Self {
-            peer: self.peer,
-            data: self.data.clone(),
-            request_id: self.request_id,
-            biz_type: self.biz_type,           // [FIX] Share biz_type
-            responder: self.responder.clone(), // [FIX] Share response state
-            responded: self.responded.clone(), // [FIX] Clone instances are not primary, not responsible for checking response
-            is_primary: false, // [FIX] Clone instances are not primary, not responsible for checking response
-        }
-    }
-}
-
-impl std::fmt::Debug for RequestContext {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RequestContext")
-            .field("peer", &self.peer)
-            .field("data", &format!("{} bytes", self.data.len()))
-            .field("request_id", &self.request_id)
-            .field("biz_type", &self.biz_type)
-            .field(
-                "responded",
-                &self.responded.load(std::sync::atomic::Ordering::SeqCst),
-            )
-            .finish()
-    }
-}
-
-impl Drop for RequestContext {
-    fn drop(&mut self) {
-        // [FIX] Only primary instances are responsible for checking response status, avoiding false warning from clone instances
-        if self.is_primary && !self.responded.load(std::sync::atomic::Ordering::SeqCst) {
-            tracing::warn!(
-                "[WARN] RequestContext dropped without response (ID: {})",
-                self.request_id
-            );
-        }
     }
 }
 
@@ -645,13 +516,6 @@ impl TransportContext {
                 request_registry,
                 token,
             },
-        }
-    }
-
-    /// Set as primary instance (responsible for checking response status)
-    pub(crate) fn set_primary(&mut self) {
-        if let TransportContextKind::Request { is_primary, .. } = &mut self.kind {
-            *is_primary = true;
         }
     }
 
