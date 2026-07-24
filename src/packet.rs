@@ -210,58 +210,55 @@ impl Default for ReservedFlags {
 }
 
 /// 16-byte fixed header - optimized field order
+/// Fixed-size wire header metadata.
+///
+/// 2.0: the redundant `ext_header_len`/`payload_len` fields were REMOVED — they
+/// are derived from the actual `ext_header`/`payload` at encode time, so the
+/// header can no longer disagree with the body it describes (the old public
+/// fields let a caller truncate a length while the body kept its full bytes,
+/// producing a frame the strict decoder rejected). Internal-only; the public
+/// surface is the accessors on [`Packet`].
 #[repr(C)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FixedHeader {
-    /// Protocol version (1 byte)
+pub(crate) struct FixedHeader {
     pub version: u8,
-    /// Compression algorithm (1 byte)
     pub compression: CompressionType,
-    /// Packet type (1 byte)
     pub packet_type: PacketType,
-    /// Application business type (1 byte) - 0-255, defined by business layer
     pub biz_type: u8,
-    /// Message ID (4 bytes)
     pub message_id: u32,
-    /// Extended header length (2 bytes)
-    pub ext_header_len: u16,
-    /// Payload length (4 bytes)
-    pub payload_len: u32,
-    /// Reserved field (2 bytes) - flags for fragmentation, priority, routing, etc.
     pub reserved: ReservedFlags,
 }
 
 impl FixedHeader {
-    /// Create new fixed header
     pub fn new(packet_type: PacketType, message_id: u32) -> Self {
         Self {
             version: 1,
             compression: CompressionType::None,
             packet_type,
-            biz_type: 0, // Default business type
+            biz_type: 0,
             message_id,
-            ext_header_len: 0,
-            payload_len: 0,
             reserved: ReservedFlags::new(),
         }
     }
 
-    /// Serialize to byte array (big endian)
-    pub fn to_bytes(&self) -> [u8; 16] {
+    /// Serialize to 16 wire bytes, with the two length fields supplied by the
+    /// caller from the ACTUAL body lengths (validated by `Packet::try_encode`).
+    pub fn to_bytes(&self, ext_header_len: u16, payload_len: u32) -> [u8; 16] {
         let mut bytes = [0u8; 16];
         bytes[0] = self.version;
         bytes[1] = u8::from(self.compression);
         bytes[2] = u8::from(self.packet_type);
         bytes[3] = self.biz_type;
         bytes[4..8].copy_from_slice(&self.message_id.to_be_bytes());
-        bytes[8..10].copy_from_slice(&self.ext_header_len.to_be_bytes());
-        bytes[10..14].copy_from_slice(&self.payload_len.to_be_bytes());
+        bytes[8..10].copy_from_slice(&ext_header_len.to_be_bytes());
+        bytes[10..14].copy_from_slice(&payload_len.to_be_bytes());
         bytes[14..16].copy_from_slice(&self.reserved.raw().to_be_bytes());
         bytes
     }
 
-    /// Deserialize from byte array (big endian)
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, PacketError> {
+    /// Parse the 16-byte header, returning it alongside the declared ext-header
+    /// and payload lengths (the caller uses them to bound the body).
+    pub fn from_bytes(bytes: &[u8]) -> Result<(Self, u16, u32), PacketError> {
         if bytes.len() < 16 {
             return Err(PacketError::InvalidHeader("Header too short".to_string()));
         }
@@ -280,16 +277,18 @@ impl FixedHeader {
         let payload_len = u32::from_be_bytes([bytes[10], bytes[11], bytes[12], bytes[13]]);
         let reserved = ReservedFlags::from_raw(u16::from_be_bytes([bytes[14], bytes[15]]));
 
-        Ok(Self {
-            version,
-            compression,
-            packet_type,
-            biz_type,
-            message_id,
+        Ok((
+            Self {
+                version,
+                compression,
+                packet_type,
+                biz_type,
+                message_id,
+                reserved,
+            },
             ext_header_len,
             payload_len,
-            reserved,
-        })
+        ))
     }
 }
 
@@ -339,17 +338,14 @@ impl Default for MessageIdManager {
 /// Packet structure
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Packet {
-    /// Fixed header
-    pub header: FixedHeader,
-    /// Extended header (optional)
-    pub ext_header: Vec<u8>,
-    /// Payload data.
-    ///
-    /// Backed by [`Bytes`] so decoding can slice the read buffer instead of
-    /// copying, and encoding can hand the buffer over without another copy.
-    /// The wire format is unchanged. `Bytes` derefs to `&[u8]`, so read-only
-    /// use (`&packet.payload`, `.len()`, indexing) is identical to a `Vec<u8>`.
-    pub payload: Bytes,
+    /// Fixed header metadata. Crate-internal; external access is via the
+    /// accessor methods (`message_id()`, `packet_type()`, `biz_type()`, ...).
+    pub(crate) header: FixedHeader,
+    /// Extension header, `Bytes` for zero-copy slicing/handoff.
+    pub(crate) ext_header: Bytes,
+    /// Payload data, `Bytes` so decoding slices the read buffer and encoding
+    /// hands the buffer over without a copy.
+    pub(crate) payload: Bytes,
 }
 
 impl Packet {
@@ -357,7 +353,7 @@ impl Packet {
     pub fn new(packet_type: PacketType, message_id: u32) -> Self {
         Self {
             header: FixedHeader::new(packet_type, message_id),
-            ext_header: Vec::new(),
+            ext_header: Bytes::new(),
             payload: Bytes::new(),
         }
     }
@@ -390,10 +386,9 @@ impl Packet {
         packet
     }
 
-    /// Set payload
+    /// Set payload.
     pub fn set_payload(&mut self, payload: impl Into<Bytes>) {
         self.payload = payload.into();
-        self.header.payload_len = self.payload.len() as u32;
     }
 
     /// Set message ID
@@ -406,10 +401,10 @@ impl Packet {
         self.header.packet_type = packet_type;
     }
 
-    /// Set extension header
-    pub fn set_ext_header(&mut self, ext_header: impl Into<Vec<u8>>) {
+    /// Set extension header. Oversized values are rejected at `try_encode`,
+    /// never silently truncated (the 1.x `as u16` cast is gone).
+    pub fn set_ext_header(&mut self, ext_header: impl Into<Bytes>) {
         self.ext_header = ext_header.into();
-        self.header.ext_header_len = self.ext_header.len() as u16;
     }
 
     /// Set compression type
@@ -457,6 +452,11 @@ impl Packet {
         self.header.reserved = self.header.reserved.route_tag(has_route);
     }
 
+    /// Set the raw reserved flags directly.
+    pub fn set_reserved(&mut self, reserved: ReservedFlags) {
+        self.header.reserved = reserved;
+    }
+
     /// Check if has route tag
     pub fn has_route_tag(&self) -> bool {
         self.header.reserved.has_route_tag()
@@ -470,7 +470,6 @@ impl Packet {
         }
 
         self.payload = Bytes::from(Self::compress_data(&self.payload, compression)?);
-        self.header.payload_len = self.payload.len() as u32;
         Ok(())
     }
 
@@ -482,42 +481,39 @@ impl Packet {
         }
 
         self.payload = Bytes::from(Self::decompress_data(&self.payload, compression)?);
-        self.header.payload_len = self.payload.len() as u32;
         Ok(())
     }
 
-    /// Serialize to Bytes (zero-copy optimized)
-    pub fn to_bytes(&self) -> Bytes {
-        let total_len = 16 + self.ext_header.len() + self.payload.len();
-        let mut buf = BytesMut::with_capacity(total_len);
-
-        // Fixed header
-        buf.extend_from_slice(&self.header.to_bytes());
-
-        // Extension header
-        if !self.ext_header.is_empty() {
-            buf.extend_from_slice(&self.ext_header);
-        }
-
-        // Payload
-        buf.extend_from_slice(&self.payload);
-
-        buf.freeze()
-    }
-
-    /// Serialize to a `Vec<u8>` in a single allocation.
+    /// The single, fallible encoder: serialize to wire `Bytes`.
     ///
-    /// Equivalent to `to_bytes().to_vec()` but without the intermediate `Bytes`
-    /// allocation, for sinks that need an owned `Vec` (e.g. the WebSocket adapter).
-    pub fn encode_to_vec(&self) -> Vec<u8> {
-        let total_len = 16 + self.ext_header.len() + self.payload.len();
-        let mut buf = Vec::with_capacity(total_len);
-        buf.extend_from_slice(&self.header.to_bytes());
+    /// The header's length fields are written from the ACTUAL `ext_header`/
+    /// `payload` lengths, and an ext header above `u16::MAX` or a payload above
+    /// `u32::MAX` is a hard [`PacketError::FrameTooLarge`] — never a silent
+    /// truncation that would desync the header from the body. This is the only
+    /// public encoding entry point (the infallible 1.x `to_bytes` is gone).
+    pub fn try_encode(&self) -> Result<Bytes, PacketError> {
+        let ext_len = self.ext_header.len();
+        if ext_len > u16::MAX as usize {
+            return Err(PacketError::FrameTooLarge {
+                declared: ext_len as u64,
+                limit: u16::MAX as usize,
+            });
+        }
+        let payload_len = self.payload.len();
+        if payload_len > u32::MAX as usize {
+            return Err(PacketError::FrameTooLarge {
+                declared: payload_len as u64,
+                limit: u32::MAX as usize,
+            });
+        }
+
+        let mut buf = BytesMut::with_capacity(16 + ext_len + payload_len);
+        buf.extend_from_slice(&self.header.to_bytes(ext_len as u16, payload_len as u32));
         if !self.ext_header.is_empty() {
             buf.extend_from_slice(&self.ext_header);
         }
         buf.extend_from_slice(&self.payload);
-        buf
+        Ok(buf.freeze())
     }
 
     /// Deserialize from byte array
@@ -574,27 +570,28 @@ impl Packet {
             return Ok(None);
         }
 
-        // Parse fixed header (validates version, packet_type, compression).
-        let header = FixedHeader::from_bytes(&bytes[0..16])?;
+        // Parse fixed header (validates version, packet_type, compression) and
+        // the two declared body lengths (no longer stored in the header).
+        let (header, ext_header_len, payload_len) = FixedHeader::from_bytes(&bytes[0..16])?;
 
         // Length arithmetic in u64: the declared lengths are attacker-
         // controlled, and `16 + ext + payload` in usize wraps on 32-bit
         // targets for payload_len near u32::MAX (reversed slice range =>
         // panic). u64 cannot overflow here (16 + u16::MAX + u32::MAX).
-        let declared = 16u64 + header.ext_header_len as u64 + header.payload_len as u64;
+        let declared = 16u64 + ext_header_len as u64 + payload_len as u64;
         // All limits are enforced from the fixed header alone, BEFORE any
         // Ok(None): a frame that must never be accepted is refused up front,
         // not buffered toward its declared size first. Hard errors, not
         // "incomplete".
-        if header.payload_len as u64 > limits.max_payload_size as u64 {
+        if payload_len as u64 > limits.max_payload_size as u64 {
             return Err(PacketError::FrameTooLarge {
-                declared: header.payload_len as u64,
+                declared: payload_len as u64,
                 limit: limits.max_payload_size,
             });
         }
-        if header.ext_header_len as usize > limits.max_ext_header_size {
+        if ext_header_len as usize > limits.max_ext_header_size {
             return Err(PacketError::FrameTooLarge {
-                declared: header.ext_header_len as u64,
+                declared: ext_header_len as u64,
                 limit: limits.max_ext_header_size,
             });
         }
@@ -606,17 +603,17 @@ impl Packet {
         }
         // Fits in usize: bounded by max_frame_size, which is a usize.
         let total = declared as usize;
-        let ext_end = 16 + header.ext_header_len as usize;
+        let ext_end = 16 + ext_header_len as usize;
         if bytes.len() < total {
             return Ok(None);
         }
 
-        let ext_header = if header.ext_header_len > 0 {
-            bytes[16..ext_end].to_vec()
+        let ext_header = if ext_header_len > 0 {
+            Bytes::copy_from_slice(&bytes[16..ext_end])
         } else {
-            Vec::new()
+            Bytes::new()
         };
-        let payload = if header.payload_len > 0 {
+        let payload = if payload_len > 0 {
             Bytes::copy_from_slice(&bytes[ext_end..total])
         } else {
             Bytes::new()
@@ -645,6 +642,37 @@ impl Packet {
     /// Get payload size
     pub fn payload_len(&self) -> usize {
         self.payload.len()
+    }
+
+    /// Protocol version.
+    pub fn version(&self) -> u8 {
+        self.header.version
+    }
+
+    /// Reserved flags (fragmentation / priority / route tag).
+    pub fn reserved(&self) -> ReservedFlags {
+        self.header.reserved
+    }
+
+    /// Payload bytes (read-only, zero-copy handle).
+    pub fn payload(&self) -> &Bytes {
+        &self.payload
+    }
+
+    /// Take ownership of the payload bytes, consuming the packet — the
+    /// zero-copy way to forward a received payload into a response.
+    pub fn into_payload(self) -> Bytes {
+        self.payload
+    }
+
+    /// Extension header bytes (empty when absent).
+    pub fn ext_header(&self) -> &[u8] {
+        &self.ext_header
+    }
+
+    /// Extension header size.
+    pub fn ext_header_len(&self) -> usize {
+        self.ext_header.len()
     }
 
     /// Get total size
@@ -799,8 +827,8 @@ mod tests {
     fn decode_one_streams_and_reports_incomplete() {
         let a = Packet::one_way(1, b"aa".to_vec());
         let b = Packet::request(2, b"bbb".to_vec());
-        let mut stream = a.to_bytes().to_vec();
-        stream.extend_from_slice(&b.to_bytes());
+        let mut stream = a.try_encode().unwrap().to_vec();
+        stream.extend_from_slice(&b.try_encode().unwrap());
 
         let (p1, used1) = Packet::decode_one(&stream).unwrap().expect("first");
         assert_eq!(p1.message_id(), 1);
@@ -825,7 +853,10 @@ mod tests {
         // Header claims ~4 GiB payload: must be FrameTooLarge immediately —
         // Ok(None) would tell a streaming caller to keep buffering, and on
         // 32-bit targets the unchecked arithmetic used to wrap and panic.
-        let mut bytes = Packet::request(1, b"hi".to_vec()).to_bytes().to_vec();
+        let mut bytes = Packet::request(1, b"hi".to_vec())
+            .try_encode()
+            .unwrap()
+            .to_vec();
         bytes[10] = 0xFF;
         bytes[11] = 0xFF;
         bytes[12] = 0xFF;
@@ -841,7 +872,7 @@ mod tests {
 
         // A frame just over a custom limit errs; at the limit it decodes.
         let p = Packet::one_way(1, vec![0u8; 100]);
-        let encoded = p.to_bytes();
+        let encoded = p.try_encode().unwrap();
         let tight = DecodeLimits {
             max_frame_size: encoded.len(),
             ..DecodeLimits::default()
@@ -867,7 +898,10 @@ mod tests {
             max_payload_size: 1024 * 1024,
             max_ext_header_size: 64 * 1024,
         };
-        let mut header_only = Packet::one_way(1, Vec::new()).to_bytes().to_vec();
+        let mut header_only = Packet::one_way(1, Vec::new())
+            .try_encode()
+            .unwrap()
+            .to_vec();
         let over = (1024 * 1024 + 1u32).to_be_bytes();
         header_only[10..14].copy_from_slice(&over);
         assert!(matches!(
@@ -878,7 +912,10 @@ mod tests {
 
         // Ext header over its own cap is likewise refused from the header
         // (the wire field is u16, so the cap must be below 65535 to bite).
-        let mut header_only = Packet::one_way(1, Vec::new()).to_bytes().to_vec();
+        let mut header_only = Packet::one_way(1, Vec::new())
+            .try_encode()
+            .unwrap()
+            .to_vec();
         header_only[8..10].copy_from_slice(&2048u16.to_be_bytes());
         let tight_ext = DecodeLimits {
             max_ext_header_size: 1024,
@@ -895,7 +932,7 @@ mod tests {
             max_payload_size: 1024,
             ..limits
         };
-        assert!(Packet::decode_one_with(&p.to_bytes(), &capped)
+        assert!(Packet::decode_one_with(&p.try_encode().unwrap(), &capped)
             .unwrap()
             .is_some());
     }
@@ -903,19 +940,19 @@ mod tests {
     #[test]
     fn decode_exact_rejects_trailing_bytes_and_bad_headers() {
         let p = Packet::one_way(7, b"payload".to_vec());
-        let mut bytes = p.to_bytes().to_vec();
+        let mut bytes = p.try_encode().unwrap().to_vec();
         assert_eq!(Packet::decode_exact(&bytes).unwrap().message_id(), 7);
 
         bytes.push(0xFF); // trailing garbage
         assert!(Packet::decode_exact(&bytes).is_err());
 
         // Invalid packet_type on the wire is an error end-to-end.
-        let mut bad = p.to_bytes().to_vec();
+        let mut bad = p.try_encode().unwrap().to_vec();
         bad[2] = 9;
         assert!(Packet::decode_exact(&bad).is_err());
         assert!(Packet::decode_one(&bad).is_err());
         // Invalid compression id likewise.
-        let mut bad = p.to_bytes().to_vec();
+        let mut bad = p.try_encode().unwrap().to_vec();
         bad[1] = 9;
         assert!(Packet::decode_exact(&bad).is_err());
     }
@@ -928,15 +965,16 @@ mod tests {
             packet_type: PacketType::Request,
             biz_type: 0,
             message_id: 12345,
-            ext_header_len: 8,
-            payload_len: 1024,
             reserved: ReservedFlags::new(),
         };
 
-        let bytes = header.to_bytes();
-        let recovered = FixedHeader::from_bytes(&bytes).unwrap();
+        // Lengths are supplied at encode and returned separately at decode.
+        let bytes = header.to_bytes(8, 1024);
+        let (recovered, ext_len, payload_len) = FixedHeader::from_bytes(&bytes).unwrap();
 
         assert_eq!(header, recovered);
+        assert_eq!(ext_len, 8);
+        assert_eq!(payload_len, 1024);
         assert_eq!(bytes.len(), 16);
     }
 
@@ -966,16 +1004,9 @@ mod tests {
     }
 
     #[test]
-    fn encode_to_vec_matches_to_bytes() {
-        let mut packet = Packet::request(7, b"payload".to_vec());
-        packet.set_ext_header(b"ext");
-        assert_eq!(packet.encode_to_vec(), packet.to_bytes().to_vec());
-    }
-
-    #[test]
     fn test_packet_serialization() {
         let packet = Packet::request(456, "test message");
-        let bytes = packet.to_bytes();
+        let bytes = packet.try_encode().unwrap();
         let recovered = Packet::from_bytes(&bytes).unwrap();
 
         assert_eq!(packet, recovered);
@@ -984,13 +1015,13 @@ mod tests {
     #[test]
     fn test_packet_with_ext_header() {
         let mut packet = Packet::response(789, "response data");
-        packet.set_ext_header(b"extension");
+        packet.set_ext_header(b"extension".to_vec());
 
-        let bytes = packet.to_bytes();
+        let bytes = packet.try_encode().unwrap();
         let recovered = Packet::from_bytes(&bytes).unwrap();
 
         assert_eq!(packet, recovered);
-        assert_eq!(recovered.ext_header, b"extension");
+        assert_eq!(recovered.ext_header(), b"extension");
     }
 
     #[test]
@@ -1093,7 +1124,7 @@ mod tests {
         packet.set_biz_type(123); // Custom business layer type
         packet.set_compression(CompressionType::Zlib);
 
-        let bytes = packet.to_bytes();
+        let bytes = packet.try_encode().unwrap();
         let recovered = Packet::from_bytes(&bytes).unwrap();
 
         assert_eq!(packet, recovered);
@@ -1107,7 +1138,7 @@ mod tests {
         packet.set_biz_type(255); // Maximum business type value
         packet.set_compression(CompressionType::Zstd);
 
-        let bytes = packet.to_bytes();
+        let bytes = packet.try_encode().unwrap();
 
         // Verify new field order
         assert_eq!(bytes[0], 1); // version
@@ -1135,7 +1166,7 @@ mod tests {
     #[test]
     fn test_big_endian_format() {
         let packet = Packet::request(0x12345678, "test");
-        let bytes = packet.to_bytes();
+        let bytes = packet.try_encode().unwrap();
 
         // Verify big endian format
         // message_id should be at bytes 4-7 position in new field order, big endian
@@ -1156,11 +1187,11 @@ mod tests {
         packet.set_fragmented(true);
         packet.set_priority(true);
         packet.set_route_tag(true);
-        packet.set_ext_header(b"complex_ext_header");
+        packet.set_ext_header(b"complex_ext_header".to_vec());
         packet.set_payload(b"complex_payload_data_for_testing".to_vec());
 
         // Packet serialization
-        let packet_bytes = packet.to_bytes();
+        let packet_bytes = packet.try_encode().unwrap();
 
         // Round-trip must reproduce the packet exactly.
         let recovered = Packet::from_bytes(&packet_bytes).unwrap();

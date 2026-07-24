@@ -22,7 +22,7 @@ impl SessionHandler for Echo {
     async fn on_message(&self, _s: SessionId, _packet: Packet, _sender: SessionSender) {}
 
     async fn on_request(&self, _s: SessionId, request: Packet, responder: Responder) {
-        let _ = responder.respond(request.payload).await;
+        let _ = responder.respond(request.into_payload()).await;
     }
 }
 

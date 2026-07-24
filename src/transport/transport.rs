@@ -741,22 +741,14 @@ impl Transport {
             .unwrap_or_else(|| self.request_registry.next_message_id());
 
         // Create request packet
-        let mut packet = crate::packet::Packet {
-            header: crate::packet::FixedHeader {
-                version: 1,
-                compression: options
-                    .compression
-                    .unwrap_or(crate::packet::CompressionType::None),
-                packet_type: crate::packet::PacketType::Request,
-                biz_type: options.biz_type.unwrap_or(0),
-                message_id,
-                ext_header_len: options.ext_header.as_ref().map_or(0, |h| h.len() as u16),
-                payload_len: data.len() as u32,
-                reserved: crate::packet::ReservedFlags::new(),
-            },
-            ext_header: options.ext_header.unwrap_or_default().to_vec(),
-            payload: data.clone(),
-        };
+        let mut packet = crate::packet::Packet::request(message_id, data.clone());
+        packet.set_biz_type(options.biz_type.unwrap_or(0));
+        if let Some(compression) = options.compression {
+            packet.set_compression(compression);
+        }
+        if let Some(ext) = options.ext_header.as_ref() {
+            packet.set_ext_header(ext.clone());
+        }
 
         // [FIX] If compression is needed, compress the packet
         if options.compression.is_some()
@@ -850,22 +842,14 @@ impl Transport {
             .unwrap_or_else(|| self.request_registry.next_message_id());
 
         // Create one-way message packet
-        let mut packet = crate::packet::Packet {
-            header: crate::packet::FixedHeader {
-                version: 1,
-                compression: options
-                    .compression
-                    .unwrap_or(crate::packet::CompressionType::None),
-                packet_type: crate::packet::PacketType::OneWay,
-                biz_type: options.biz_type.unwrap_or(0),
-                message_id,
-                ext_header_len: options.ext_header.as_ref().map_or(0, |h| h.len() as u16),
-                payload_len: data.len() as u32,
-                reserved: crate::packet::ReservedFlags::new(),
-            },
-            ext_header: options.ext_header.unwrap_or_default().to_vec(),
-            payload: data.clone(),
-        };
+        let mut packet = crate::packet::Packet::one_way(message_id, data.clone());
+        packet.set_biz_type(options.biz_type.unwrap_or(0));
+        if let Some(compression) = options.compression {
+            packet.set_compression(compression);
+        }
+        if let Some(ext) = options.ext_header.as_ref() {
+            packet.set_ext_header(ext.clone());
+        }
 
         // [FIX] If compression is needed, compress the packet
         if options.compression.is_some()

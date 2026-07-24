@@ -700,7 +700,7 @@ impl TransportClient {
                                 if packet.ext_header.is_empty() {
                                     None
                                 } else {
-                                    Some(packet.ext_header.clone())
+                                    Some(packet.ext_header.to_vec())
                                 },
                                 packet.payload.clone(),
                                 Arc::new(
@@ -727,22 +727,12 @@ impl TransportClient {
                                                     ),
                                                 );
                                             };
-                                            let response_packet = crate::packet::Packet {
-                                                header: crate::packet::FixedHeader {
-                                                    version: 1,
-                                                    compression:
-                                                        crate::packet::CompressionType::None,
-                                                    packet_type:
-                                                        crate::packet::PacketType::Response,
-                                                    biz_type,
+                                            let response_packet =
+                                                crate::packet::Packet::response_with_biz(
                                                     message_id,
-                                                    ext_header_len: 0,
-                                                    payload_len: response_data.len() as u32,
-                                                    reserved: crate::packet::ReservedFlags::new(),
-                                                },
-                                                ext_header: Vec::new(),
-                                                payload: response_data,
-                                            };
+                                                    biz_type,
+                                                    response_data,
+                                                );
                                             // Generation-bound: if the client
                                             // reconnected since this request
                                             // arrived, the stale response is

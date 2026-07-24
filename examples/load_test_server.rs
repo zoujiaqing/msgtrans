@@ -32,11 +32,11 @@ struct EchoHandler;
 #[async_trait]
 impl SessionHandler for EchoHandler {
     async fn on_message(&self, _session_id: SessionId, packet: Packet, sender: SessionSender) {
-        let _ = sender.send_data(packet.payload).await;
+        let _ = sender.send_data(packet.into_payload()).await;
     }
 
     async fn on_request(&self, _session_id: SessionId, request: Packet, responder: Responder) {
-        let _ = responder.respond(request.payload).await;
+        let _ = responder.respond(request.into_payload()).await;
     }
 
     async fn on_connected(&self, session_id: SessionId, _info: msgtrans::command::ConnectionInfo) {

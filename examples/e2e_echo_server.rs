@@ -31,7 +31,7 @@ struct EchoHandler;
 #[async_trait]
 impl SessionHandler for EchoHandler {
     async fn on_message(&self, _session_id: SessionId, packet: Packet, sender: SessionSender) {
-        let biz_type = packet.header.biz_type;
+        let biz_type = packet.biz_type();
 
         if biz_type == BIZ_DROP {
             // Silent drop — used by TS timeout / close-pending tests.
@@ -39,18 +39,18 @@ impl SessionHandler for EchoHandler {
         }
 
         // Mirror OneWay back with same biz_type and payload.
-        let mut echo = Packet::one_way(0, packet.payload);
+        let mut echo = Packet::one_way(0, packet.into_payload());
         echo.set_biz_type(biz_type);
         let _ = sender.send(echo).await;
     }
 
     async fn on_request(&self, _session_id: SessionId, request: Packet, responder: Responder) {
-        if request.header.biz_type == BIZ_DROP {
+        if request.biz_type() == BIZ_DROP {
             // Silent drop: the untouched responder leaves the request to the
             // lifecycle machinery (timeout), as the TS tests expect.
             return;
         }
-        let _ = responder.respond(request.payload).await;
+        let _ = responder.respond(request.into_payload()).await;
     }
 }
 

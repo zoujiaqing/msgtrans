@@ -33,10 +33,10 @@ impl SessionHandler for DebugHandler {
         println!(
             "[REQUEST] session={} id={} ({} bytes)",
             session_id,
-            request.header.message_id,
-            request.payload.len()
+            request.message_id(),
+            request.payload().len()
         );
-        let reply = format!("Echo: {}", String::from_utf8_lossy(&request.payload));
+        let reply = format!("Echo: {}", String::from_utf8_lossy(request.payload()));
         let _ = responder.respond(reply.into_bytes()).await;
     }
 
@@ -56,10 +56,12 @@ impl SessionHandler for DebugHandler {
     }
 
     async fn on_message(&self, session_id: SessionId, packet: Packet, _sender: SessionSender) {
-        let text = String::from_utf8_lossy(&packet.payload).to_string();
+        let text = String::from_utf8_lossy(packet.payload()).to_string();
         println!(
             "[RECV] Message received (session: {}, ID: {}): {}",
-            session_id, packet.header.message_id, text
+            session_id,
+            packet.message_id(),
+            text
         );
     }
 

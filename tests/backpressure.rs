@@ -112,7 +112,7 @@ impl SessionHandler for GatedCounter {
             self.gate.notified().await;
         }
         // Order check: payload carries a monotonically increasing number.
-        let n: u64 = String::from_utf8_lossy(&p.payload).parse().unwrap_or(0);
+        let n: u64 = String::from_utf8_lossy(p.payload()).parse().unwrap_or(0);
         let prev = self.last.swap(n, Ordering::SeqCst);
         if n != prev + 1 && !(prev == 0 && n == 1) {
             self.ordered.store(false, Ordering::SeqCst);

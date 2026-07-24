@@ -26,13 +26,13 @@ fn main() {
         println!(
             "  {} - type: {:?}, ID: {}, payload: {} bytes",
             name,
-            packet.header.packet_type,
-            packet.header.message_id,
-            packet.payload.len()
+            packet.packet_type(),
+            packet.message_id(),
+            packet.payload().len()
         );
 
         // Test serialization
-        let serialized = packet.to_bytes();
+        let serialized = packet.try_encode().unwrap();
         println!("    Serialized: {} bytes", serialized.len());
 
         // Test deserialization
@@ -40,7 +40,7 @@ fn main() {
             Ok(recovered) => {
                 println!(
                     "    Deserialization successful: {} bytes",
-                    recovered.payload.len()
+                    recovered.payload().len()
                 );
 
                 // Verify data consistency
@@ -63,15 +63,15 @@ fn main() {
     let test_packet = Packet::one_way(999, test_message);
 
     println!("  Original packet:");
-    println!("    Type: {:?}", test_packet.header.packet_type);
-    println!("    Message ID: {}", test_packet.header.message_id);
-    println!("    Payload length: {} bytes", test_packet.payload.len());
+    println!("    Type: {:?}", test_packet.packet_type());
+    println!("    Message ID: {}", test_packet.message_id());
+    println!("    Payload length: {} bytes", test_packet.payload().len());
     if let Some(text) = test_packet.payload_as_string() {
         println!("    Payload content: \"{}\"", text);
     }
 
     // Serialization
-    let bytes = test_packet.to_bytes();
+    let bytes = test_packet.try_encode().unwrap();
     println!("  After serialization: {} bytes", bytes.len());
     println!(
         "    First 16 bytes (header): {:02X?}",
@@ -82,11 +82,11 @@ fn main() {
     match Packet::from_bytes(&bytes) {
         Ok(recovered_packet) => {
             println!("  Deserialization:");
-            println!("    Type: {:?}", recovered_packet.header.packet_type);
-            println!("    Message ID: {}", recovered_packet.header.message_id);
+            println!("    Type: {:?}", recovered_packet.packet_type());
+            println!("    Message ID: {}", recovered_packet.message_id());
             println!(
                 "    Payload length: {} bytes",
-                recovered_packet.payload.len()
+                recovered_packet.payload().len()
             );
             if let Some(text) = recovered_packet.payload_as_string() {
                 println!("    Payload content: \"{}\"", text);

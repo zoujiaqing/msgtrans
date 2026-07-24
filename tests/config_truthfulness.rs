@@ -31,7 +31,7 @@ impl SessionHandler for Echo {
     async fn on_message(&self, _s: SessionId, _packet: Packet, _sender: SessionSender) {}
 
     async fn on_request(&self, _s: SessionId, request: Packet, responder: Responder) {
-        let _ = responder.respond(request.payload).await;
+        let _ = responder.respond(request.into_payload()).await;
     }
 }
 
@@ -174,7 +174,7 @@ async fn ws_message_size_cap_is_enforced() {
         .await
         .expect("handshake");
     // In-cap message is fine.
-    let small = Packet::one_way(1, vec![0u8; 64]).to_bytes();
+    let small = Packet::one_way(1, vec![0u8; 64]).try_encode().unwrap();
     stream
         .send(tokio_tungstenite::tungstenite::Message::Binary(small))
         .await
@@ -182,7 +182,9 @@ async fn ws_message_size_cap_is_enforced() {
     wait_sessions(&server, 1, "session up").await;
 
     // Over-cap message: the server protocol layer must kill the connection.
-    let oversized = Packet::one_way(2, vec![0u8; 8 * 1024]).to_bytes();
+    let oversized = Packet::one_way(2, vec![0u8; 8 * 1024])
+        .try_encode()
+        .unwrap();
     let _ = stream
         .send(tokio_tungstenite::tungstenite::Message::Binary(oversized))
         .await;

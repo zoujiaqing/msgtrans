@@ -460,7 +460,16 @@ impl<C> WebSocketAdapter<C> {
                             let (packet, completion) = (item.packet, item.completion);
                             // tungstenite takes Bytes directly, so the packet's own
                             // Bytes buffer is handed over without another copy.
-                            let message = Message::Binary(packet.to_bytes());
+                            let encoded = match packet.try_encode() {
+                                Ok(bytes) => bytes,
+                                Err(e) => {
+                                    if let Some(completion) = completion {
+                                        completion.complete(Err(crate::error::TransportError::protocol_error("websocket", format!("encode failed: {e}"))));
+                                    }
+                                    continue;
+                                }
+                            };
+                            let message = Message::Binary(encoded);
 
                             // Deadline: a peer that stops draining kills the
                             // connection instead of blocking queued senders.
@@ -974,7 +983,10 @@ mod frame_policy_tests {
     /// strict (TryFrom), not silently delivered as a OneWay.
     #[test]
     fn strict_rejects_invalid_packet_type_byte() {
-        let mut bytes = Packet::one_way(1, b"x".to_vec()).to_bytes().to_vec();
+        let mut bytes = Packet::one_way(1, b"x".to_vec())
+            .try_encode()
+            .unwrap()
+            .to_vec();
         bytes[2] = 9; // invalid packet_type
         let r = classify::<()>(
             Message::Binary(bytes::Bytes::from(bytes)),
@@ -986,7 +998,7 @@ mod frame_policy_tests {
     #[test]
     fn valid_packets_pass_both_policies() {
         for policy in [FramePolicy::Strict, FramePolicy::Lenient] {
-            let bytes = Packet::request(3, b"req".to_vec()).to_bytes();
+            let bytes = Packet::request(3, b"req".to_vec()).try_encode().unwrap();
             let r = classify::<()>(Message::Binary(bytes), policy);
             match r {
                 MessageProcessResult::Packet(p) => assert_eq!(p.message_id(), 3),

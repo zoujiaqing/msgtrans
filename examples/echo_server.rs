@@ -89,7 +89,7 @@ impl SessionHandler for EchoHandler {
     }
 
     async fn on_message(&self, session_id: SessionId, packet: Packet, sender: SessionSender) {
-        let biz_type = packet.header.biz_type;
+        let biz_type = packet.biz_type();
 
         if self.passive {
             // Byte-for-byte echo with biz_type preserved.
@@ -97,14 +97,14 @@ impl SessionHandler for EchoHandler {
             if biz_type == BIZ_DROP {
                 return;
             }
-            let mut echo = Packet::one_way(0, packet.payload);
+            let mut echo = Packet::one_way(0, packet.into_payload());
             echo.set_biz_type(biz_type);
             let _ = sender.send(echo).await;
             return;
         }
 
         // Demo: "Echo: " prefix.
-        let msg_text = String::from_utf8_lossy(&packet.payload).to_string();
+        let msg_text = String::from_utf8_lossy(packet.payload()).to_string();
         println!("[RECV] Message received");
         println!("   Session: {}", session_id);
         println!("   Content: \"{}\"", msg_text);
@@ -122,15 +122,15 @@ impl SessionHandler for EchoHandler {
         request: Packet,
         responder: msgtrans::transport::Responder,
     ) {
-        let biz_type = request.header.biz_type;
+        let biz_type = request.biz_type();
         if self.passive {
             if biz_type == BIZ_DROP {
                 return; // dropped responder -> request left to the lifecycle machinery
             }
-            let _ = responder.respond(request.payload).await;
+            let _ = responder.respond(request.into_payload()).await;
             return;
         }
-        let msg_text = String::from_utf8_lossy(&request.payload).to_string();
+        let msg_text = String::from_utf8_lossy(request.payload()).to_string();
         println!("[SEND] Responding to client request (session {session_id})...");
         let echo_message = format!("Echo: {}", msg_text);
         let _ = responder.respond(echo_message.into_bytes()).await;

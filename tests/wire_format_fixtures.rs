@@ -81,10 +81,10 @@ fn build_packet_from_spec(spec: &FixtureJson) -> Packet {
     p.set_compression(CompressionType::try_from(spec.compression).expect("fixture compression"));
     p.set_ext_header(hex_decode(&spec.ext_header_hex));
     p.set_payload(hex_decode(&spec.payload_hex));
-    p.header.reserved = ReservedFlags::from_raw(spec.reserved);
-    // Spec mandates version=1 for protocol v1; honor whatever the JSON says
-    // so that future-version fixtures can be parsed if added.
-    p.header.version = spec.version;
+    p.set_reserved(ReservedFlags::from_raw(spec.reserved));
+    // All current fixtures are protocol version 1 (constructors set it); the
+    // decoder rejects any other version, so there is nothing to override.
+    assert_eq!(spec.version, 1, "fixtures are protocol v1");
     p
 }
 
@@ -94,7 +94,7 @@ fn fixed_header_is_16_bytes() {
     // must serialize to exactly the fixed-header length (16 bytes).
     let empty = Packet::one_way(0, Vec::<u8>::new());
     assert_eq!(
-        empty.to_bytes().len(),
+        empty.try_encode().unwrap().len(),
         16,
         "fixed header must serialize to exactly 16 bytes"
     );
@@ -151,31 +151,28 @@ fn fixtures_round_trip() {
         let parsed = Packet::from_bytes(&bin_bytes)
             .unwrap_or_else(|e| panic!("[{}] from_bytes failed: {:?}", label, e));
 
-        assert_eq!(parsed.header.version, spec.version, "[{}] version", label);
+        assert_eq!(parsed.version(), spec.version, "[{}] version", label);
         assert_eq!(
-            u8::from(parsed.header.compression),
+            u8::from(parsed.compression()),
             spec.compression,
             "[{}] compression",
             label
         );
         assert_eq!(
-            u8::from(parsed.header.packet_type),
+            u8::from(parsed.packet_type()),
             spec.packet_type,
             "[{}] packet_type",
             label
         );
+        assert_eq!(parsed.biz_type(), spec.biz_type, "[{}] biz_type", label);
         assert_eq!(
-            parsed.header.biz_type, spec.biz_type,
-            "[{}] biz_type",
-            label
-        );
-        assert_eq!(
-            parsed.header.message_id, spec.message_id,
+            parsed.message_id(),
+            spec.message_id,
             "[{}] message_id",
             label
         );
         assert_eq!(
-            parsed.header.reserved.raw(),
+            parsed.reserved().raw(),
             spec.reserved,
             "[{}] reserved",
             label
@@ -183,18 +180,23 @@ fn fixtures_round_trip() {
 
         let expected_ext = hex_decode(&spec.ext_header_hex);
         let expected_payload = hex_decode(&spec.payload_hex);
-        assert_eq!(parsed.ext_header, expected_ext, "[{}] ext_header", label);
-        assert_eq!(parsed.payload, expected_payload, "[{}] payload", label);
+        assert_eq!(parsed.ext_header(), expected_ext, "[{}] ext_header", label);
+        assert_eq!(
+            parsed.payload().as_ref(),
+            expected_payload.as_slice(),
+            "[{}] payload",
+            label
+        );
 
         // Header length fields must match wire reality.
         assert_eq!(
-            parsed.header.ext_header_len as usize,
+            parsed.ext_header_len() as usize,
             expected_ext.len(),
             "[{}] ext_header_len header field",
             label
         );
         assert_eq!(
-            parsed.header.payload_len as usize,
+            parsed.payload_len() as usize,
             expected_payload.len(),
             "[{}] payload_len header field",
             label
@@ -202,7 +204,7 @@ fn fixtures_round_trip() {
 
         // ---- Direction 2: rebuild from .json, verify bytes match .bin ----
         let rebuilt = build_packet_from_spec(&spec);
-        let rebuilt_bytes = rebuilt.to_bytes();
+        let rebuilt_bytes = rebuilt.try_encode().unwrap();
         assert_eq!(
             rebuilt_bytes.as_ref(),
             bin_bytes.as_slice(),

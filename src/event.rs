@@ -497,7 +497,7 @@ impl ClientEvent {
                             if packet.ext_header.is_empty() {
                                 None
                             } else {
-                                Some(packet.ext_header.clone())
+                                Some(packet.ext_header.to_vec())
                             },
                             packet.payload.clone(),
                         );

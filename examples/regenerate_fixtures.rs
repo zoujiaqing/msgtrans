@@ -35,14 +35,14 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 fn to_json(packet: &Packet) -> FixtureJson {
     FixtureJson {
-        version: packet.header.version,
-        compression: u8::from(packet.header.compression),
-        packet_type: u8::from(packet.header.packet_type),
-        biz_type: packet.header.biz_type,
-        message_id: packet.header.message_id,
-        ext_header_hex: hex_encode(&packet.ext_header),
-        payload_hex: hex_encode(&packet.payload),
-        reserved: packet.header.reserved.raw(),
+        version: packet.version(),
+        compression: u8::from(packet.compression()),
+        packet_type: u8::from(packet.packet_type()),
+        biz_type: packet.biz_type(),
+        message_id: packet.message_id(),
+        ext_header_hex: hex_encode(packet.ext_header()),
+        payload_hex: hex_encode(packet.payload()),
+        reserved: packet.reserved().raw(),
     }
 }
 
@@ -105,7 +105,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Sanity: fixed header is 16 bytes regardless of payload.
     let header_only = Packet::one_way(0, Vec::<u8>::new());
     assert_eq!(
-        header_only.to_bytes().len(),
+        header_only.try_encode().unwrap().len(),
         16,
         "fixed header must serialize to exactly 16 bytes"
     );
@@ -123,7 +123,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let bin_path = out_dir.join(format!("{}.bin", name));
         let json_path = out_dir.join(format!("{}.json", name));
 
-        let bin_bytes = packet.to_bytes();
+        let bin_bytes = packet.try_encode().unwrap();
         fs::write(&bin_path, &bin_bytes)?;
 
         let json = to_json(packet);
@@ -134,9 +134,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "  {} ({} bytes wire, mid={}, biz={}, type={})",
             name,
             bin_bytes.len(),
-            packet.header.message_id,
-            packet.header.biz_type,
-            u8::from(packet.header.packet_type),
+            packet.message_id(),
+            packet.biz_type(),
+            u8::from(packet.packet_type()),
         );
     }
 

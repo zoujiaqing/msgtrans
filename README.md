@@ -68,14 +68,14 @@ struct Echo;
 impl SessionHandler for Echo {
     async fn on_message(&self, _session: SessionId, packet: Packet, sender: SessionSender) {
         // One-way traffic: echo it back - protocol transparent.
-        let response = format!("Echo: {}", String::from_utf8_lossy(&packet.payload));
+        let response = format!("Echo: {}", String::from_utf8_lossy(packet.payload()));
         let _ = sender.send_data(response.into_bytes()).await;
     }
 
     async fn on_request(&self, _session: SessionId, request: Packet, responder: Responder) {
         // Requests carry an obligation to answer: the consuming Responder is
         // the only way to do it, and Ok(Written) means the bytes were written.
-        let _ = responder.respond(request.payload).await;
+        let _ = responder.respond(request.into_payload()).await;
     }
 }
 
@@ -227,7 +227,7 @@ struct MyHandler;
 impl SessionHandler for MyHandler {
     async fn on_message(&self, session_id: SessionId, packet: Packet, sender: SessionSender) { /* ... */ }
     async fn on_request(&self, session_id: SessionId, request: Packet, responder: Responder) {
-        let _ = responder.respond(request.payload).await; // Ok(Written) == bytes written
+        let _ = responder.respond(request.into_payload()).await; // Ok(Written) == bytes written
     }
     async fn on_connected(&self, session_id: SessionId, info: ConnectionInfo) { /* ... */ }
     async fn on_disconnected(&self, session_id: SessionId, reason: CloseReason) { /* ... */ }
@@ -263,7 +263,7 @@ impl SessionHandler for Echo {
         // pick up the next message.
         let server = self.server.clone();
         tokio::spawn(async move {
-            let response = format!("Echo: {}", String::from_utf8_lossy(&packet.payload));
+            let response = format!("Echo: {}", String::from_utf8_lossy(packet.payload()));
             let _ = server.send(session_id, response.as_bytes()).await;
         });
     }
@@ -271,7 +271,7 @@ impl SessionHandler for Echo {
     async fn on_request(&self, _s: SessionId, request: Packet, responder: msgtrans::transport::Responder) {
         // respond_detached hands the write off; the registry still records
         // the true outcome.
-        responder.respond_detached(request.payload);
+        responder.respond_detached(request.into_payload());
     }
 }
 ```
@@ -333,12 +333,12 @@ struct Chat;
 #[async_trait]
 impl SessionHandler for Chat {
     async fn on_message(&self, _session: SessionId, packet: Packet, sender: SessionSender) {
-        let msg = String::from_utf8_lossy(&packet.payload);
+        let msg = String::from_utf8_lossy(packet.payload());
         let _ = sender.send_data(format!("You said: {msg}").into_bytes()).await;
     }
 
     async fn on_request(&self, _session: SessionId, request: Packet, responder: Responder) {
-        let msg = String::from_utf8_lossy(&request.payload).to_string();
+        let msg = String::from_utf8_lossy(request.payload()).to_string();
         let _ = responder.respond(format!("You asked: {msg}").into_bytes()).await;
     }
 }

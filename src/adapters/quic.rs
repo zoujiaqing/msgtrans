@@ -704,8 +704,23 @@ impl<C> QuicAdapter<C> {
                         let packet_id = packet.header.message_id;
                         packet_ids.push(packet_id);
 
-                        // Zero-copy serialization
-                        let data = packet.to_bytes();
+                        // Fallible encode: an unencodable packet fails its own
+                        // completion and is skipped, without poisoning the batch.
+                        let data = match packet.try_encode() {
+                            Ok(bytes) => bytes,
+                            Err(e) => {
+                                if let Some(completion) = completions.pop() {
+                                    completion.complete(Err(
+                                        crate::error::TransportError::protocol_error(
+                                            "quic",
+                                            format!("encode failed: {e}"),
+                                        ),
+                                    ));
+                                }
+                                packet_ids.pop();
+                                continue;
+                            }
+                        };
                         let frame_len = data.len() as u32;
 
                         // Append header + payload to write buffer

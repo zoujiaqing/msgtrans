@@ -590,8 +590,11 @@ impl<C> TcpAdapter<C> {
         write_half: &mut tokio::net::tcp::OwnedWriteHalf,
         packet: &Packet,
     ) -> Result<(), TcpError> {
-        // Use zero-copy serialization
-        let packet_bytes = packet.to_bytes();
+        // Fallible encode: an unencodable packet (ext header > u16::MAX or
+        // payload > u32::MAX) is a protocol error, not a panic.
+        let packet_bytes = packet
+            .try_encode()
+            .map_err(|e| TcpError::Config(format!("encode failed: {e}")))?;
         write_half
             .write_all(&packet_bytes)
             .await
@@ -861,7 +864,10 @@ mod strict_stream_tests {
     #[test]
     fn strict_fails_on_corruption_after_valid_packets() {
         let mut f = framer();
-        feed(&mut f, &Packet::one_way(1, b"ok".to_vec()).to_bytes());
+        feed(
+            &mut f,
+            &Packet::one_way(1, b"ok".to_vec()).try_encode().unwrap(),
+        );
         let first = f.try_parse_next_packet(true).expect("valid stream");
         assert_eq!(first.expect("complete").message_id(), 1);
 
@@ -877,11 +883,17 @@ mod strict_stream_tests {
     #[test]
     fn lenient_resyncs_after_corruption() {
         let mut f = framer();
-        feed(&mut f, &Packet::one_way(1, b"ok".to_vec()).to_bytes());
+        feed(
+            &mut f,
+            &Packet::one_way(1, b"ok".to_vec()).try_encode().unwrap(),
+        );
         assert!(f.try_parse_next_packet(false).expect("ok").is_some());
 
         feed(&mut f, &[0xFFu8; 8]); // corruption
-        feed(&mut f, &Packet::one_way(2, b"back".to_vec()).to_bytes());
+        feed(
+            &mut f,
+            &Packet::one_way(2, b"back".to_vec()).try_encode().unwrap(),
+        );
         let recovered = f
             .try_parse_next_packet(false)
             .expect("lenient stream survives")
@@ -905,7 +917,10 @@ mod strict_stream_tests {
     #[test]
     fn oversized_declared_frame_fails_fast_under_strict() {
         let mut f = framer();
-        let mut bytes = Packet::one_way(1, b"x".to_vec()).to_bytes().to_vec();
+        let mut bytes = Packet::one_way(1, b"x".to_vec())
+            .try_encode()
+            .unwrap()
+            .to_vec();
         bytes[10] = 0xFF;
         bytes[11] = 0xFF;
         bytes[12] = 0xFF;
@@ -924,10 +939,16 @@ mod strict_stream_tests {
             let mut f = framer();
             // Establish a valid stream first so this is not the first-packet
             // fast-fail path.
-            feed(&mut f, &Packet::one_way(1, b"ok".to_vec()).to_bytes());
+            feed(
+                &mut f,
+                &Packet::one_way(1, b"ok".to_vec()).try_encode().unwrap(),
+            );
             assert!(f.try_parse_next_packet(strict).expect("ok").is_some());
 
-            let mut header = Packet::one_way(2, Vec::new()).to_bytes().to_vec();
+            let mut header = Packet::one_way(2, Vec::new())
+                .try_encode()
+                .unwrap()
+                .to_vec();
             header[10..14].copy_from_slice(&((MAX_PAYLOAD_SIZE as u32) + 1).to_be_bytes());
             assert_eq!(header.len(), FIXED_HEADER_SIZE, "header only, no payload");
             feed(&mut f, &header);

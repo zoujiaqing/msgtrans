@@ -19,7 +19,7 @@ fn encode(c: &mut Criterion) {
         let packet = Packet::request(42, vec![0u8; size]);
         group.throughput(Throughput::Bytes((16 + size) as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), &packet, |b, p| {
-            b.iter(|| black_box(p.to_bytes()));
+            b.iter(|| black_box(p.try_encode().unwrap()));
         });
     }
     group.finish();
@@ -28,7 +28,7 @@ fn encode(c: &mut Criterion) {
 fn decode(c: &mut Criterion) {
     let mut group = c.benchmark_group("packet_decode");
     for &size in SIZES {
-        let bytes = Packet::request(42, vec![0u8; size]).to_bytes();
+        let bytes = Packet::request(42, vec![0u8; size]).try_encode().unwrap();
         group.throughput(Throughput::Bytes(bytes.len() as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), &bytes, |b, data| {
             b.iter(|| black_box(Packet::from_bytes(black_box(data.as_ref())).unwrap()));

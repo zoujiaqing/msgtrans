@@ -60,7 +60,7 @@ async fn stalled_write_fails_the_respond_within_the_deadline() {
     let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
     let request = Packet::request(1, b"gimme".to_vec());
     stream
-        .write_all(&request.to_bytes())
+        .write_all(&request.try_encode().unwrap())
         .await
         .expect("send request");
     stream.flush().await.expect("flush");
