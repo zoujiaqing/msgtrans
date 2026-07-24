@@ -923,7 +923,7 @@ mod generation_tests {
         async fn flush(&mut self) -> Result<(), TransportError> {
             Ok(())
         }
-        fn take_event_pipe(&mut self) -> Option<crate::adapters::events::EventPipeRx> {
+        fn take_event_pipe(&mut self) -> Option<crate::spi::ConnectionEvents> {
             None
         }
     }

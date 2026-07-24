@@ -513,7 +513,16 @@ impl SessionActor {
                         }
                     }
                     ActorMessage::SendWithReply { packet, reply } => {
-                        let result = self.transport.send(packet).await;
+                        // Write-confirmed: a "send that reports its result" (used
+                        // by the server's request path) must report the WRITE
+                        // result, not enqueue success — otherwise the server's
+                        // response timeout could start before the request bytes
+                        // reach the socket (ghost RPC). Bound to this session's
+                        // generation so it can never write onto a replacement.
+                        let result = self
+                            .transport
+                            .send_confirmed_with(packet, Some(self.session_id), None)
+                            .await;
                         let _ = reply.send(result);
                     }
                 }

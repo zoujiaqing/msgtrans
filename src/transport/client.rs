@@ -40,8 +40,9 @@ impl RetryConfig {
         }
     }
 
-    /// Set the backoff multiplier. Non-finite or non-positive values are
-    /// rejected (clamped to 1.0), so the delay computation can never panic.
+    /// Set the backoff multiplier. Non-finite (NaN/Inf) or `< 1.0` values are
+    /// clamped to `1.0` (never rejected/errored), so the delay computation can
+    /// never panic and backoff never shrinks the delay.
     pub fn backoff_multiplier(mut self, multiplier: f64) -> Self {
         self.backoff_multiplier = if multiplier.is_finite() && multiplier >= 1.0 {
             multiplier

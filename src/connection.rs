@@ -101,11 +101,11 @@ pub trait Connection: Send + Sync + std::any::Any {
     /// Flush send buffer
     async fn flush(&mut self) -> Result<(), TransportError>;
 
-    /// Take the bounded event pipe: the connection's single event channel
-    /// (single consumer, take-once). All queued data events are delivered
-    /// first, then exactly one ConnectionClosed.
-    #[doc(hidden)]
-    fn take_event_pipe(&mut self) -> Option<crate::adapters::events::EventPipeRx>;
+    /// Take the connection's event channel (single consumer, take-once). The
+    /// transport drains it: all queued data events, then exactly one
+    /// `ConnectionClosed`. Return the [`crate::spi::ConnectionEvents`] paired
+    /// with the [`crate::spi::EventSink`] the read loop pushes into.
+    fn take_event_pipe(&mut self) -> Option<crate::spi::ConnectionEvents>;
 
     /// Set the frame decode policy for this connection. Adapters that support it
     /// (WebSocket, QUIC) override this; others (e.g. TCP, which is always strict

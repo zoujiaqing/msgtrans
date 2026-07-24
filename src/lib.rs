@@ -40,6 +40,7 @@ pub mod stream;
 
 // New modules
 pub mod connection;
+pub mod spi;
 
 // Type definitions
 pub type PacketId = u32;

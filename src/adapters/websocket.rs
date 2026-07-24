@@ -661,8 +661,8 @@ impl<C: Send + Sync + 'static> Connection for WebSocketAdapter<C> {
         Ok(())
     }
 
-    fn take_event_pipe(&mut self) -> Option<crate::adapters::events::EventPipeRx> {
-        self.event_pipe_rx.take()
+    fn take_event_pipe(&mut self) -> Option<crate::spi::ConnectionEvents> {
+        self.event_pipe_rx.take().map(crate::spi::ConnectionEvents)
     }
 
     fn set_frame_policy(&self, policy: crate::packet::FramePolicy) {

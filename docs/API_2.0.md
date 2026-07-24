@@ -15,7 +15,7 @@ protocol configs.
 - `ClientEvent`, `TransportEvent`, `RespondOutcome`
 - `TcpEvent` *(feature = "tcp")*, `WebSocketEvent` *(feature = "websocket")*,
   `QuicEvent` *(feature = "quic")*
-- `ClientEvents`, `EventStream`, `PacketStream`
+- `ClientEvents`
 
 ## Packet API
 
