@@ -85,3 +85,28 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Clippy
         run: cargo clippy --all-features --all-targets -- -D warnings
+
+  # The 2.0 public API is frozen. `public-api.txt` is the committed snapshot of
+  # the crate-root surface plus `msgtrans::spi`; this job diffs the live surface
+  # against it and fails on any unrecorded add/remove/change. Widening or
+  # breaking the API therefore requires regenerating the baseline
+  # (scripts/gen_public_api.sh) in the same commit — no silent drift.
+  public-api:
+    name: public API snapshot
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-public-api
+        # Pinned: the tool's output format can change between releases, which
+        # would produce spurious diffs against the committed baseline. Bump this
+        # and regenerate public-api.txt (scripts/gen_public_api.sh) together.
+        run: cargo install cargo-public-api --locked --version 0.52.0
+      - name: Check public API against committed baseline
+        run: |
+          cargo +nightly public-api --all-features -s > /tmp/public-api.current
+          if ! diff -u public-api.txt /tmp/public-api.current; then
+            echo "::error::Public API drifted from public-api.txt. If intended, regenerate with scripts/gen_public_api.sh and commit the result."
+            exit 1
+          fi
