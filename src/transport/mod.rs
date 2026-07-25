@@ -16,7 +16,7 @@ pub(crate) mod client;
 /// ├─────────────────┬───────────────────┬───────────────────────┤
 /// │   Frontend API   │    Core Processing │    Backend Storage    │
 /// ├─────────────────┼───────────────────┼───────────────────────┤
-/// │ Transport API    │ Generic Actor     │ LockFree Pools        │
+/// │ Transport API    │ Generic Actor     │ Concurrent Pools        │
 /// │ Unified Interface│ Legacy Compatible │ Optimized Memory      │
 /// │ Zero Config      │ Ready for Upgrade │ Detailed Monitoring   │
 /// └─────────────────┴───────────────────┴───────────────────────┘
@@ -36,8 +36,8 @@ pub(crate) mod server;
 pub(crate) mod transport;
 pub(crate) mod transport_server;
 
+pub(crate) mod concurrent;
 pub(crate) mod context;
-pub(crate) mod lockfree;
 // The read-buffer pool is a byte-stream (TCP/QUIC) optimization; WebSocket
 // framing does its own buffering, so the pool is gated to those protocols.
 #[cfg(any(feature = "tcp", feature = "quic"))]

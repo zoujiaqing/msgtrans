@@ -1,8 +1,6 @@
 use bytes::BytesMut;
 use std::sync::{Arc, OnceLock};
 
-use crate::transport::lockfree::LockFreeQueue;
-
 static SHARED_MEMORY_POOL: OnceLock<Arc<OptimizedMemoryPool>> = OnceLock::new();
 
 /// Get the globally shared memory pool (lazy-initializes a default if none was registered).
@@ -12,18 +10,32 @@ pub fn shared_memory_pool() -> Arc<OptimizedMemoryPool> {
         .clone()
 }
 
-/// Lock-free read-buffer pool for the byte-stream adapters (TCP/QUIC).
+/// Read-buffer pool for the byte-stream adapters (TCP/QUIC).
 ///
-/// A per-tier lock-free queue caches reusable `BytesMut` buffers so the read
-/// loop avoids re-allocating on every frame. 2.0 removed the per-operation
-/// statistics (get/return counters, hit-rate and running-total atomics on the
-/// hot path): nothing read them, so the buffer path no longer pays for metrics
-/// nobody consumes. The cache is bounded purely by the queue length.
+/// Each tier is a **bounded** `flume` channel of reusable `BytesMut` buffers, so
+/// the read loop avoids re-allocating on every frame. The cache limit is the
+/// channel capacity itself: `return_buffer` uses `try_send`, which atomically
+/// drops the buffer when the tier is full — the previous `len()`-then-`push()`
+/// check was not atomic, so concurrent returns could overshoot the cap.
 #[derive(Clone)]
 pub struct OptimizedMemoryPool {
-    small_buffers: Arc<LockFreeQueue<BytesMut>>,
-    medium_buffers: Arc<LockFreeQueue<BytesMut>>,
-    large_buffers: Arc<LockFreeQueue<BytesMut>>,
+    small: BufferTier,
+    medium: BufferTier,
+    large: BufferTier,
+}
+
+/// One bounded cache of reusable buffers.
+#[derive(Clone)]
+struct BufferTier {
+    tx: flume::Sender<BytesMut>,
+    rx: flume::Receiver<BytesMut>,
+}
+
+impl BufferTier {
+    fn with_capacity(max_cached: usize) -> Self {
+        let (tx, rx) = flume::bounded(max_cached);
+        Self { tx, rx }
+    }
 }
 
 /// Buffer size tier. The three tiers exist for TCP's adaptive read sizing;
@@ -67,20 +79,20 @@ impl BufferSize {
 }
 
 impl OptimizedMemoryPool {
-    /// Create a fully lock-free memory pool.
+    /// Create a memory pool with each tier bounded at its `max_cached`.
     pub fn new() -> Self {
         Self {
-            small_buffers: Arc::new(LockFreeQueue::new()),
-            medium_buffers: Arc::new(LockFreeQueue::new()),
-            large_buffers: Arc::new(LockFreeQueue::new()),
+            small: BufferTier::with_capacity(BufferSize::Small.max_cached()),
+            medium: BufferTier::with_capacity(BufferSize::Medium.max_cached()),
+            large: BufferTier::with_capacity(BufferSize::Large.max_cached()),
         }
     }
 
-    fn queue(&self, size: BufferSize) -> &LockFreeQueue<BytesMut> {
+    fn tier(&self, size: BufferSize) -> &BufferTier {
         match size {
-            BufferSize::Small => &self.small_buffers,
-            BufferSize::Medium => &self.medium_buffers,
-            BufferSize::Large => &self.large_buffers,
+            BufferSize::Small => &self.small,
+            BufferSize::Medium => &self.medium,
+            BufferSize::Large => &self.large,
         }
     }
 
@@ -88,7 +100,7 @@ impl OptimizedMemoryPool {
     /// allocate. Returned buffers are cleared, so callers always see an empty
     /// buffer with capacity `>= size.capacity()`.
     pub fn get_buffer(&self, size: BufferSize) -> BytesMut {
-        if let Some(mut buffer) = self.queue(size).pop() {
+        if let Ok(mut buffer) = self.tier(size).rx.try_recv() {
             buffer.clear();
             tracing::trace!(
                 "[TARGET] Cache hit: {} capacity={}",
@@ -108,7 +120,8 @@ impl OptimizedMemoryPool {
     }
 
     /// Return a buffer to the cache for reuse. Abnormal buffers (empty or over
-    /// 10MB) are dropped; the cache is bounded by the tier's `max_cached`.
+    /// 10MB) are dropped; `try_send` atomically drops the buffer when the tier
+    /// is at capacity, so concurrent returns can never overshoot the cap.
     pub fn return_buffer(&self, buffer: BytesMut, size: BufferSize) {
         if buffer.capacity() == 0 || buffer.capacity() > 10 * 1024 * 1024 {
             tracing::warn!(
@@ -117,15 +130,11 @@ impl OptimizedMemoryPool {
             );
             return;
         }
-
-        let queue = self.queue(size);
-        if queue.len() >= size.max_cached() {
-            tracing::trace!("[DROP] Cache full, dropping {} buffer", size.description());
-            return;
-        }
-
-        if queue.push(buffer).is_err() {
-            tracing::warn!("[WARNING] Buffer return failed: {}", size.description());
+        if self.tier(size).tx.try_send(buffer).is_err() {
+            tracing::trace!(
+                "[DROP] Cache full or closed, dropping {} buffer",
+                size.description()
+            );
         }
     }
 }

@@ -23,14 +23,14 @@ pub enum ConnectionState {
 /// Provides thread-safe state management, preventing duplicate closing
 pub struct ConnectionStateManager {
     states:
-        Arc<crate::transport::lockfree::LockFreeHashMap<SessionId, Arc<Mutex<ConnectionState>>>>,
+        Arc<crate::transport::concurrent::ConcurrentMap<SessionId, Arc<Mutex<ConnectionState>>>>,
 }
 
 impl ConnectionStateManager {
     /// Create new state manager
     pub fn new() -> Self {
         Self {
-            states: Arc::new(crate::transport::lockfree::LockFreeHashMap::new()),
+            states: Arc::new(crate::transport::concurrent::ConcurrentMap::new()),
         }
     }
 

@@ -19,24 +19,16 @@ quic = ["dep:quinn", "dep:rustls", "dep:rustls-pemfile", "dep:rcgen", "dep:webpk
 [dependencies]
 # Core dependencies
 tokio = { version = "1.40", features = ["full"] }
-tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 futures-util = "0.3"
 futures = "0.3.28"
 async-trait = "0.1"
 bytes = "1.0"
 thiserror = "2"
-anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
 tracing = "0.1"
-chrono = { version = "0.4", features = ["serde"] }
-url = "2.4.0"
 
 # Lock-free data structures
-parking_lot = "0.12"
-slab = "0.4"
-sharded-slab = "0.1"
 flume = "0.12"
 
 # Protocol-specific dependencies
@@ -54,13 +46,11 @@ zstd = { version = "0.13", optional = true }
 # Added for dashmap
 dashmap = "6"
 
-# Added for log
-log = "^0.4"
-
 # TCP keepalive support (cross-platform via SockRef)
 socket2 = "0.6"
 
 [dev-dependencies]
+serde_json = "1.0"
 tracing-subscriber = "0.3"
 toml = "1"
 criterion = "0.8"

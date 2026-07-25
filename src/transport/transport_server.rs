@@ -1,8 +1,8 @@
 use crate::{
     transport::{
+        concurrent::ConcurrentMap,
         config::TransportConfig,
         connection_state::ConnectionStateManager,
-        lockfree::LockFreeHashMap,
         session_actor::{
             create_session_actor, SessionHandle, SessionHandler, DEFAULT_ACTOR_BUFFER_SIZE,
         },
@@ -60,8 +60,8 @@ pub struct TransportServer {
     config: TransportConfig,
     /// Shared context for creating Transport instances (no global singletons)
     context: Arc<crate::transport::context::TransportContext>,
-    transports: Arc<LockFreeHashMap<SessionId, Arc<crate::transport::transport::Transport>>>,
-    session_handles: Arc<LockFreeHashMap<SessionId, SessionHandle>>,
+    transports: Arc<ConcurrentMap<SessionId, Arc<crate::transport::transport::Transport>>>,
+    session_handles: Arc<ConcurrentMap<SessionId, SessionHandle>>,
     session_id_generator: Arc<std::sync::atomic::AtomicU64>,
     protocol_configs:
         std::collections::HashMap<String, Box<dyn crate::protocol::adapter::DynServerConfig>>,
@@ -142,8 +142,8 @@ impl TransportServer {
         let server = Self {
             config,
             context: ctx,
-            transports: Arc::new(LockFreeHashMap::new()),
-            session_handles: Arc::new(LockFreeHashMap::new()),
+            transports: Arc::new(ConcurrentMap::new()),
+            session_handles: Arc::new(ConcurrentMap::new()),
             session_id_generator: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             protocol_configs,
             state_manager: ConnectionStateManager::new(),
