@@ -43,7 +43,6 @@ pub(crate) mod session_actor;
 
 // [EXPORTS] Re-export core APIs with unified architecture
 pub use client::{RetryConfig, TransportClient, TransportClientBuilder};
-pub use context::TransportContext;
 pub use server::TransportServerBuilder;
 pub use transport::Transport;
 pub use transport_server::{ShutdownReport, TransportServer};

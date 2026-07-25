@@ -99,7 +99,7 @@ pub use stream::ClientEvents;
 
 pub use transport::{
     RetryConfig, ShutdownReport, Transport, TransportClient, TransportClientBuilder,
-    TransportConfig, TransportContext, TransportServer, TransportServerBuilder,
+    TransportConfig, TransportServer, TransportServerBuilder,
 };
 
 pub use protocol::{ClientConfig, ServerConfig};

@@ -8,14 +8,6 @@ use crate::transport::lockfree::LockFreeQueue;
 
 static SHARED_MEMORY_POOL: OnceLock<Arc<OptimizedMemoryPool>> = OnceLock::new();
 
-/// Register a memory pool as the globally shared instance.
-///
-/// Must be called before any adapter is created. Subsequent calls are no-ops
-/// (the first pool wins, matching OnceLock semantics).
-pub fn init_shared_memory_pool(pool: Arc<OptimizedMemoryPool>) {
-    let _ = SHARED_MEMORY_POOL.set(pool);
-}
-
 /// Get the globally shared memory pool (lazy-initializes a default if none was registered).
 pub fn shared_memory_pool() -> Arc<OptimizedMemoryPool> {
     SHARED_MEMORY_POOL
@@ -38,9 +30,6 @@ pub struct OptimizedMemoryPool {
     small_max_cached: Arc<AtomicUsize>, // Maximum cached small buffers
     medium_max_cached: Arc<AtomicUsize>, // Maximum cached medium buffers
     large_max_cached: Arc<AtomicUsize>,  // Maximum cached large buffers
-
-    /// [EVENT] Event broadcaster
-    event_broadcaster: tokio::sync::broadcast::Sender<MemoryPoolEvent>,
 }
 
 /// [OPTIMIZED] Memory pool statistics
@@ -101,17 +90,6 @@ pub struct OptimizedMemoryStatsSnapshot {
     pub total_memory_allocated_mb: f64,
     pub total_memory_cached_mb: f64,
     pub memory_efficiency: f64,
-}
-
-/// [EVENT] Memory pool events
-#[derive(Debug, Clone)]
-pub enum MemoryPoolEvent {
-    BufferAllocated { size: BufferSize, capacity: usize },
-    BufferReturned { size: BufferSize, capacity: usize },
-    CacheHit { size: BufferSize },
-    CacheMiss { size: BufferSize },
-    CacheEviction { size: BufferSize, count: usize },
-    MemoryPressure { total_mb: f64, threshold_mb: f64 },
 }
 
 /// Buffer size enumeration
@@ -200,8 +178,6 @@ impl OptimizedMemoryStats {
 impl OptimizedMemoryPool {
     /// [PERF] Create fully lock-free memory pool
     pub fn new() -> Self {
-        let (event_broadcaster, _) = tokio::sync::broadcast::channel(8192);
-
         Self {
             small_buffers: Arc::new(LockFreeQueue::new()),
             medium_buffers: Arc::new(LockFreeQueue::new()),
@@ -210,55 +186,7 @@ impl OptimizedMemoryPool {
             small_max_cached: Arc::new(AtomicUsize::new(500)), // Maximum small buffer cache
             medium_max_cached: Arc::new(AtomicUsize::new(200)), // Maximum medium buffer cache
             large_max_cached: Arc::new(AtomicUsize::new(50)),  // Maximum large buffer cache
-            event_broadcaster,
         }
-    }
-
-    /// [PERF] Pre-allocate buffer pool
-    pub fn with_preallocation(
-        self,
-        small_count: usize,
-        medium_count: usize,
-        large_count: usize,
-    ) -> Self {
-        // Pre-allocate small buffers
-        for _ in 0..small_count {
-            let buffer = BytesMut::with_capacity(BufferSize::Small.capacity());
-            let _ = self.small_buffers.push(buffer);
-            self.stats.small_cached.fetch_add(1, Ordering::Relaxed);
-            self.stats
-                .total_memory_cached
-                .fetch_add(BufferSize::Small.capacity() as u64, Ordering::Relaxed);
-        }
-
-        // Pre-allocate medium buffers
-        for _ in 0..medium_count {
-            let buffer = BytesMut::with_capacity(BufferSize::Medium.capacity());
-            let _ = self.medium_buffers.push(buffer);
-            self.stats.medium_cached.fetch_add(1, Ordering::Relaxed);
-            self.stats
-                .total_memory_cached
-                .fetch_add(BufferSize::Medium.capacity() as u64, Ordering::Relaxed);
-        }
-
-        // Pre-allocate large buffers
-        for _ in 0..large_count {
-            let buffer = BytesMut::with_capacity(BufferSize::Large.capacity());
-            let _ = self.large_buffers.push(buffer);
-            self.stats.large_cached.fetch_add(1, Ordering::Relaxed);
-            self.stats
-                .total_memory_cached
-                .fetch_add(BufferSize::Large.capacity() as u64, Ordering::Relaxed);
-        }
-
-        tracing::info!(
-            "[PERF] Memory pool pre-allocation completed - Small:{}, Medium:{}, Large:{}",
-            small_count,
-            medium_count,
-            large_count
-        );
-
-        self
     }
 
     /// [PERF] Synchronous buffer acquisition (LockFree + Zero-Copy)
@@ -302,11 +230,6 @@ impl OptimizedMemoryPool {
             // Clear buffer to ensure zero-copy
             buffer.clear();
 
-            // Send cache hit event
-            let _ = self
-                .event_broadcaster
-                .send(MemoryPoolEvent::CacheHit { size });
-
             tracing::trace!(
                 "[TARGET] Cache hit: {} capacity={}",
                 size.description(),
@@ -325,14 +248,6 @@ impl OptimizedMemoryPool {
         self.stats
             .total_memory_allocated
             .fetch_add(capacity as u64, Ordering::Relaxed);
-
-        // Send events
-        let _ = self
-            .event_broadcaster
-            .send(MemoryPoolEvent::CacheMiss { size });
-        let _ = self
-            .event_broadcaster
-            .send(MemoryPoolEvent::BufferAllocated { size, capacity });
 
         tracing::trace!(
             "[NEW] New allocation: {} capacity={}",
@@ -405,14 +320,6 @@ impl OptimizedMemoryPool {
                     .total_memory_cached
                     .fetch_add(size.capacity() as u64, Ordering::Relaxed);
 
-                // Send return event
-                let _ = self
-                    .event_broadcaster
-                    .send(MemoryPoolEvent::BufferReturned {
-                        size,
-                        capacity: size.capacity(),
-                    });
-
                 tracing::trace!(
                     "[RECYCLE] Buffer returned: {} cache_count={}",
                     size.description(),
@@ -426,94 +333,9 @@ impl OptimizedMemoryPool {
         }
     }
 
-    /// [PERF] Adaptive cache adjustment
-    pub fn adjust_cache_limits(&self, memory_pressure_threshold_mb: f64) {
-        let stats = self.stats.snapshot();
-        let current_memory_mb = stats.total_memory_cached_mb;
-
-        if current_memory_mb > memory_pressure_threshold_mb {
-            // Memory pressure too high, reduce cache limits
-            let reduction_factor = 0.8;
-
-            self.small_max_cached.store(
-                ((self.small_max_cached.load(Ordering::Relaxed) as f64) * reduction_factor)
-                    as usize,
-                Ordering::Relaxed,
-            );
-            self.medium_max_cached.store(
-                ((self.medium_max_cached.load(Ordering::Relaxed) as f64) * reduction_factor)
-                    as usize,
-                Ordering::Relaxed,
-            );
-            self.large_max_cached.store(
-                ((self.large_max_cached.load(Ordering::Relaxed) as f64) * reduction_factor)
-                    as usize,
-                Ordering::Relaxed,
-            );
-
-            // Send memory pressure event
-            let _ = self
-                .event_broadcaster
-                .send(MemoryPoolEvent::MemoryPressure {
-                    total_mb: current_memory_mb,
-                    threshold_mb: memory_pressure_threshold_mb,
-                });
-
-            tracing::info!("[REDUCE] Memory pressure adjustment: cache limits reduced to 80% (current={:.1}MB)", current_memory_mb);
-        }
-    }
-
     /// [PERF] Get memory pool performance statistics
     pub fn get_stats(&self) -> OptimizedMemoryStatsSnapshot {
         self.stats.snapshot()
-    }
-
-    /// [PERF] Clear cache (for low memory situations)
-    pub fn clear_cache(&self) -> usize {
-        let mut cleared_count = 0;
-        let mut cleared_memory = 0u64;
-
-        // Clear small buffer cache
-        while self.small_buffers.pop().is_some() {
-            cleared_count += 1;
-            cleared_memory += BufferSize::Small.capacity() as u64;
-            self.stats.small_cached.fetch_sub(1, Ordering::Relaxed);
-        }
-
-        // Clear medium buffer cache
-        while self.medium_buffers.pop().is_some() {
-            cleared_count += 1;
-            cleared_memory += BufferSize::Medium.capacity() as u64;
-            self.stats.medium_cached.fetch_sub(1, Ordering::Relaxed);
-        }
-
-        // Clear large buffer cache
-        while self.large_buffers.pop().is_some() {
-            cleared_count += 1;
-            cleared_memory += BufferSize::Large.capacity() as u64;
-            self.stats.large_cached.fetch_sub(1, Ordering::Relaxed);
-        }
-
-        // Update total memory statistics
-        self.stats.total_memory_cached.store(0, Ordering::Relaxed);
-
-        tracing::info!(
-            "[CLEAN] Cache cleared: {} buffers, {:.1}MB",
-            cleared_count,
-            cleared_memory as f64 / (1024.0 * 1024.0)
-        );
-
-        cleared_count
-    }
-
-    /// [PERF] Get event receiver (for monitoring)
-    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<MemoryPoolEvent> {
-        self.event_broadcaster.subscribe()
-    }
-
-    /// [PERF] Get memory pool status (compatible with old API)
-    pub async fn status(&self) -> OptimizedMemoryStatsSnapshot {
-        self.get_stats()
     }
 }
 

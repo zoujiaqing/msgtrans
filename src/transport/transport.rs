@@ -66,7 +66,7 @@ const REQUEST_WAITER_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 const INBOUND_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 impl Transport {
     /// Create Transport from a shared context (synchronous — no global singletons).
-    pub fn with_context(config: TransportConfig, ctx: &TransportContext) -> Self {
+    pub(crate) fn with_context(config: TransportConfig, ctx: &TransportContext) -> Self {
         let (client_events_tx, client_events_rx) = mpsc::channel(8192);
         Self {
             config,
