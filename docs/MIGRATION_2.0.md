@@ -171,3 +171,89 @@ The following were implementation detail or dead tracks, not API, and are gone:
   / `ErrorSeverity`, and the read-buffer pool's per-op statistics.
 - The `MessageIdManager` and the old cloneable `Message` struct (superseded by
   `ClientMessage`/`ClientRequest`).
+
+## 10. Send / request results are typed and honest
+
+`TransportResult` and `TransportStatus` are **removed**. They could encode
+impossible combinations, and — worse — a request **timeout** was reported as
+`Ok(TransportResult { status: Timeout, data: None })`, so a caller who checked
+only `is_ok()` treated a request that never got an answer as a success.
+
+```rust
+// 1.x
+let result = client.request(b"ping").await?;
+if let Some(data) = result.data { /* ... */ }   // silently also the timeout path
+
+// 2.0
+let response: Bytes = client.request(b"ping").await?;  // timeout => Err
+```
+
+`send` is now **write-confirmed** on both client and server: it returns only
+once the bytes reached the socket, and yields a typed `SendReceipt`. The
+fire-and-forget tier is explicitly named:
+
+```rust
+let receipt = client.send(b"hello").await?;          // confirmed written
+let receipt = client.send_detached(b"hello").await?; // queued only
+```
+
+`SessionHandler::on_message_sent` is documented as **droppable** (it rides the
+diagnostic plane): never use it as a delivery ledger.
+
+## 11. `ConnectionInfo` contains only real data
+
+`last_activity`, `packets_sent`, `packets_received`, `bytes_sent` and
+`bytes_received` are **removed**: no adapter ever updated them, so reading them
+returned a constant zero that looked like a live counter. The addresses are now
+real on every protocol (WebSocket used to report `0.0.0.0:0`; QUIC discarded the
+addresses it had already resolved).
+
+`SessionHandler::on_connected` is a notification, not an admission decision —
+it returns `()`. To reject a peer, close its session explicitly.
+
+## 12. Adapters hand out a `ConnectionWriter`
+
+`Connection::send_with_completion` is replaced by
+`Connection::writer() -> Arc<dyn ConnectionWriter>`, and the send method moves
+onto `ConnectionWriter` (taking `&self`):
+
+```rust
+// 2.0
+fn writer(&self) -> Arc<dyn ConnectionWriter> {
+    Arc::new(MyWriter { queue: self.send_queue.clone() })
+}
+```
+
+This exists so the transport can clone the writer under its connection lock and
+**release the lock before awaiting the enqueue** — previously a saturated
+outbound queue parked reconnect/close/shutdown behind every waiting sender.
+
+`Connection::set_frame_policy` is now a **required** method (the old no-op
+default let an adapter silently ignore `Strict`).
+
+## 13. One object-safe protocol config trait set
+
+The generic `ServerConfig`/`ClientConfig` traits are crate-private: their
+associated types named the concrete private adapters, which wrote internal
+types into the frozen public API. Implement the object-safe set only —
+`DynProtocolConfig` + `DynServerConfig`/`DynClientConfig`. The dead
+`as_any`, `clone_dyn` and `get_target_info` methods are gone.
+
+`EventSink` is typed by plane: `message(Packet)`/`error(TransportError)` (data,
+backpressured), `message_sent(id)` (droppable diagnostic), `close(reason)`
+(control). `event_channel` takes a `NonZeroUsize`.
+
+## 14. Message ids are always allocated by the transport
+
+`TransportOptions::message_id` is removed. A caller-chosen id could be reused
+while a previous request's response was still in flight, and the peer echoes the
+id with no generation, so a late old response could be handed to the new caller.
+Ids are now always unique and monotonic. (`SessionSender::send_data` likewise
+stopped stamping every one-way message with the fixed id 0.)
+
+## 15. Extensible enums are `#[non_exhaustive]`
+
+`TransportError`, `CloseReason`, `ClientEvent`, `RespondOutcome`,
+`ConnectionState` and the output-only `ShutdownReport`/`ConnectionInfo` are
+`#[non_exhaustive]`, so future variants and fields are additive. Add a `_ => {}`
+arm to exhaustive matches.

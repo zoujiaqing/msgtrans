@@ -17,7 +17,6 @@ protocol configs.
   `Connected`/`MessageSent`/`Disconnected`/`Error`), `ClientMessage` (one-way,
   cloneable data), `ClientRequest` (consuming; `respond`/`respond_detached`),
   `TransportEvent`, `RespondOutcome`
-- `TransportResult`, `TransportStatus` (returned by `TransportClient::send`/`request`)
 - `ClientEvents`
 
 Everything above is reachable **only** through the crate root
@@ -49,7 +48,8 @@ Everything above is reachable **only** through the crate root
   .frame_policy(..).max_connections(..).actor_buffer_size(..)
   .transport_config(..).build(Arc<dyn SessionHandler>) -> TransportServer`
 - `TransportServer`: `serve()`, `shutdown()`, `shutdown_with_timeout(Duration)
-  -> ShutdownReport`, `send(session, bytes)`, `request(session, bytes)`,
+  -> ShutdownReport`, `send(session, bytes)` (write-confirmed -> `SendReceipt`),
+  `request(session, bytes)` (-> response `Bytes`; a timeout is an `Err`),
   `session_count()`, clone (Arc-shared)
 - `SessionHandler`: `on_message(id, Packet, SessionSender)` +
   `on_request(id, Packet, Responder)` (both required); optional `on_connected`,
@@ -65,9 +65,10 @@ Everything above is reachable **only** through the crate root
 
 - `TransportClientBuilder::new().protocol(cfg).limits(ClientLimits)
   .transport_config(..).retry_strategy(..).build() -> TransportClient`
-- `TransportClient`: `connect()`, `shutdown()`, `send`, `request`,
-  `request_with_options`, `send_with_options`, `events()`, `is_connected()`,
-  `current_session_id()`, `disconnect()`
+- `TransportClient`: `connect()`, `shutdown()`, `send` (write-confirmed ->
+  `SendReceipt`), `send_detached` (queued only), `request` (-> response
+  `Bytes`; a timeout is an `Err`), `request_with_options`, `send_with_options`,
+  `events()`, `is_connected()`, `current_session_id()`, `disconnect()`
 - `RetryConfig` (+ `exponential_backoff`)
 
 ## Limits

@@ -84,19 +84,25 @@ const FIXED_HEADER_SIZE: usize = 16;
 struct OptimizedReadBuffer {
     buffer: BytesMut,
     target_capacity: usize,
-    stats: ReadBufferStats,
+    progress: ReadProgress,
     pool: Arc<OptimizedMemoryPool>,
     buffer_tier: BufferSize,
 }
 
+/// The only read-loop state that drives a DECISION.
+///
+/// 2.0 removed the six-counter `ReadBufferStats` (reads / packets_parsed /
+/// reallocations / bytes_read / resync_attempts / bytes_discarded): five were
+/// write-only — incremented on the hot path for every read, every parse and
+/// every resync, and never read by anything — and the sixth was only ever
+/// compared against zero. That single question is what remains.
 #[derive(Debug, Default)]
-struct ReadBufferStats {
-    reads: u64,
-    packets_parsed: u64,
-    reallocations: u64,
-    bytes_read: u64,
-    resync_attempts: u64,
-    bytes_discarded: u64,
+struct ReadProgress {
+    /// Whether any packet has been parsed on this connection yet. Under the
+    /// lenient policy the FIRST invalid header closes the connection (it is
+    /// almost certainly non-protocol traffic), while a later one triggers a
+    /// bounded resync.
+    parsed_any: bool,
 }
 
 impl Drop for OptimizedReadBuffer {
@@ -122,7 +128,7 @@ impl OptimizedReadBuffer {
         Self {
             buffer,
             target_capacity: initial_capacity,
-            stats: ReadBufferStats::default(),
+            progress: ReadProgress::default(),
             pool,
             buffer_tier,
         }
@@ -184,8 +190,6 @@ impl OptimizedReadBuffer {
     /// Scans forward byte-by-byte looking for a valid header.
     /// Returns true if resync successful, false if should disconnect.
     fn try_resync_frame(&mut self) -> bool {
-        self.stats.resync_attempts += 1;
-
         let scan_limit = self.buffer.len().min(MAX_RESYNC_SCAN_DISTANCE);
 
         for offset in 1..scan_limit {
@@ -195,7 +199,6 @@ impl OptimizedReadBuffer {
                     "[RESYNC] Frame resync successful, discarded {} bytes",
                     offset
                 );
-                self.stats.bytes_discarded += offset as u64;
                 let _ = self.buffer.split_to(offset);
                 return true;
             }
@@ -208,7 +211,6 @@ impl OptimizedReadBuffer {
                 "[RESYNC] No valid frame found in {} bytes, discarding",
                 MAX_RESYNC_SCAN_DISTANCE
             );
-            self.stats.bytes_discarded += MAX_RESYNC_SCAN_DISTANCE as u64;
             let _ = self.buffer.split_to(MAX_RESYNC_SCAN_DISTANCE);
             return true;
         }
@@ -257,7 +259,7 @@ impl OptimizedReadBuffer {
                 Ok(Some(total)) => {
                     let frame = self.buffer.split_to(total).freeze();
                     let packet = Packet::decode_exact_from(&frame, &limits)?;
-                    self.stats.packets_parsed += 1;
+                    self.progress.parsed_any = true;
                     return Ok(Some(packet));
                 }
                 Ok(None) => return Ok(None),
@@ -285,7 +287,7 @@ impl OptimizedReadBuffer {
                     }
                     // Lenient: fast-fail for non-protocol traffic on the very
                     // first packet, bounded resync afterwards.
-                    if self.stats.packets_parsed == 0 {
+                    if !self.progress.parsed_any {
                         tracing::warn!(
                             "[PARSE] Invalid protocol header on first packet, closing connection"
                         );
@@ -311,7 +313,6 @@ impl OptimizedReadBuffer {
         // Ensure buffer has enough space
         if self.buffer.capacity() - self.buffer.len() < 4096 {
             self.buffer.reserve(self.target_capacity);
-            self.stats.reallocations += 1;
         }
 
         // Read data
@@ -319,9 +320,6 @@ impl OptimizedReadBuffer {
             .read_buf(&mut self.buffer)
             .await
             .map_err(TcpError::Io)?;
-
-        self.stats.reads += 1;
-        self.stats.bytes_read += bytes_read as u64;
 
         Ok(bytes_read)
     }
