@@ -8,7 +8,7 @@
 //! Batch 1 (this tool) covers fixtures 01-08, all uncompressed.
 //! Batch 2 (compression) is intentionally not generated here.
 
-use msgtrans::packet::{Packet, ReservedFlags};
+use msgtrans::{Packet, ReservedFlags};
 use serde::Serialize;
 use std::fs;
 use std::path::Path;

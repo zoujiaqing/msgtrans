@@ -4,7 +4,7 @@ use crate::{
     error::TransportError,
     event::TransportEvent,
     packet::{Packet, PacketError},
-    protocol::{AdapterStats, TcpClientConfig, TcpServerConfig},
+    protocol::{TcpClientConfig, TcpServerConfig},
     transport::memory_pool::{shared_memory_pool, BufferSize, OptimizedMemoryPool},
     SessionId,
 };
@@ -336,7 +336,6 @@ pub struct TcpAdapter<C> {
     config: C,
     /// Adapter statistics (diagnostics; not on the hot path).
     #[allow(dead_code)]
-    stats: AdapterStats,
     /// Connection information
     connection_info: ConnectionInfo,
     /// Send queue
@@ -411,7 +410,6 @@ impl<C> TcpAdapter<C> {
         Ok(Self {
             state,
             config,
-            stats: AdapterStats::new(),
             connection_info,
             send_queue: send_queue_tx,
             event_pipe_rx: Some(event_pipe_rx),

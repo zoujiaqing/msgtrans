@@ -9,16 +9,24 @@ protocol configs.
 ## Core types
 
 - `SessionId`, `PacketId`, `Result<T>` (alias for `Result<T, TransportError>`)
-- `Packet`, `PacketType`, `PacketError`, `FramePolicy`
+- `Packet`, `PacketType`, `CompressionType`, `PacketError`, `FramePolicy`,
+  `ReservedFlags`, `DecodeLimits`, `DEFAULT_MAX_FRAME_SIZE`
 - `TransportError`, `CloseReason`
-- `ConnectionInfo`
+- `ConnectionInfo`, `ConnectionState`
 - `ClientEvent` (`Message(ClientMessage)` | `Request(ClientRequest)` |
   `Connected`/`MessageSent`/`Disconnected`/`Error`), `ClientMessage` (one-way,
   cloneable data), `ClientRequest` (consuming; `respond`/`respond_detached`),
   `TransportEvent`, `RespondOutcome`
-- `TcpEvent` *(feature = "tcp")*, `WebSocketEvent` *(feature = "websocket")*,
-  `QuicEvent` *(feature = "quic")*
+- `TransportResult`, `TransportStatus` (returned by `TransportClient::send`/`request`)
 - `ClientEvents`
+
+Everything above is reachable **only** through the crate root
+(`msgtrans::TypeName`). The implementation modules — `transport`, `protocol`,
+`event`, `packet`, `command`, `connection`, `stream`, `error`, `adapters` — are
+`pub(crate)`; deep paths like `msgtrans::transport::Transport` or
+`msgtrans::event::ClientEvent` do **not** resolve. The only public module is
+`msgtrans::spi`. This is enforced by the committed `public-api.txt` snapshot
+(CI `public-api` job).
 
 ## Packet API
 
@@ -88,7 +96,8 @@ internal type. This is a *separate module* (`msgtrans::spi`), not the crate root
   event backbone) + `event_channel(capacity)`; the adapter keeps the `EventSink`
   and returns the `ConnectionEvents` from `Connection::take_event_pipe`
 - `ServerConfig` / `ClientConfig` (+ object-safe `DynServerConfig` /
-  `DynClientConfig`), `ProtocolConfig`, `ConfigError`, taking `ConnectionLimits`
+  `DynClientConfig` and their shared supertrait `DynProtocolConfig`),
+  `ProtocolConfig`, `ConfigError`, taking `ConnectionLimits`
 - Re-exported building blocks: `Packet`, `TransportEvent`, `SessionId`,
   `ConnectionInfo`, `CloseReason`, `TransportError`, `ConnectionLimits`
 

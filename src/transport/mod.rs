@@ -47,7 +47,6 @@ pub(crate) mod session_actor;
 // [EXPORTS] Re-export core APIs with unified architecture
 pub use client::{RetryConfig, TransportClient, TransportClientBuilder};
 pub use server::TransportServerBuilder;
-pub use transport::Transport;
 pub use transport_server::{ShutdownReport, TransportServer};
 // Extension SPI (used by custom protocol adapters) reachable via the crate root.
 

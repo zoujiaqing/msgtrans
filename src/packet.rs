@@ -1,8 +1,4 @@
 use bytes::{Bytes, BytesMut};
-/// Unified architecture packet definition
-///
-/// Simplified, efficient packet format designed for unified architecture
-use std::sync::atomic::{AtomicU32, Ordering};
 
 #[cfg(any(feature = "flate2", feature = "zstd"))]
 const MAX_DECOMPRESSED_PAYLOAD_SIZE: usize = 16 * 1024 * 1024;
@@ -290,49 +286,6 @@ impl FixedHeader {
             ext_header_len,
             payload_len,
         ))
-    }
-}
-
-/// Message ID manager - thread safe
-#[derive(Debug)]
-pub struct MessageIdManager {
-    counter: AtomicU32,
-}
-
-impl MessageIdManager {
-    /// Create new ID manager
-    pub fn new() -> Self {
-        Self {
-            counter: AtomicU32::new(1), // Start from 1
-        }
-    }
-
-    /// Get next ID
-    pub fn next_id(&self) -> u32 {
-        let id = self.counter.fetch_add(1, Ordering::SeqCst);
-        if id == u32::MAX {
-            // Reset to 1 when reaching maximum value
-            self.counter.store(1, Ordering::SeqCst);
-            1
-        } else {
-            id
-        }
-    }
-
-    /// Reset ID counter (for connection rebuilding)
-    pub fn reset(&self) {
-        self.counter.store(1, Ordering::SeqCst);
-    }
-
-    /// Get current ID (without incrementing)
-    pub fn current_id(&self) -> u32 {
-        self.counter.load(Ordering::SeqCst)
-    }
-}
-
-impl Default for MessageIdManager {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -1098,18 +1051,6 @@ mod tests {
         assert_eq!(ext_len, 8);
         assert_eq!(payload_len, 1024);
         assert_eq!(bytes.len(), 16);
-    }
-
-    #[test]
-    fn test_message_id_manager() {
-        let manager = MessageIdManager::new();
-
-        assert_eq!(manager.next_id(), 1);
-        assert_eq!(manager.next_id(), 2);
-        assert_eq!(manager.next_id(), 3);
-
-        manager.reset();
-        assert_eq!(manager.next_id(), 1);
     }
 
     #[test]

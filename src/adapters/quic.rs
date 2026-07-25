@@ -24,7 +24,7 @@ use crate::{
     error::TransportError,
     event::TransportEvent,
     packet::Packet,
-    protocol::{AdapterStats, QuicClientConfig, QuicServerConfig},
+    protocol::{QuicClientConfig, QuicServerConfig},
     transport::memory_pool::{shared_memory_pool, BufferSize},
     SessionId,
 };
@@ -362,7 +362,6 @@ pub struct QuicAdapter<C> {
     #[allow(dead_code)]
     config: C,
     #[allow(dead_code)]
-    stats: AdapterStats,
     #[allow(dead_code)]
     connection_info: ConnectionInfo,
     /// Send queue
@@ -427,7 +426,6 @@ impl<C> QuicAdapter<C> {
         Ok(Self {
             state,
             config,
-            stats: AdapterStats::new(),
             connection_info,
             send_queue: send_queue_tx,
             event_pipe_rx: Some(event_pipe_rx),

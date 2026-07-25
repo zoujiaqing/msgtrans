@@ -1,7 +1,7 @@
 //! Wire-codec robustness: truncated, oversized, and malformed frames must return
 //! an error rather than panic or over-allocate.
 
-use msgtrans::packet::Packet;
+use msgtrans::Packet;
 
 #[test]
 fn from_bytes_rejects_too_short() {

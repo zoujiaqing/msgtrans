@@ -13,9 +13,8 @@
 //!   --port            Server port (default: 8001 for tcp, 8002 for websocket, 8003 for quic)
 
 use msgtrans::{
-    event::{ClientEvent, TransportStatus},
-    protocol::{QuicClientConfig, TcpClientConfig, WebSocketClientConfig},
-    transport::TransportClientBuilder,
+    ClientEvent, QuicClientConfig, TcpClientConfig, TransportClientBuilder, TransportStatus,
+    WebSocketClientConfig,
 };
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;

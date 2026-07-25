@@ -52,9 +52,9 @@ msgtrans = "1.0"
 ```rust,no_run
 use async_trait::async_trait;
 use msgtrans::{
-    transport::{Responder, SessionHandler, SessionSender, TransportServerBuilder},
-    protocol::{TcpServerConfig, WebSocketServerConfig, QuicServerConfig},
-    packet::Packet,
+    Responder, SessionHandler, SessionSender, TransportServerBuilder,
+    TcpServerConfig, WebSocketServerConfig, QuicServerConfig,
+    Packet,
     SessionId,
 };
 use std::sync::Arc;
@@ -104,9 +104,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```rust,no_run
 use msgtrans::{
-    transport::TransportClientBuilder,
-    protocol::TcpClientConfig,
-    event::ClientEvent,
+    TransportClientBuilder,
+    TcpClientConfig,
+    ClientEvent,
 };
 use std::time::Duration;
 
@@ -185,13 +185,13 @@ hides protocol details.
 config passed to `.protocol(..)` changes:
 
 ```rust,no_run
-# use msgtrans::{transport::{TransportServerBuilder, SessionHandler, SessionSender}, protocol::{TcpServerConfig, QuicServerConfig}, packet::Packet, SessionId};
+# use msgtrans::{TransportServerBuilder, SessionHandler, SessionSender, TcpServerConfig, QuicServerConfig, Packet, SessionId};
 # use std::sync::Arc;
 # struct H;
 # #[async_trait::async_trait]
 # impl SessionHandler for H {
 #     async fn on_message(&self, _s: SessionId, _p: Packet, _tx: SessionSender) {}
-#     async fn on_request(&self, _s: SessionId, _p: Packet, _r: msgtrans::transport::Responder) {}
+#     async fn on_request(&self, _s: SessionId, _p: Packet, _r: msgtrans::Responder) {}
 # }
 # async fn f() -> Result<(), Box<dyn std::error::Error>> {
 # let handler = Arc::new(H);
@@ -214,11 +214,11 @@ still exposes an event stream, since a client has exactly one connection.
 
 ```rust
 use msgtrans::{
-    event::ClientEvent,
-    command::ConnectionInfo,
-    error::{TransportError, CloseReason},
-    packet::Packet,
-    transport::{Responder, SessionHandler, SessionSender},
+    ClientEvent,
+    ConnectionInfo,
+    TransportError, CloseReason,
+    Packet,
+    Responder, SessionHandler, SessionSender,
     SessionId,
 };
 
@@ -257,7 +257,7 @@ ClientEvent::Error { error } => { /* ... */ }
 moved into spawned tasks for concurrent, lock-free session access:
 
 ```rust,no_run
-# use msgtrans::{transport::{TransportServer, SessionHandler, SessionSender}, packet::Packet, SessionId};
+# use msgtrans::{TransportServer, SessionHandler, SessionSender, Packet, SessionId};
 # use std::sync::Arc;
 struct Echo { server: TransportServer }
 
@@ -273,7 +273,7 @@ impl SessionHandler for Echo {
         });
     }
 
-    async fn on_request(&self, _s: SessionId, request: Packet, responder: msgtrans::transport::Responder) {
+    async fn on_request(&self, _s: SessionId, request: Packet, responder: msgtrans::Responder) {
         // respond_detached hands the write off; the registry still records
         // the true outcome.
         responder.respond_detached(request.into_payload());
@@ -284,7 +284,7 @@ impl SessionHandler for Echo {
 ### Request / Response
 
 ```rust,no_run
-# use msgtrans::transport::TransportClient;
+# use msgtrans::TransportClient;
 # async fn f(client: &TransportClient) -> Result<(), Box<dyn std::error::Error>> {
 let response = client.request(b"Get user data").await?;
 if let Some(data) = response.data {
@@ -302,7 +302,7 @@ matching config type. See the built-in `adapters::{tcp, websocket, quic}` for
 complete, working references; the outline below shows the shape:
 
 ```rust,ignore
-use msgtrans::{connection::Connection, packet::Packet, error::TransportError};
+use msgtrans::{Connection, Packet, TransportError};
 
 pub struct MyAdapter { /* protocol-specific state */ }
 
@@ -326,9 +326,9 @@ impl Connection for MyAdapter {
 ```rust,no_run
 use async_trait::async_trait;
 use msgtrans::{
-    transport::{Responder, SessionHandler, SessionSender, TransportServerBuilder},
-    protocol::WebSocketServerConfig,
-    packet::Packet,
+    Responder, SessionHandler, SessionSender, TransportServerBuilder,
+    WebSocketServerConfig,
+    Packet,
     SessionId,
 };
 use std::sync::Arc;
@@ -367,8 +367,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```rust,no_run
 use msgtrans::{
-    transport::TransportClientBuilder,
-    protocol::QuicClientConfig,
+    TransportClientBuilder,
+    QuicClientConfig,
 };
 
 #[tokio::main]
@@ -400,7 +400,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### Server Configuration
 
 ```rust,no_run
-use msgtrans::protocol::{TcpServerConfig, WebSocketServerConfig, QuicServerConfig};
+use msgtrans::{TcpServerConfig, WebSocketServerConfig, QuicServerConfig};
 use std::time::Duration;
 
 # fn f() -> Result<(), Box<dyn std::error::Error>> {
@@ -425,7 +425,7 @@ let quic_config = QuicServerConfig::new("0.0.0.0:8003")?
 ### Statistics
 
 ```rust,no_run
-# use msgtrans::transport::TransportServer;
+# use msgtrans::TransportServer;
 # async fn f(server: &TransportServer) {
 let active = server.session_count().await;
 println!("Active sessions: {active}");
@@ -435,7 +435,7 @@ println!("Active sessions: {active}");
 ### Graceful Error Handling
 
 ```rust,no_run
-# use msgtrans::{transport::TransportClient, error::TransportError};
+# use msgtrans::{TransportClient, TransportError};
 # async fn f(client: &mut TransportClient) -> Result<(), Box<dyn std::error::Error>> {
 match client.send("Hello, World!".as_bytes()).await {
     Ok(result) => println!("Sent (ID: {})", result.message_id),
@@ -454,14 +454,14 @@ match client.send("Hello, World!".as_bytes()).await {
 ### Graceful Shutdown
 
 ```rust,no_run
-use msgtrans::{transport::{TransportServerBuilder, SessionHandler, SessionSender}, protocol::TcpServerConfig, packet::Packet, SessionId};
+use msgtrans::{TransportServerBuilder, SessionHandler, SessionSender, TcpServerConfig, Packet, SessionId};
 use std::sync::Arc;
 
 # struct H;
 # #[async_trait::async_trait]
 # impl SessionHandler for H {
 #     async fn on_message(&self, _s: SessionId, _p: Packet, _tx: SessionSender) {}
-#     async fn on_request(&self, _s: SessionId, _p: Packet, _r: msgtrans::transport::Responder) {}
+#     async fn on_request(&self, _s: SessionId, _p: Packet, _r: msgtrans::Responder) {}
 # }
 # async fn f() -> Result<(), Box<dyn std::error::Error>> {
 let server = TransportServerBuilder::new()

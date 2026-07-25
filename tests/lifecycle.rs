@@ -5,13 +5,8 @@
 
 use async_trait::async_trait;
 use msgtrans::{
-    packet::Packet,
-    protocol::{TcpClientConfig, TcpServerConfig},
-    transport::{
-        Responder, SessionHandler, SessionSender, TransportClient, TransportClientBuilder,
-        TransportServer, TransportServerBuilder,
-    },
-    SessionId,
+    Packet, Responder, SessionHandler, SessionId, SessionSender, TcpClientConfig, TcpServerConfig,
+    TransportClient, TransportClientBuilder, TransportServer, TransportServerBuilder,
 };
 use std::{sync::Arc, time::Duration};
 
@@ -218,7 +213,7 @@ async fn deadline_during_close_leaves_no_zombie_session() {
     drop(client);
 }
 
-use msgtrans::protocol::{QuicServerConfig, WebSocketServerConfig};
+use msgtrans::{QuicServerConfig, WebSocketServerConfig};
 
 /// Full acceptance: after clean shutdown the serve() handle has completed and
 /// all three protocol endpoints (TCP/WS/QUIC) can be re-bound immediately by
@@ -762,7 +757,7 @@ async fn handler_panic_releases_session_and_permit() {
     drop(c2);
 }
 
-use msgtrans::protocol::adapter::{DynProtocolConfig, DynServerConfig};
+use msgtrans::spi::{DynProtocolConfig, DynServerConfig};
 
 /// Test-only protocol config: build_server_dyn signals it has ENTERED the
 /// build, then pends forever — the deterministic Phase A window.
@@ -776,7 +771,7 @@ impl DynProtocolConfig for GatedBuildConfig {
     fn protocol_name(&self) -> &'static str {
         "gated-test"
     }
-    fn validate_dyn(&self) -> Result<(), msgtrans::protocol::ConfigError> {
+    fn validate_dyn(&self) -> Result<(), msgtrans::spi::ConfigError> {
         Ok(())
     }
     fn as_any(&self) -> &dyn std::any::Any {
@@ -794,10 +789,7 @@ impl DynServerConfig for GatedBuildConfig {
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
-                    Output = Result<
-                        Box<dyn msgtrans::connection::Server>,
-                        msgtrans::TransportError,
-                    >,
+                    Output = Result<Box<dyn msgtrans::Server>, msgtrans::TransportError>,
                 > + Send
                 + '_,
         >,
@@ -865,7 +857,7 @@ impl DynProtocolConfig for PanicBuildConfig {
     fn protocol_name(&self) -> &'static str {
         "panic-test"
     }
-    fn validate_dyn(&self) -> Result<(), msgtrans::protocol::ConfigError> {
+    fn validate_dyn(&self) -> Result<(), msgtrans::spi::ConfigError> {
         Ok(())
     }
     fn as_any(&self) -> &dyn std::any::Any {
@@ -883,10 +875,7 @@ impl DynServerConfig for PanicBuildConfig {
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
-                    Output = Result<
-                        Box<dyn msgtrans::connection::Server>,
-                        msgtrans::TransportError,
-                    >,
+                    Output = Result<Box<dyn msgtrans::Server>, msgtrans::TransportError>,
                 > + Send
                 + '_,
         >,

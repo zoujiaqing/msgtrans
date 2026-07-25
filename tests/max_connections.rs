@@ -6,13 +6,9 @@
 
 use async_trait::async_trait;
 use msgtrans::{
-    packet::Packet,
-    protocol::{TcpClientConfig, TcpServerConfig, WebSocketClientConfig, WebSocketServerConfig},
-    transport::{
-        Responder, SessionHandler, SessionSender, TransportClient, TransportClientBuilder,
-        TransportServerBuilder,
-    },
-    SessionId,
+    Packet, Responder, SessionHandler, SessionId, SessionSender, TcpClientConfig, TcpServerConfig,
+    TransportClient, TransportClientBuilder, TransportServerBuilder, WebSocketClientConfig,
+    WebSocketServerConfig,
 };
 use std::{sync::Arc, time::Duration};
 

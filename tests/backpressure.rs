@@ -5,10 +5,8 @@
 
 use async_trait::async_trait;
 use msgtrans::{
-    packet::Packet,
-    protocol::{TcpClientConfig, TcpServerConfig},
-    transport::{SessionHandler, SessionSender, TransportClientBuilder, TransportServerBuilder},
-    SessionId,
+    Packet, SessionHandler, SessionId, SessionSender, TcpClientConfig, TcpServerConfig,
+    TransportClientBuilder, TransportServerBuilder,
 };
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -22,7 +20,7 @@ struct SlowCounter {
 
 #[async_trait]
 impl SessionHandler for SlowCounter {
-    async fn on_request(&self, _s: SessionId, _p: Packet, _r: msgtrans::transport::Responder) {}
+    async fn on_request(&self, _s: SessionId, _p: Packet, _r: msgtrans::Responder) {}
 
     async fn on_message(&self, _s: SessionId, _p: Packet, _tx: SessionSender) {
         // Slow enough that the sender vastly outpaces us: queues must fill.
@@ -88,7 +86,7 @@ struct GatedCounter {
 
 #[async_trait]
 impl SessionHandler for GatedCounter {
-    async fn on_request(&self, _s: SessionId, _p: Packet, _r: msgtrans::transport::Responder) {}
+    async fn on_request(&self, _s: SessionId, _p: Packet, _r: msgtrans::Responder) {}
 
     async fn on_message(&self, _s: SessionId, p: Packet, _tx: SessionSender) {
         while !self.open.load(Ordering::SeqCst) {

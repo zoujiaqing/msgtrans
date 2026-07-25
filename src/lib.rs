@@ -22,24 +22,21 @@
 #![allow(async_fn_in_trait)]
 #![allow(non_upper_case_globals)]
 
-/// Transport layer: client, server, session actors and request lifecycle.
-pub mod transport;
-
-// Protocol adapters
+// Implementation modules are crate-private: the public API is exactly the
+// crate root re-exports below plus `msgtrans::spi`. Reaching internal types
+// through deep paths (`msgtrans::transport::Transport`, `msgtrans::event::*`,
+// …) does not resolve.
 pub(crate) mod adapters;
+pub(crate) mod command;
+pub(crate) mod connection;
+pub(crate) mod error;
+pub(crate) mod event;
+pub(crate) mod packet;
+pub(crate) mod protocol;
+pub(crate) mod stream;
+pub(crate) mod transport;
 
-// Protocol abstraction
-pub mod protocol;
-
-// Core types
-pub mod command;
-pub mod error;
-pub mod event;
-pub mod packet;
-pub mod stream;
-
-// New modules
-pub mod connection;
+/// Stable extension SPI for implementing a custom transport protocol.
 pub mod spi;
 
 // Type definitions
@@ -85,21 +82,22 @@ impl From<SessionId> for u64 {
 }
 
 // Re-export core types
-pub use command::ConnectionInfo;
+pub use command::{ConnectionInfo, ConnectionState};
 pub use error::{CloseReason, TransportError};
-#[cfg(feature = "quic")]
-pub use event::QuicEvent;
-#[cfg(feature = "tcp")]
-pub use event::TcpEvent;
-#[cfg(feature = "websocket")]
-pub use event::WebSocketEvent;
-pub use event::{ClientEvent, ClientMessage, ClientRequest, RespondOutcome, TransportEvent};
-pub use packet::{FramePolicy, Packet, PacketError, PacketType};
+pub use event::{
+    ClientEvent, ClientMessage, ClientRequest, RespondOutcome, TransportEvent, TransportResult,
+    TransportStatus,
+};
+pub use packet::{
+    CompressionType, DecodeLimits, FramePolicy, Packet, PacketError, PacketType, ReservedFlags,
+    DEFAULT_MAX_FRAME_SIZE,
+};
 pub use stream::ClientEvents;
 
 pub use transport::{
-    RetryConfig, ShutdownReport, Transport, TransportClient, TransportClientBuilder,
-    TransportConfig, TransportServer, TransportServerBuilder,
+    Responder, RetryConfig, SessionHandler, SessionSender, ShutdownReport, TransportClient,
+    TransportClientBuilder, TransportConfig, TransportOptions, TransportServer,
+    TransportServerBuilder,
 };
 
 pub use protocol::{ClientConfig, ServerConfig};

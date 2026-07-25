@@ -16,10 +16,8 @@
 
 use async_trait::async_trait;
 use msgtrans::{
-    packet::Packet,
-    protocol::WebSocketServerConfig,
-    transport::{Responder, SessionHandler, SessionSender, TransportServerBuilder},
-    SessionId,
+    Packet, Responder, SessionHandler, SessionId, SessionSender, TransportServerBuilder,
+    WebSocketServerConfig,
 };
 use std::{env, sync::Arc};
 

@@ -8,7 +8,7 @@
 //! Spec: `docs/WIRE_FORMAT.md` §15 (batch 1: 01-08, uncompressed).
 //! Regenerate via: `cargo run --example regenerate_fixtures`.
 
-use msgtrans::packet::{CompressionType, Packet, PacketType, ReservedFlags};
+use msgtrans::{CompressionType, Packet, PacketType, ReservedFlags};
 use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};

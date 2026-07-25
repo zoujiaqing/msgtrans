@@ -14,12 +14,8 @@
 
 use async_trait::async_trait;
 use msgtrans::{
-    packet::Packet,
-    protocol::QuicServerConfig,
-    protocol::TcpServerConfig,
-    protocol::WebSocketServerConfig,
-    transport::{Responder, SessionHandler, SessionSender, TransportServerBuilder},
-    SessionId,
+    Packet, QuicServerConfig, Responder, SessionHandler, SessionId, SessionSender, TcpServerConfig,
+    TransportServerBuilder, WebSocketServerConfig,
 };
 use std::sync::Arc;
 
@@ -39,11 +35,11 @@ impl SessionHandler for EchoHandler {
         let _ = responder.respond(request.into_payload()).await;
     }
 
-    async fn on_connected(&self, session_id: SessionId, _info: msgtrans::command::ConnectionInfo) {
+    async fn on_connected(&self, session_id: SessionId, _info: msgtrans::ConnectionInfo) {
         tracing::debug!("[CONNECT] Session {} connected", session_id);
     }
 
-    async fn on_disconnected(&self, session_id: SessionId, _reason: msgtrans::error::CloseReason) {
+    async fn on_disconnected(&self, session_id: SessionId, _reason: msgtrans::CloseReason) {
         tracing::debug!("[DISCONNECT] Session {} disconnected", session_id);
     }
 }

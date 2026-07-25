@@ -1,4 +1,4 @@
-use msgtrans::{event::ClientEvent, protocol::QuicClientConfig, transport::TransportClientBuilder};
+use msgtrans::{ClientEvent, QuicClientConfig, TransportClientBuilder};
 /// QUIC Echo client - simplified API demonstration
 /// [TARGET] Demonstrates simplified byte API, hiding all Packet complexity
 ///

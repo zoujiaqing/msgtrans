@@ -11,7 +11,8 @@
 pub use crate::connection::{Connection, Server, WriteCompletion};
 pub use crate::packet::Packet;
 pub use crate::protocol::adapter::{
-    ClientConfig, ConfigError, DynClientConfig, DynServerConfig, ProtocolConfig, ServerConfig,
+    ClientConfig, ConfigError, DynClientConfig, DynProtocolConfig, DynServerConfig, ProtocolConfig,
+    ServerConfig,
 };
 pub use crate::transport::limits::ConnectionLimits;
 pub use crate::{CloseReason, ConnectionInfo, SessionId, TransportError, TransportEvent};

@@ -9,7 +9,7 @@
 use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use msgtrans::packet::Packet;
+use msgtrans::Packet;
 
 const SIZES: &[usize] = &[16, 256, 4096, 65536];
 

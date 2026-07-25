@@ -17,7 +17,7 @@ use tokio_tungstenite::{
 
 use crate::{
     command::ConnectionState, connection::Connection, error::TransportError, event::TransportEvent,
-    packet::Packet, protocol::AdapterStats, ConnectionInfo, SessionId,
+    packet::Packet, ConnectionInfo, SessionId,
 };
 
 /// WebSocket message processing result
@@ -220,7 +220,6 @@ pub struct WebSocketAdapter<C> {
     config: C,
     /// Statistics information (diagnostics; not on the hot path).
     #[allow(dead_code)]
-    stats: AdapterStats,
     /// Connection information
     connection_info: ConnectionInfo,
     /// Send queue
@@ -284,7 +283,6 @@ impl<C> WebSocketAdapter<C> {
         Ok(Self {
             state,
             config,
-            stats: AdapterStats::new(),
             connection_info,
             send_queue: send_queue_tx,
             event_pipe_rx: Some(event_pipe_rx),

@@ -7,13 +7,9 @@
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use msgtrans::{
-    packet::Packet,
-    protocol::{QuicServerConfig, TcpServerConfig, WebSocketClientConfig, WebSocketServerConfig},
-    transport::{
-        Responder, SessionHandler, SessionSender, TransportClientBuilder, TransportServer,
-        TransportServerBuilder,
-    },
-    ClientTls, SessionId,
+    ClientTls, Packet, QuicServerConfig, Responder, SessionHandler, SessionId, SessionSender,
+    TcpServerConfig, TransportClientBuilder, TransportServer, TransportServerBuilder,
+    WebSocketClientConfig, WebSocketServerConfig,
 };
 use std::{sync::Arc, time::Duration};
 
@@ -431,7 +427,7 @@ async fn quic_custom_transport_parameters_smoke() {
 
     let mut client = TransportClientBuilder::new()
         .protocol(
-            msgtrans::protocol::QuicClientConfig::new(addr)
+            msgtrans::QuicClientConfig::new(addr)
                 .expect("cfg")
                 .verify_certificate(false),
         )

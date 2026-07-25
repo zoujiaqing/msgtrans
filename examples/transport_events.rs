@@ -1,14 +1,7 @@
 use async_trait::async_trait;
 use msgtrans::{
-    command::ConnectionInfo,
-    event::ClientEvent,
-    packet::Packet,
-    protocol::{TcpClientConfig, TcpServerConfig},
-    transport::{
-        SessionHandler, SessionSender, TransportClientBuilder, TransportServer,
-        TransportServerBuilder,
-    },
-    SessionId,
+    ClientEvent, ConnectionInfo, Packet, SessionHandler, SessionId, SessionSender, TcpClientConfig,
+    TcpServerConfig, TransportClientBuilder, TransportServer, TransportServerBuilder,
 };
 /// Specialized program for debugging transport event streams
 ///
@@ -28,7 +21,7 @@ impl SessionHandler for DebugHandler {
         &self,
         session_id: SessionId,
         request: Packet,
-        responder: msgtrans::transport::Responder,
+        responder: msgtrans::Responder,
     ) {
         println!(
             "[REQUEST] session={} id={} ({} bytes)",

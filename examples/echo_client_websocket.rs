@@ -1,6 +1,4 @@
-use msgtrans::{
-    event::ClientEvent, protocol::WebSocketClientConfig, transport::TransportClientBuilder,
-};
+use msgtrans::{ClientEvent, TransportClientBuilder, WebSocketClientConfig};
 /// WebSocket Echo client - simplified API demonstration
 /// [TARGET] Demonstrates simplified byte API, hiding all Packet complexity
 use std::time::Duration;

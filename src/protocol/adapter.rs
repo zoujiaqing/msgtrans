@@ -6,59 +6,6 @@ use crate::protocol::{TcpClientConfig, TcpServerConfig};
 #[cfg(feature = "websocket")]
 use crate::protocol::{WebSocketClientConfig, WebSocketServerConfig};
 
-/// Adapter statistics information
-#[derive(Debug, Clone)]
-pub struct AdapterStats {
-    /// Number of packets sent
-    pub packets_sent: u64,
-    /// Number of packets received
-    pub packets_received: u64,
-    /// Number of bytes sent
-    pub bytes_sent: u64,
-    /// Number of bytes received
-    pub bytes_received: u64,
-    /// Error count
-    pub errors: u64,
-    /// Last activity time
-    pub last_activity: std::time::SystemTime,
-}
-
-impl Default for AdapterStats {
-    fn default() -> Self {
-        Self {
-            packets_sent: 0,
-            packets_received: 0,
-            bytes_sent: 0,
-            bytes_received: 0,
-            errors: 0,
-            last_activity: std::time::SystemTime::now(),
-        }
-    }
-}
-
-impl AdapterStats {
-    pub fn new() -> Self {
-        Default::default()
-    }
-
-    pub fn record_packet_sent(&mut self, size: usize) {
-        self.packets_sent += 1;
-        self.bytes_sent += size as u64;
-        self.last_activity = std::time::SystemTime::now();
-    }
-
-    pub fn record_packet_received(&mut self, size: usize) {
-        self.packets_received += 1;
-        self.bytes_received += size as u64;
-        self.last_activity = std::time::SystemTime::now();
-    }
-
-    pub fn record_error(&mut self) {
-        self.errors += 1;
-        self.last_activity = std::time::SystemTime::now();
-    }
-}
-
 /// Protocol configuration trait
 pub trait ProtocolConfig: Send + Sync + Clone + std::fmt::Debug + 'static {
     /// Validate if configuration is valid

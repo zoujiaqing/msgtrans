@@ -321,11 +321,6 @@ impl Transport {
         conn.close().await
     }
 
-    /// Check if messages should be ignored for this session
-    pub async fn should_ignore_messages(&self, session_id: SessionId) -> bool {
-        self.state_manager.should_ignore_messages(session_id).await
-    }
-
     /// [TARGET] Core method: check connection status
     pub async fn is_connected(&self) -> bool {
         self.slot.lock().await.is_some()
@@ -621,17 +616,11 @@ impl Transport {
                             packet.header.packet_type
                         );
 
-                        // [TARGET] Unpack data
+                        // Validate the payload can be unpacked; forward the raw
+                        // packet on success (the client event decodes it), or a
+                        // transport error on an undecodable body.
                         match self.decode_payload(&packet) {
-                            Ok(data) => {
-                                // [TARGET] Create user-friendly Message
-                                let _message = crate::event::Message {
-                                    peer: Some(source_session),
-                                    data,
-                                    message_id: packet.header.message_id,
-                                };
-
-                                // [TARGET] Send user-friendly message event (maintain backward compatibility)
+                            Ok(_data) => {
                                 self.forward_client_event(
                                     source_session,
                                     crate::event::TransportEvent::MessageReceived(packet),

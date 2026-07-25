@@ -24,11 +24,8 @@
 //! `MSGTRANS_E2E_READY ws://127.0.0.1:<ws_port>`
 use async_trait::async_trait;
 use msgtrans::{
-    command::ConnectionInfo,
-    packet::Packet,
-    protocol::{QuicServerConfig, TcpServerConfig, WebSocketServerConfig},
-    transport::{SessionHandler, SessionSender, TransportServer, TransportServerBuilder},
-    SessionId,
+    ConnectionInfo, Packet, QuicServerConfig, SessionHandler, SessionId, SessionSender,
+    TcpServerConfig, TransportServer, TransportServerBuilder, WebSocketServerConfig,
 };
 use std::{env, sync::Arc, sync::OnceLock};
 
@@ -120,7 +117,7 @@ impl SessionHandler for EchoHandler {
         &self,
         session_id: SessionId,
         request: Packet,
-        responder: msgtrans::transport::Responder,
+        responder: msgtrans::Responder,
     ) {
         let biz_type = request.biz_type();
         if self.passive {

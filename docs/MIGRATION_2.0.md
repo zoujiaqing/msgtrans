@@ -143,16 +143,31 @@ The 1.x `verify_tls` flag was never wired (the client could not establish TLS).
 
 ## 8. Sealed implementation modules
 
-The `transport::*` and `adapters::*` implementation submodules are now
-`pub(crate)`. Reach everything through the crate root: `msgtrans::Packet`, not
-`msgtrans::packet::Packet` deep paths into internals like
-`msgtrans::transport::request_registry::RequestState` no longer resolve (they
-were never meant to be public). The request-lifecycle state machine and the
-session-actor internals are fully crate-private.
+**Every** implementation module is now `pub(crate)`: `transport`, `protocol`,
+`event`, `packet`, `command`, `connection`, `stream`, `error`, `adapters`.
+Reach every public type through the crate root — `msgtrans::Packet`,
+`msgtrans::ClientEvent`, `msgtrans::Responder` — not the old deep paths
+(`msgtrans::packet::Packet`, `msgtrans::transport::Responder`,
+`msgtrans::event::ClientEvent`), which no longer resolve. The only public module
+is `msgtrans::spi` (the protocol-extension SPI). The internal `Transport`
+per-connection type, `TaggedClientEvent`, and `GlobalConfig` are no longer
+reachable at all.
+
+The frozen surface is captured in `public-api.txt` and enforced by the CI
+`public-api` job, so it can no longer drift silently.
 
 ## 9. Removed public machinery
 
-The internal performance types are no longer re-exported at the crate root:
-`LockFreeCounter/HashMap/Queue`, `MemoryPool`/`MemoryStats`, `ProtocolStats`,
-`RequestManager`, `FlumePoweredProtocolAdapter`. They were implementation
-detail, not API.
+The following were implementation detail or dead tracks, not API, and are gone:
+
+- Performance internals: `LockFreeCounter/HashMap/Queue`, `MemoryPool`/
+  `MemoryStats`, `ProtocolStats`, `RequestManager`, `FlumePoweredProtocolAdapter`.
+- The legacy command track: `TransportCommand`, `ConfigUpdate`, `TransportStats`,
+  `ProtocolCommand`, `CommandBuilder`, `CommandExecutor`.
+- Orphaned event machinery with no producer: the `TcpEvent`/`WebSocketEvent`/
+  `QuicEvent` enums, the `ProtocolEvent` trait, and `ConnectionEvent`. Client
+  code observes `ClientEvent`; internal plumbing uses `TransportEvent`.
+- Unread instrumentation: `AdapterStats`, `ErrorStats`, `TransportError::severity`
+  / `ErrorSeverity`, and the read-buffer pool's per-op statistics.
+- The `MessageIdManager` and the old cloneable `Message` struct (superseded by
+  `ClientMessage`/`ClientRequest`).

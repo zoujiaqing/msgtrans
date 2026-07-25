@@ -1,5 +1,4 @@
 use crate::{
-    command::TransportStats,
     transport::{
         config::TransportConfig,
         connection_state::ConnectionStateManager,
@@ -64,7 +63,6 @@ pub struct TransportServer {
     transports: Arc<LockFreeHashMap<SessionId, Arc<crate::transport::transport::Transport>>>,
     session_handles: Arc<LockFreeHashMap<SessionId, SessionHandle>>,
     session_id_generator: Arc<std::sync::atomic::AtomicU64>,
-    stats: Arc<LockFreeHashMap<SessionId, TransportStats>>,
     protocol_configs:
         std::collections::HashMap<String, Box<dyn crate::protocol::adapter::DynServerConfig>>,
     state_manager: ConnectionStateManager,
@@ -147,7 +145,6 @@ impl TransportServer {
             transports: Arc::new(LockFreeHashMap::new()),
             session_handles: Arc::new(LockFreeHashMap::new()),
             session_id_generator: Arc::new(std::sync::atomic::AtomicU64::new(1)),
-            stats: Arc::new(LockFreeHashMap::new()),
             protocol_configs,
             state_manager: ConnectionStateManager::new(),
             request_registry: Arc::new(
@@ -508,16 +505,6 @@ impl TransportServer {
             let _ = transport.disconnect().await;
             return session_id;
         }
-        if let Err(e) = self.stats.insert(session_id, TransportStats::new()) {
-            tracing::error!(
-                "[ERROR] Failed to register stats for session {}: {:?}",
-                session_id,
-                e
-            );
-            let _ = self.transports.remove(&session_id);
-            let _ = transport.disconnect().await;
-            return session_id;
-        }
 
         // Register connection state
         self.state_manager.add_connection(session_id);
@@ -694,13 +681,6 @@ impl TransportServer {
         if let Err(e) = self.session_handles.remove(&session_id) {
             tracing::warn!(
                 "[WARN] Failed to remove session actor handle for session {}: {:?}",
-                session_id,
-                e
-            );
-        }
-        if let Err(e) = self.stats.remove(&session_id) {
-            tracing::warn!(
-                "[WARN] Failed to remove stats for session {}: {:?}",
                 session_id,
                 e
             );
@@ -1610,7 +1590,6 @@ impl Clone for TransportServer {
             context: self.context.clone(),
             transports: self.transports.clone(),
             session_id_generator: self.session_id_generator.clone(),
-            stats: self.stats.clone(),
             protocol_configs: cloned_configs,
             state_manager: self.state_manager.clone(),
             request_registry: self.request_registry.clone(),

@@ -6,7 +6,6 @@ pub mod client_config;
 pub mod server_config;
 
 // Re-export core types
-pub use adapter::AdapterStats;
 // Re-export configuration types
 #[cfg(feature = "quic")]
 pub use client_config::QuicClientConfig;
@@ -24,7 +23,9 @@ pub use server_config::TcpServerConfig;
 pub use server_config::WebSocketServerConfig;
 
 // Re-export adapter configuration
-pub use adapter::{
-    ClientConfig, ConfigError, DynClientConfig, DynProtocolConfig, DynServerConfig, ProtocolConfig,
-    ServerConfig,
-};
+pub use adapter::{ClientConfig, ServerConfig};
+// `ProtocolConfig`/`ConfigError` are only referenced by the protocol adapters
+// and their configs, all of which are feature-gated; a no-protocol build uses
+// neither. (The SPI re-exports them from `adapter` directly.)
+#[cfg(any(feature = "tcp", feature = "websocket", feature = "quic"))]
+pub use adapter::{ConfigError, ProtocolConfig};
