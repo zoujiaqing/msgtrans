@@ -134,18 +134,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ClientEvent::Connected { .. } => {
                     println!("[CONNECT] Client connected successfully");
                 }
-                ClientEvent::MessageReceived(context) => {
+                ClientEvent::Message(msg) => {
                     println!(
                         "[RECV] Client received message (ID: {}): {}",
-                        context.message_id,
-                        context.as_text_lossy()
+                        msg.message_id(),
+                        msg.as_text_lossy()
                     );
-
-                    if context.is_request() {
-                        println!("[SEND] Responding to server request...");
-                        context.respond_detached(b"Client response!".to_vec());
-                        println!("[SUCCESS] Server request responded");
-                    }
+                }
+                ClientEvent::Request(req) => {
+                    println!(
+                        "[RECV] Client received request (ID: {}): {}",
+                        req.message_id(),
+                        req.as_text_lossy()
+                    );
+                    println!("[SEND] Responding to server request...");
+                    req.respond_detached(b"Client response!".to_vec());
+                    println!("[SUCCESS] Server request responded");
                 }
                 ClientEvent::MessageSent { message_id } => {
                     println!("[SEND] Client message send confirmation: ID {}", message_id);

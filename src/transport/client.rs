@@ -644,7 +644,7 @@ impl TransportClient {
                                 .upgrade()
                                 .map(|t| t.request_registry().clone());
 
-                            let context = crate::event::TransportContext::new_request_with_registry(
+                            let context = crate::event::ClientRequest::new(
                                 Some(source_session),
                                 message_id,
                                 biz_type,
@@ -703,7 +703,7 @@ impl TransportClient {
                                 request_token,
                             );
 
-                            let client_event = crate::event::ClientEvent::MessageReceived(context);
+                            let client_event = crate::event::ClientEvent::Request(context);
                             tracing::debug!(
                                 "[SEND] TransportClient forwarding ClientEvent (Request): {:?}",
                                 client_event

@@ -11,8 +11,11 @@ protocol configs.
 - `SessionId`, `PacketId`, `Result<T>` (alias for `Result<T, TransportError>`)
 - `Packet`, `PacketType`, `PacketError`, `FramePolicy`
 - `TransportError`, `CloseReason`
-- `ConnectionInfo`, `TransportCommand`, `TransportStats`
-- `ClientEvent`, `TransportEvent`, `RespondOutcome`
+- `ConnectionInfo`
+- `ClientEvent` (`Message(ClientMessage)` | `Request(ClientRequest)` |
+  `Connected`/`MessageSent`/`Disconnected`/`Error`), `ClientMessage` (one-way,
+  cloneable data), `ClientRequest` (consuming; `respond`/`respond_detached`),
+  `TransportEvent`, `RespondOutcome`
 - `TcpEvent` *(feature = "tcp")*, `WebSocketEvent` *(feature = "websocket")*,
   `QuicEvent` *(feature = "quic")*
 - `ClientEvents`
@@ -74,13 +77,20 @@ protocol configs.
   `WS_SUBPROTOCOL_MSGTRANS`
 - *(quic)* `QuicServerConfig`, `QuicClientConfig`
 
-## Extension SPI (implement a new protocol)
+## Extension SPI — `msgtrans::spi` (implement a new protocol)
+
+The whole surface an out-of-crate protocol needs, and nothing that leaks an
+internal type. This is a *separate module* (`msgtrans::spi`), not the crate root.
 
 - `Connection` (single send method: `send_with_completion(Packet,
-  WriteCompletion)`), `WriteCompletion`, `Server`, `ConnectionFactory`
+  WriteCompletion)`), `WriteCompletion`, `Server`
+- `EventSink` / `ConnectionEvents` (public wrappers over the internal bounded
+  event backbone) + `event_channel(capacity)`; the adapter keeps the `EventSink`
+  and returns the `ConnectionEvents` from `Connection::take_event_pipe`
 - `ServerConfig` / `ClientConfig` (+ object-safe `DynServerConfig` /
-  `DynClientConfig`), taking `ConnectionLimits`
-- `TransportConfig`, `TransportContext`, `Transport`
+  `DynClientConfig`), `ProtocolConfig`, `ConfigError`, taking `ConnectionLimits`
+- Re-exported building blocks: `Packet`, `TransportEvent`, `SessionId`,
+  `ConnectionInfo`, `CloseReason`, `TransportError`, `ConnectionLimits`
 
 ## Cargo features
 

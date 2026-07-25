@@ -55,21 +55,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     info!("[CONNECT] Connection event: {:?}", info);
                 }
 
-                ClientEvent::MessageReceived(context) => {
-                    // [TARGET] Unified context handles all message types
+                ClientEvent::Message(msg) => {
+                    // One-way message: pure data, no response obligation.
                     info!(
                         "[RECV] Message received (ID: {}): {}",
-                        context.message_id,
-                        context.as_text_lossy()
+                        msg.message_id(),
+                        msg.as_text_lossy()
                     );
+                }
 
-                    // If it's a request, respond
-                    if context.is_request() {
-                        let message_id = context.message_id;
-                        info!("[SEND] Responding to server request...");
-                        context.respond_detached(b"Hello from client response!".to_vec());
-                        info!("[SUCCESS] Server request responded (ID: {})", message_id);
-                    }
+                ClientEvent::Request(req) => {
+                    // Server-initiated request: answer via the consuming request.
+                    let message_id = req.message_id();
+                    info!(
+                        "[RECV] Request received (ID: {}): {}",
+                        message_id,
+                        req.as_text_lossy()
+                    );
+                    info!("[SEND] Responding to server request...");
+                    req.respond_detached(b"Hello from client response!".to_vec());
+                    info!("[SUCCESS] Server request responded (ID: {})", message_id);
                 }
 
                 ClientEvent::MessageSent { message_id } => {

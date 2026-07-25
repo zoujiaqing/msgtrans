@@ -65,21 +65,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     tracing::info!("[CLOSE] Connection closed: {:?}", reason);
                     break;
                 }
-                ClientEvent::MessageReceived(context) => {
-                    let content = String::from_utf8_lossy(&context.data);
+                ClientEvent::Message(msg) => {
                     tracing::info!(
                         "[RECV] Message received (ID: {}): {}",
-                        context.message_id,
-                        content
+                        msg.message_id(),
+                        msg.as_text_lossy()
                     );
-
-                    // If it's a request, respond
-                    if context.is_request() {
-                        let message_id = context.message_id;
-                        tracing::info!("[SEND] Responding to server request...");
-                        context.respond_detached(b"Hello from WebSocket client response!".to_vec());
-                        tracing::info!("[SUCCESS] Server request responded (ID: {})", message_id);
-                    }
+                }
+                ClientEvent::Request(req) => {
+                    let message_id = req.message_id();
+                    tracing::info!(
+                        "[RECV] Request received (ID: {}): {}",
+                        message_id,
+                        req.as_text_lossy()
+                    );
+                    tracing::info!("[SEND] Responding to server request...");
+                    req.respond_detached(b"Hello from WebSocket client response!".to_vec());
+                    tracing::info!("[SUCCESS] Server request responded (ID: {})", message_id);
                 }
                 ClientEvent::MessageSent { message_id } => {
                     tracing::info!("[SUCCESS] Message sent successfully (ID: {})", message_id);

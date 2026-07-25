@@ -5,7 +5,6 @@ use crate::transport::request_registry::{MarkResult, RequestRegistry};
 use crate::{CloseReason, PacketId, SessionId};
 use bytes::Bytes;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -327,16 +326,21 @@ impl Message {
     }
 }
 
-/// [SIMPLE] User-friendly client events - completely hide Packet complexity
-#[derive(Debug, Clone)]
+/// [SIMPLE] User-friendly client events - completely hide Packet complexity.
+///
+/// Not `Clone`: `Request` carries a consuming responder that must be answered
+/// exactly once.
+#[derive(Debug)]
 pub enum ClientEvent {
     /// Connection established
     Connected { info: ConnectionInfo },
     /// Connection disconnected
     Disconnected { reason: CloseReason },
 
-    /// [SIMPLE] Message received (unified context, contains all information)
-    MessageReceived(TransportContext),
+    /// A one-way message was received.
+    Message(ClientMessage),
+    /// A request was received; answer it via the consuming responder.
+    Request(ClientRequest),
 
     /// Message send confirmation
     MessageSent { message_id: u32 },
@@ -360,19 +364,19 @@ impl ClientEvent {
                         None
                     }
                     _ => {
-                        // OneWay and Response packets are handled normally
-                        let context = TransportContext::new_oneway(
+                        // OneWay and Response packets are plain messages.
+                        let ext = if packet.ext_header.is_empty() {
+                            None
+                        } else {
+                            Some(packet.ext_header.to_vec())
+                        };
+                        Some(ClientEvent::Message(ClientMessage::new(
                             None,
                             packet.header.message_id,
                             packet.header.biz_type,
-                            if packet.ext_header.is_empty() {
-                                None
-                            } else {
-                                Some(packet.ext_header.to_vec())
-                            },
+                            ext,
                             packet.payload.clone(),
-                        );
-                        Some(ClientEvent::MessageReceived(context))
+                        )))
                     }
                 }
             }
@@ -397,7 +401,7 @@ impl ClientEvent {
     pub fn is_data_event(&self) -> bool {
         matches!(
             self,
-            ClientEvent::MessageReceived(..) | ClientEvent::MessageSent { .. }
+            ClientEvent::Message(..) | ClientEvent::Request(..) | ClientEvent::MessageSent { .. }
         )
     }
 
@@ -407,45 +411,81 @@ impl ClientEvent {
     }
 }
 
-/// [TARGET] Unified transport context - used for all received messages
-pub struct TransportContext {
-    /// Message source session ID (None for client, Some for server)
-    pub peer: Option<SessionId>,
-    /// System-assigned message ID
-    pub message_id: u32,
-    /// Business type
-    pub biz_type: u8,
-    /// Extension header content
-    pub ext_header: Option<Vec<u8>>,
-    /// Decompressed raw data
-    pub data: Bytes,
-    /// Reception timestamp
-    pub timestamp: Instant,
-    /// Message type (internal use)
-    kind: TransportContextKind,
-}
-
 /// What a respond call actually did.
 ///
 /// `Ok(Written)` is the only value that means "the response bytes reached the
 /// socket". Duplicate/late/unknown responds report `AlreadyHandled` instead of
-/// a fake success, and real failures are `Err` — the three cases are never
-/// conflated.
+/// a fake success, and real failures are `Err` — never conflated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RespondOutcome {
     /// The response was written to the transport (write-confirmed).
     Written,
-    /// Nothing was written: another responder already claimed this request,
-    /// or the request is no longer tracked (late/unknown). Idempotent-skip.
+    /// Nothing was written: another responder already claimed this request, or
+    /// the request is no longer tracked (late/unknown). Idempotent-skip.
     AlreadyHandled,
 }
 
-/// Responder that sends a response and reports the send result. Receives the
-/// respond claim (when the request is registry-tracked) so completion
-/// ownership can travel with the queued write — the claim resolves the
-/// registry state no matter where the send is cancelled or fails. Returns a
-/// boxed future so `respond` can spawn it fire-and-forget while
-/// `respond_checked` can await the outcome.
+/// A one-way message delivered to the client. Pure data — cloneable, with no
+/// response obligation (the split mirrors the server's on_message/on_request).
+#[derive(Debug, Clone)]
+pub struct ClientMessage {
+    peer: Option<SessionId>,
+    message_id: u32,
+    biz_type: u8,
+    ext_header: Option<Vec<u8>>,
+    data: Bytes,
+}
+
+impl ClientMessage {
+    pub(crate) fn new(
+        peer: Option<SessionId>,
+        message_id: u32,
+        biz_type: u8,
+        ext_header: Option<Vec<u8>>,
+        data: impl Into<Bytes>,
+    ) -> Self {
+        Self {
+            peer,
+            message_id,
+            biz_type,
+            ext_header,
+            data: data.into(),
+        }
+    }
+
+    /// Source session id (server-side); `None` on the client.
+    pub fn peer(&self) -> Option<SessionId> {
+        self.peer
+    }
+    /// Message id.
+    pub fn message_id(&self) -> u32 {
+        self.message_id
+    }
+    /// Business type.
+    pub fn biz_type(&self) -> u8 {
+        self.biz_type
+    }
+    /// Extension header, if any.
+    pub fn ext_header(&self) -> Option<&[u8]> {
+        self.ext_header.as_deref()
+    }
+    /// Payload bytes.
+    pub fn payload(&self) -> &Bytes {
+        &self.data
+    }
+    /// Take ownership of the payload.
+    pub fn into_payload(self) -> Bytes {
+        self.data
+    }
+    /// Payload as a lossy UTF-8 string.
+    pub fn as_text_lossy(&self) -> String {
+        String::from_utf8_lossy(&self.data).to_string()
+    }
+}
+
+/// Responder closure: sends a response and reports the real write result,
+/// receiving the respond claim so completion ownership travels with the queued
+/// write. Boxed so `respond` can await it and `respond_detached` can spawn it.
 type ResponderFn = Arc<
     dyn Fn(
             Bytes,
@@ -455,51 +495,33 @@ type ResponderFn = Arc<
         + Sync,
 >;
 
-/// Message type enumeration
-enum TransportContextKind {
-    /// One-way message (no response needed)
-    OneWay,
-    /// Request message (requires response)
-    Request {
-        responder: ResponderFn,
-        responded: Arc<AtomicBool>,
-        is_primary: bool, // Mark whether it's the primary instance
-        request_registry: Option<Arc<RequestRegistry>>,
-        /// Unforgeable registration token: the ONLY key the respond path may
-        /// use against the registry (ABA defense via its generation).
-        token: Option<crate::transport::request_registry::RequestToken>,
-    },
+/// A request delivered to the client that carries the obligation to answer.
+///
+/// NOT `Clone` and consuming, exactly like the server-side `Responder`:
+/// `respond(self)`/`respond_detached(self)` answer it exactly once, enforced by
+/// the type system (a second response is a compile error, not a runtime dedup).
+/// Dropping it without responding leaves the request to the peer's own timeout.
+pub struct ClientRequest {
+    peer: Option<SessionId>,
+    message_id: u32,
+    biz_type: u8,
+    ext_header: Option<Vec<u8>>,
+    data: Bytes,
+    responder: ResponderFn,
+    registry: Option<Arc<RequestRegistry>>,
+    token: Option<crate::transport::request_registry::RequestToken>,
 }
 
-impl TransportContext {
-    /// Create one-way message context
-    pub fn new_oneway(
-        peer: Option<SessionId>,
-        message_id: u32,
-        biz_type: u8,
-        ext_header: Option<Vec<u8>>,
-        data: impl Into<Bytes>,
-    ) -> Self {
-        Self {
-            peer,
-            message_id,
-            biz_type,
-            ext_header,
-            data: data.into(),
-            timestamp: Instant::now(),
-            kind: TransportContextKind::OneWay,
-        }
-    }
-
+impl ClientRequest {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new_request_with_registry(
+    pub(crate) fn new(
         peer: Option<SessionId>,
         message_id: u32,
         biz_type: u8,
         ext_header: Option<Vec<u8>>,
         data: impl Into<Bytes>,
         responder: ResponderFn,
-        request_registry: Option<Arc<RequestRegistry>>,
+        registry: Option<Arc<RequestRegistry>>,
         token: Option<crate::transport::request_registry::RequestToken>,
     ) -> Self {
         Self {
@@ -508,90 +530,71 @@ impl TransportContext {
             biz_type,
             ext_header,
             data: data.into(),
-            timestamp: Instant::now(),
-            kind: TransportContextKind::Request {
-                responder,
-                responded: Arc::new(AtomicBool::new(false)),
-                is_primary: false, // Default not primary instance
-                request_registry,
-                token,
-            },
+            responder,
+            registry,
+            token,
         }
     }
 
-    /// Check if it's a request type
-    pub fn is_request(&self) -> bool {
-        matches!(self.kind, TransportContextKind::Request { .. })
+    /// Source session id (server-side); `None` on the client.
+    pub fn peer(&self) -> Option<SessionId> {
+        self.peer
     }
-
-    /// Convert data to string (lossy conversion)
+    /// Message id.
+    pub fn message_id(&self) -> u32 {
+        self.message_id
+    }
+    /// Business type.
+    pub fn biz_type(&self) -> u8 {
+        self.biz_type
+    }
+    /// Extension header, if any.
+    pub fn ext_header(&self) -> Option<&[u8]> {
+        self.ext_header.as_deref()
+    }
+    /// Request payload bytes.
+    pub fn payload(&self) -> &Bytes {
+        &self.data
+    }
+    /// Take ownership of the request payload.
+    pub fn into_payload(self) -> Bytes {
+        self.data
+    }
+    /// Request payload as a lossy UTF-8 string.
     pub fn as_text_lossy(&self) -> String {
         String::from_utf8_lossy(&self.data).to_string()
     }
 
-    /// Respond, write-confirmed. `Ok(RespondOutcome::Written)` means the
-    /// response bytes reached the socket; duplicate/late/unknown requests
-    /// return `Ok(RespondOutcome::AlreadyHandled)` — never a fake `Written`.
-    /// One-way messages return a protocol error.
+    /// Respond, write-confirmed. `Ok(Written)` means the bytes reached the
+    /// socket; a duplicate/late request returns `Ok(AlreadyHandled)`.
     ///
-    /// Consumes the context: a second response is a compile error. The claim
-    /// is created in the same poll that wins `begin_respond` and travels with
-    /// the queued write, so cancelling this future (timeout/select/abort)
-    /// cannot strand registry state, and the registration token's generation
-    /// check refuses cross-registration responses (message-id reuse) by
-    /// construction.
+    /// Consumes the request. Cancellation-safe: the claim is created in the
+    /// same poll that wins `begin_respond` and rides the queued write, so
+    /// timeout/select/abort cannot strand registry state, and the token's
+    /// generation check refuses cross-registration (reused-id) responses.
     pub async fn respond(
-        mut self,
+        self,
         response: impl Into<Bytes>,
     ) -> Result<RespondOutcome, crate::error::TransportError> {
         let response: Bytes = response.into();
-        let fut = match &mut self.kind {
-            TransportContextKind::Request {
-                responder,
-                responded,
-                request_registry,
-                token,
-                ..
-            } => {
-                // Same-poll claim: created and moved into the responder future
-                // with no await in between.
-                let claim = match (request_registry.as_ref(), token.as_ref()) {
-                    (Some(registry), Some(token)) => match registry.begin_respond(token) {
-                        MarkResult::Updated => {
-                            Some(crate::transport::request_registry::RespondClaim::new(
-                                registry.clone(),
-                                *token,
-                            ))
-                        }
-                        _ => return Ok(RespondOutcome::AlreadyHandled),
-                    },
-                    _ => None,
-                };
-                if responded
-                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
-                {
-                    Some(responder(response, claim))
-                } else {
-                    None
-                }
-            }
-            TransportContextKind::OneWay => {
-                return Err(crate::error::TransportError::protocol_error(
-                    "generic",
-                    "Cannot respond to one-way message",
-                ));
-            }
+        let claim = match (self.registry.as_ref(), self.token.as_ref()) {
+            (Some(registry), Some(token)) => match registry.begin_respond(token) {
+                MarkResult::Updated => Some(crate::transport::request_registry::RespondClaim::new(
+                    registry.clone(),
+                    *token,
+                )),
+                _ => return Ok(RespondOutcome::AlreadyHandled),
+            },
+            _ => None,
         };
-        match fut {
-            Some(f) => f.await.map(|()| RespondOutcome::Written),
-            None => Ok(RespondOutcome::AlreadyHandled),
-        }
+        (self.responder)(response, claim)
+            .await
+            .map(|()| RespondOutcome::Written)
     }
 
     /// Respond without awaiting the outcome. Registry state still resolves
     /// truthfully (the claim rides the queued write); only the caller's
-    /// visibility is sacrificed.
+    /// visibility of the result is given up.
     pub fn respond_detached(self, response: impl Into<Bytes>) {
         let response: Bytes = response.into();
         tokio::spawn(async move {
@@ -602,67 +605,14 @@ impl TransportContext {
     }
 }
 
-impl Clone for TransportContext {
-    fn clone(&self) -> Self {
-        let kind = match &self.kind {
-            TransportContextKind::OneWay => TransportContextKind::OneWay,
-            TransportContextKind::Request {
-                responder,
-                responded,
-                request_registry,
-                token,
-                ..
-            } => TransportContextKind::Request {
-                responder: responder.clone(),
-                responded: responded.clone(),
-                // Clone instances should never be watchdog owners.
-                is_primary: false,
-                request_registry: request_registry.clone(),
-                token: *token,
-            },
-        };
-        Self {
-            peer: self.peer,
-            message_id: self.message_id,
-            biz_type: self.biz_type,
-            ext_header: self.ext_header.clone(),
-            data: self.data.clone(),
-            timestamp: self.timestamp,
-            kind,
-        }
-    }
-}
-
-impl std::fmt::Debug for TransportContext {
+impl std::fmt::Debug for ClientRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TransportContext")
+        f.debug_struct("ClientRequest")
             .field("peer", &self.peer)
             .field("message_id", &self.message_id)
+            .field("biz_type", &self.biz_type)
             .field("data", &format!("{} bytes", self.data.len()))
-            .field("timestamp", &self.timestamp)
-            .field("is_request", &self.is_request())
             .finish()
-    }
-}
-
-impl Drop for TransportContext {
-    fn drop(&mut self) {
-        if let TransportContextKind::Request {
-            responded,
-            is_primary,
-            ..
-        } = &self.kind
-        {
-            // Drop is now debug-only fallback. Main timeout detection is handled by RequestRegistry.
-            if *is_primary && !responded.load(Ordering::SeqCst) {
-                tracing::debug!(
-                    "[DROP] TransportContext dropped before response (request_id={}, session_id={:?}, biz_type={})",
-                    self.message_id,
-                    self.peer,
-                    self.biz_type
-                );
-            }
-        }
     }
 }
 
@@ -797,8 +747,8 @@ mod respond_tests {
         registry: &Arc<RequestRegistry>,
         token: RequestToken,
         responder: ResponderFn,
-    ) -> TransportContext {
-        TransportContext::new_request_with_registry(
+    ) -> ClientRequest {
+        ClientRequest::new(
             Some(SessionId(7)),
             1,
             0,
@@ -837,11 +787,9 @@ mod respond_tests {
         assert_eq!(registry.counters_snapshot().response_send_failed_total, 1);
     }
 
-    #[tokio::test]
-    async fn respond_on_one_way_is_error() {
-        let ctx = TransportContext::new_oneway(Some(SessionId(3)), 44, 0, None, b"data".to_vec());
-        assert!(ctx.respond(b"resp".to_vec()).await.is_err());
-    }
+    // (The former `respond_on_one_way_is_error` test is gone: a one-way message
+    // is now a `ClientMessage`, which has no `respond` method at all, so the
+    // error is a compile error by construction rather than a runtime check.)
 
     /// Cancelling a respond mid-send must not strand the registry in
     /// Responding: the claim travels with the responder future, so dropping

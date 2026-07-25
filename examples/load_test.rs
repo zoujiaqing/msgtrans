@@ -536,8 +536,11 @@ async fn run_client(
 
             // Use select! to handle events without timeout blocking
             match events.next().await {
-                Some(ClientEvent::MessageReceived(context)) => {
-                    stats_clone.record_receive(context.data.len() as u64);
+                Some(ClientEvent::Message(msg)) => {
+                    stats_clone.record_receive(msg.payload().len() as u64);
+                }
+                Some(ClientEvent::Request(req)) => {
+                    stats_clone.record_receive(req.payload().len() as u64);
                 }
                 Some(ClientEvent::Disconnected { .. }) => break,
                 Some(ClientEvent::Error { .. }) => {

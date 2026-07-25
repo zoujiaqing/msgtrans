@@ -93,7 +93,7 @@ pub use event::QuicEvent;
 pub use event::TcpEvent;
 #[cfg(feature = "websocket")]
 pub use event::WebSocketEvent;
-pub use event::{ClientEvent, RespondOutcome, TransportEvent};
+pub use event::{ClientEvent, ClientMessage, ClientRequest, RespondOutcome, TransportEvent};
 pub use packet::{FramePolicy, Packet, PacketError, PacketType};
 pub use stream::ClientEvents;
 

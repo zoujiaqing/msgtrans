@@ -139,8 +139,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(async move {
         while let Some(event) = events.next().await {
             match event {
-                ClientEvent::MessageReceived(context) => {
-                    println!("Received: {}", String::from_utf8_lossy(&context.data));
+                ClientEvent::Message(msg) => {
+                    println!("Received: {}", msg.as_text_lossy());
+                }
+                ClientEvent::Request(req) => {
+                    // Server-initiated request: `req` is consuming; answer it.
+                    req.respond_detached(b"ack".to_vec());
                 }
                 ClientEvent::Disconnected { .. } => break,
                 _ => {}
@@ -237,7 +241,8 @@ impl SessionHandler for MyHandler {
 // Client side: events
 # fn _client_events(ev: ClientEvent) { match ev {
 ClientEvent::Connected { info } => { /* ... */ }
-ClientEvent::MessageReceived(context) => { /* ... */ }
+ClientEvent::Message(msg) => { /* one-way data; msg.payload() */ }
+ClientEvent::Request(req) => { /* consuming; req.respond_detached(..) */ }
 ClientEvent::MessageSent { message_id } => { /* ... */ }
 ClientEvent::Disconnected { reason } => { /* ... */ }
 ClientEvent::Error { error } => { /* ... */ }
