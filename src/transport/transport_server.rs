@@ -333,13 +333,13 @@ impl TransportServer {
         }
 
         let message_id = packet.header.message_id;
-        let rx = match self.request_registry.try_register_waiter(
+        let (rx, token) = match self.request_registry.try_register_waiter(
             message_id,
             Some(session_id),
             packet.header.biz_type,
             DEFAULT_REQUEST_LIFECYCLE_TIMEOUT,
         ) {
-            Ok(rx) => rx,
+            Ok(pair) => pair,
             Err(_) => {
                 return Err(TransportError::connection_error(
                     "Duplicate in-flight request id for this session",
@@ -352,10 +352,10 @@ impl TransportServer {
         // waiter on drop, so a cancelled server request never leaks a pending
         // entry. send_to_session is write-confirmed (actor SendWithReply), so
         // the response timeout below only measures the peer's processing time.
+        // Bound to `token` -> generation-checked abort (no message-id ABA).
         let mut guard = crate::transport::request_registry::OutboundRequestGuard::new(
             self.request_registry.clone(),
-            Some(session_id),
-            message_id,
+            token,
         )
         .armed();
 

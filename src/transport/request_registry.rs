@@ -231,21 +231,19 @@ pub struct DuplicateRequest {
 /// is not needlessly aborted.
 pub struct OutboundRequestGuard {
     registry: Arc<RequestRegistry>,
-    session_id: Option<SessionId>,
-    request_id: u32,
+    token: RequestToken,
     disarmed: bool,
 }
 
 impl OutboundRequestGuard {
-    pub(crate) fn new(
-        registry: Arc<RequestRegistry>,
-        session_id: Option<SessionId>,
-        request_id: u32,
-    ) -> Self {
+    /// Build a guard bound to the exact registration `token` names. Dropping an
+    /// armed guard aborts *that* registration only — a generation mismatch (the
+    /// id was reused by a newer request) is a no-op, closing the ABA window the
+    /// old by-key abort had.
+    pub(crate) fn new(registry: Arc<RequestRegistry>, token: RequestToken) -> Self {
         Self {
             registry,
-            session_id,
-            request_id,
+            token,
             disarmed: true,
         }
     }
@@ -265,7 +263,7 @@ impl OutboundRequestGuard {
 impl Drop for OutboundRequestGuard {
     fn drop(&mut self) {
         if !self.disarmed {
-            self.registry.abort_waiter(self.session_id, self.request_id);
+            self.registry.abort_waiter_token(&self.token);
         }
     }
 }
@@ -539,18 +537,18 @@ impl RequestRegistry {
         session_id: Option<SessionId>,
         biz_type: u8,
         timeout: Duration,
-    ) -> Result<oneshot::Receiver<Packet>, DuplicateRequest> {
+    ) -> Result<(oneshot::Receiver<Packet>, RequestToken), DuplicateRequest> {
         // Waiter-based (outbound) requests rely on the caller's own timeout
         // (e.g. tokio::time::timeout) plus explicit removal, so they are NOT
         // scheduled into the timeout wheel. This also avoids unbounded bucket
         // growth on clients that run no timeout scanner.
         let key = RequestKey::outbound(session_id, request_id);
-        if self.register_impl(key, biz_type, timeout, false).is_none() {
+        let Some(token) = self.register_impl(key, biz_type, timeout, false) else {
             return Err(DuplicateRequest {
                 session_id,
                 request_id,
             });
-        }
+        };
         let (tx, rx) = oneshot::channel();
         self.waiters.insert(key, tx);
         // If the session closed between register_impl and the waiter insert,
@@ -563,7 +561,7 @@ impl RequestRegistry {
                 request_id,
             });
         }
-        Ok(rx)
+        Ok((rx, token))
     }
 
     /// Complete a request with its response: wake the waiter (if any) and move
@@ -775,6 +773,37 @@ impl RequestRegistry {
         }
     }
 
+    /// Generation-aware abort for the outbound waiter path: mark the request
+    /// `Dropped` and drop its waiter — but ONLY if the live entry is the same
+    /// registration the token was minted for. A token from an earlier life of a
+    /// reused message id observes a generation mismatch and touches nothing, so
+    /// cancelling a completed request's future can never abort the *new* request
+    /// that reused its id (the outbound ABA the by-key `abort_waiter` had).
+    pub fn abort_waiter_token(&self, token: &RequestToken) -> bool {
+        let key = token.key();
+        let Some(entry) = self.entries.get(&key) else {
+            return false;
+        };
+        if entry.generation != token.generation {
+            // Same key, different registration (id reused): touch nothing.
+            return false;
+        }
+        // Check + transition on the SAME entry Arc, so a concurrent
+        // complete-then-reregister can never make us drop the new entry.
+        match entry.try_transition(RequestState::Pending, RequestState::Dropped) {
+            Ok(_) => {
+                self.counters
+                    .pending_requests
+                    .fetch_sub(1, Ordering::Relaxed);
+                drop(entry);
+                self.remove_terminal_entry(key);
+                self.waiters.remove(&key);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     pub fn close_session_pending(&self, session_id: SessionId) -> usize {
         // Remove the runtime first (no new registers can find it), mark it
         // Closing (registers already holding the Arc will undo on re-check),
@@ -950,14 +979,14 @@ mod tests {
         let registry = Arc::new(RequestRegistry::new());
         open(&registry, &[7]);
         let sid = Some(SessionId(7));
-        let _rx = registry
+        let (_rx, token) = registry
             .try_register_waiter(1, sid, 0, Duration::from_secs(5))
             .expect("registered");
         assert_eq!(registry.pending_count(), 1);
         {
             // Armed guard dropped without disarm (== the caller's future was
             // cancelled): the waiter must be aborted, not leaked.
-            let _guard = OutboundRequestGuard::new(registry.clone(), sid, 1).armed();
+            let _guard = OutboundRequestGuard::new(registry.clone(), token).armed();
         }
         assert_eq!(
             registry.pending_count(),
@@ -971,17 +1000,61 @@ mod tests {
         let registry = Arc::new(RequestRegistry::new());
         open(&registry, &[7]);
         let sid = Some(SessionId(7));
-        let _rx = registry
+        let (_rx, token) = registry
             .try_register_waiter(1, sid, 0, Duration::from_secs(5))
             .expect("registered");
         {
-            let mut guard = OutboundRequestGuard::new(registry.clone(), sid, 1).armed();
+            let mut guard = OutboundRequestGuard::new(registry.clone(), token).armed();
             guard.disarm(); // response received: drop must NOT abort
         }
         assert_eq!(
             registry.pending_count(),
             1,
             "a disarmed guard must leave the (completed) waiter untouched"
+        );
+    }
+
+    /// Outbound ABA: an old request completes, its message id is reused by a
+    /// brand-new request, THEN the old request's future is cancelled. The
+    /// stale guard must NOT delete the new request's waiter — the token's
+    /// generation no longer matches the live entry.
+    #[test]
+    fn cancelled_old_guard_does_not_abort_reused_id() {
+        let registry = Arc::new(RequestRegistry::new());
+        open(&registry, &[7]);
+        let sid = Some(SessionId(7));
+
+        // First life of id=1: register (keep its token), then complete it.
+        let (_rx1, token1) = registry
+            .try_register_waiter(1, sid, 0, Duration::from_secs(5))
+            .expect("first register");
+        assert!(registry.complete_waiter(sid, 1, Packet::one_way(1, Vec::new())));
+        assert_eq!(registry.pending_count(), 0);
+
+        // Second life of the SAME id=1: a new registration, new generation,
+        // wrapped in an armed guard as the live in-flight request.
+        let (_rx2, token2) = registry
+            .try_register_waiter(1, sid, 0, Duration::from_secs(5))
+            .expect("re-register after reuse");
+        assert_ne!(token1.generation, token2.generation);
+        let _live_guard = OutboundRequestGuard::new(registry.clone(), token2).armed();
+        assert_eq!(registry.pending_count(), 1);
+
+        // The OLD request's future is cancelled -> its guard's Drop calls
+        // abort_waiter_token(token1). Generation mismatch => no-op; the NEW
+        // request's waiter must survive.
+        assert!(
+            !registry.abort_waiter_token(&token1),
+            "stale token must not abort anything"
+        );
+        assert_eq!(
+            registry.pending_count(),
+            1,
+            "the reused-id request's waiter must survive the stale cancel"
+        );
+        assert_eq!(
+            registry.get_state(sid, 1, RequestDirection::Outbound),
+            Some(RequestState::Pending),
         );
     }
 
@@ -1268,7 +1341,7 @@ mod tests {
         let registry = RequestRegistry::new();
         let sid = Some(SessionId(3));
         open(&registry, &[3]);
-        let mut rx = registry
+        let (mut rx, _token) = registry
             .try_register_waiter(50, sid, 0, Duration::from_secs(5))
             .expect("fresh key registers");
         assert_eq!(
@@ -1290,7 +1363,7 @@ mod tests {
     fn complete_waiter_rejects_wrong_session() {
         let registry = RequestRegistry::new();
         open(&registry, &[1]);
-        let mut rx = registry
+        let (mut rx, _token) = registry
             .try_register_waiter(60, Some(SessionId(1)), 0, Duration::from_secs(5))
             .expect("fresh key registers");
         assert!(!registry.complete_waiter(
@@ -1307,7 +1380,7 @@ mod tests {
     fn timeout_drops_waiter() {
         let registry = RequestRegistry::new();
         let key = RequestKey::outbound(None, 70);
-        let mut rx = registry
+        let (mut rx, _token) = registry
             .try_register_waiter(70, None, 0, Duration::from_secs(1))
             .expect("fresh key registers");
         assert_eq!(registry.mark_timed_out(key), MarkResult::Updated);
@@ -1322,7 +1395,7 @@ mod tests {
         let registry = RequestRegistry::new();
         let sid = SessionId(88);
         open(&registry, &[88]);
-        let mut rx = registry
+        let (mut rx, _token) = registry
             .try_register_waiter(80, Some(sid), 0, Duration::from_secs(5))
             .expect("fresh key registers");
         assert_eq!(registry.close_session_pending(sid), 1);
@@ -1337,7 +1410,7 @@ mod tests {
         let registry = RequestRegistry::new();
         let sid = Some(SessionId(5));
         open(&registry, &[5]);
-        let _rx = registry
+        let (_rx, _token) = registry
             .try_register_waiter(90, sid, 0, Duration::from_secs(5))
             .expect("first registers");
         // Second waiter for the same key is refused, not silently replaced.
@@ -1351,7 +1424,7 @@ mod tests {
         let registry = RequestRegistry::new();
         let sid = Some(SessionId(11));
         open(&registry, &[11]);
-        let mut rx = registry
+        let (mut rx, _token) = registry
             .try_register_waiter(100, sid, 0, Duration::from_secs(5))
             .expect("registers");
         assert!(registry.abort_waiter(sid, 100));
@@ -1375,7 +1448,7 @@ mod tests {
         let sid = Some(SessionId(42));
         open(&registry, &[42]);
 
-        let mut rx = registry
+        let (mut rx, _token) = registry
             .try_register_waiter(500, sid, 0, Duration::from_secs(5))
             .expect("outbound registers");
         let inbound_token = registry
@@ -1553,10 +1626,10 @@ mod tests {
     fn abort_all_drops_every_waiter() {
         let registry = RequestRegistry::new();
         open(&registry, &[1]);
-        let mut rx1 = registry
+        let (mut rx1, _token) = registry
             .try_register_waiter(1, Some(SessionId(1)), 0, Duration::from_secs(5))
             .expect("registers");
-        let mut rx2 = registry
+        let (mut rx2, _token) = registry
             .try_register_waiter(2, None, 0, Duration::from_secs(5))
             .expect("registers");
         assert_eq!(registry.abort_all(), 2);

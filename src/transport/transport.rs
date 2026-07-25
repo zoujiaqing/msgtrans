@@ -463,13 +463,13 @@ impl Transport {
         // [FIX] Use client-set message_id instead of overriding it
         let client_message_id = packet.header.message_id;
         let session_id = self.current_session_id().await;
-        let rx = match self.request_registry.try_register_waiter(
+        let (rx, token) = match self.request_registry.try_register_waiter(
             client_message_id,
             session_id,
             packet.header.biz_type,
             REQUEST_WAITER_TIMEOUT,
         ) {
-            Ok(rx) => rx,
+            Ok(pair) => pair,
             Err(_) => {
                 return Err(TransportError::connection_error(
                     "Duplicate in-flight request id",
@@ -482,11 +482,12 @@ impl Transport {
         // error return, a timeout, OR the caller cancelling this future
         // (select!/abort/outer timeout) — aborts the waiter on drop, so a
         // cancelled request never leaks a pending entry (waiters are not in
-        // the timeout wheel).
+        // the timeout wheel). The guard is bound to `token`, so aborting is
+        // generation-checked: a cancelled OLD request cannot delete the waiter
+        // of a NEW request that reused its message id.
         let mut guard = crate::transport::request_registry::OutboundRequestGuard::new(
             self.request_registry.clone(),
-            session_id,
-            client_message_id,
+            token,
         )
         .armed();
 
@@ -703,10 +704,12 @@ impl Transport {
         data: Bytes,
         options: super::TransportOptions,
     ) -> Result<Bytes, TransportError> {
-        // Use user-provided message_id or generate new one
-        let message_id = options
-            .message_id
-            .unwrap_or_else(|| self.request_registry.next_message_id());
+        // Always allocate a unique, monotonically increasing message id. A
+        // caller-chosen id could be reused while a previous request with the
+        // same id still had a response in flight; the peer echoes the id on the
+        // wire with no generation, so a late old response would be delivered to
+        // the new caller. Unique allocation removes that ABA at the source.
+        let message_id = self.request_registry.next_message_id();
 
         // Create request packet
         let mut packet = crate::packet::Packet::request(message_id, data.clone());
@@ -729,13 +732,13 @@ impl Transport {
 
         // Register request tracking
         let session_id = self.current_session_id().await;
-        let rx = match self.request_registry.try_register_waiter(
+        let (rx, token) = match self.request_registry.try_register_waiter(
             message_id,
             session_id,
             packet.header.biz_type,
             REQUEST_WAITER_TIMEOUT,
         ) {
-            Ok(rx) => rx,
+            Ok(pair) => pair,
             Err(_) => {
                 return Err(TransportError::connection_error(
                     "Duplicate in-flight request id",
@@ -753,11 +756,11 @@ impl Transport {
 
         // RAII guard: cancelling this future / any error exit aborts the waiter
         // on drop (waiters are not in the timeout wheel), so a cancelled
-        // request never leaks a pending entry.
+        // request never leaks a pending entry. Bound to `token`, so the abort is
+        // generation-checked against message-id reuse.
         let mut guard = crate::transport::request_registry::OutboundRequestGuard::new(
             self.request_registry.clone(),
-            session_id,
-            message_id,
+            token,
         )
         .armed();
 
@@ -813,10 +816,8 @@ impl Transport {
         data: Bytes,
         options: super::TransportOptions,
     ) -> Result<(), TransportError> {
-        // Use user-provided message_id or generate new one
-        let message_id = options
-            .message_id
-            .unwrap_or_else(|| self.request_registry.next_message_id());
+        // Always allocate a unique message id (see request_with_options).
+        let message_id = self.request_registry.next_message_id();
 
         // Create one-way message packet
         let mut packet = crate::packet::Packet::one_way(message_id, data.clone());
@@ -1042,7 +1043,7 @@ mod generation_tests {
         let id2 = transport.set_connection(mock(&closed)).await;
 
         // Generation 2 registers request 42.
-        let mut rx = transport
+        let (mut rx, _token) = transport
             .request_registry
             .try_register_waiter(42, Some(id2), 0, std::time::Duration::from_secs(5))
             .expect("registers");
