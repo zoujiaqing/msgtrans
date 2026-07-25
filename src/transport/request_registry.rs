@@ -222,6 +222,54 @@ pub struct DuplicateRequest {
     pub request_id: u32,
 }
 
+/// RAII guard for one in-flight OUTBOUND request. Waiter-based requests are not
+/// in the timeout wheel, so if the caller's request future is cancelled
+/// (`select!`, task abort, an outer `timeout`) the pending entry would linger
+/// until a response or disconnect. Holding this guard across the response await
+/// closes that leak: on drop it aborts the waiter by (session, id). Call
+/// [`Self::disarm`] once the response has been received so a completed request
+/// is not needlessly aborted.
+pub struct OutboundRequestGuard {
+    registry: Arc<RequestRegistry>,
+    session_id: Option<SessionId>,
+    request_id: u32,
+    disarmed: bool,
+}
+
+impl OutboundRequestGuard {
+    pub(crate) fn new(
+        registry: Arc<RequestRegistry>,
+        session_id: Option<SessionId>,
+        request_id: u32,
+    ) -> Self {
+        Self {
+            registry,
+            session_id,
+            request_id,
+            disarmed: true,
+        }
+    }
+
+    /// Arm the guard: from here, dropping it aborts the waiter.
+    pub(crate) fn armed(mut self) -> Self {
+        self.disarmed = false;
+        self
+    }
+
+    /// The response arrived (or was explicitly handled): do not abort on drop.
+    pub(crate) fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for OutboundRequestGuard {
+    fn drop(&mut self) {
+        if !self.disarmed {
+            self.registry.abort_waiter(self.session_id, self.request_id);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct RequestCountersSnapshot {
     pub pending_requests: u64,
@@ -895,6 +943,46 @@ mod tests {
         assert_eq!(snapshot.pending_requests, 0);
         assert_eq!(snapshot.duplicate_response_total, 1);
         assert_eq!(registry.active_len(), 0);
+    }
+
+    #[test]
+    fn outbound_guard_aborts_pending_waiter_on_drop() {
+        let registry = Arc::new(RequestRegistry::new());
+        open(&registry, &[7]);
+        let sid = Some(SessionId(7));
+        let _rx = registry
+            .try_register_waiter(1, sid, 0, Duration::from_secs(5))
+            .expect("registered");
+        assert_eq!(registry.pending_count(), 1);
+        {
+            // Armed guard dropped without disarm (== the caller's future was
+            // cancelled): the waiter must be aborted, not leaked.
+            let _guard = OutboundRequestGuard::new(registry.clone(), sid, 1).armed();
+        }
+        assert_eq!(
+            registry.pending_count(),
+            0,
+            "cancelled request must not leak a pending waiter"
+        );
+    }
+
+    #[test]
+    fn disarmed_guard_leaves_the_waiter_alone() {
+        let registry = Arc::new(RequestRegistry::new());
+        open(&registry, &[7]);
+        let sid = Some(SessionId(7));
+        let _rx = registry
+            .try_register_waiter(1, sid, 0, Duration::from_secs(5))
+            .expect("registered");
+        {
+            let mut guard = OutboundRequestGuard::new(registry.clone(), sid, 1).armed();
+            guard.disarm(); // response received: drop must NOT abort
+        }
+        assert_eq!(
+            registry.pending_count(),
+            1,
+            "a disarmed guard must leave the (completed) waiter untouched"
+        );
     }
 
     #[test]

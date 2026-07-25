@@ -488,26 +488,33 @@ impl Transport {
             }
         };
 
+        // RAII guard: any exit from here that is NOT an explicit disarm — an
+        // error return, a timeout, OR the caller cancelling this future
+        // (select!/abort/outer timeout) — aborts the waiter on drop, so a
+        // cancelled request never leaks a pending entry (waiters are not in
+        // the timeout wheel).
+        let mut guard = crate::transport::request_registry::OutboundRequestGuard::new(
+            self.request_registry.clone(),
+            session_id,
+            client_message_id,
+        )
+        .armed();
+
         // Confirm the WRITE before starting the response timeout: the waiter is
         // already registered (so a fast response cannot be missed), and only
         // once the request bytes have reached the socket do we begin the
         // response deadline. This closes the ghost-RPC window where a request
         // stuck in a congested outbound queue could time out for the caller
         // and then still be written and executed at the peer.
-        if let Err(e) = self.send_confirmed_with(packet, session_id, None).await {
-            self.request_registry
-                .abort_waiter(session_id, client_message_id);
-            return Err(e);
-        }
+        self.send_confirmed_with(packet, session_id, None).await?;
         let timeout_duration = std::time::Duration::from_secs(10);
         match tokio::time::timeout(timeout_duration, rx).await {
-            Ok(Ok(resp)) => Ok(resp),
-            Ok(Err(_)) => Err(TransportError::connection_error("Connection closed", true)),
-            Err(_) => {
-                self.request_registry
-                    .abort_waiter(session_id, client_message_id);
-                Err(TransportError::timeout_error("request", timeout_duration))
+            Ok(Ok(resp)) => {
+                guard.disarm();
+                Ok(resp)
             }
+            Ok(Err(_)) => Err(TransportError::connection_error("Connection closed", true)),
+            Err(_) => Err(TransportError::timeout_error("request", timeout_duration)),
         }
     }
 
@@ -760,13 +767,20 @@ impl Transport {
             options.timeout
         );
 
+        // RAII guard: cancelling this future / any error exit aborts the waiter
+        // on drop (waiters are not in the timeout wheel), so a cancelled
+        // request never leaks a pending entry.
+        let mut guard = crate::transport::request_registry::OutboundRequestGuard::new(
+            self.request_registry.clone(),
+            session_id,
+            message_id,
+        )
+        .armed();
+
         // Confirm the write before the response deadline (see `request`): no
         // ghost RPCs from a request that timed out while queued and was then
         // written.
-        if let Err(e) = self.send_confirmed_with(packet, session_id, None).await {
-            self.request_registry.abort_waiter(session_id, message_id);
-            return Err(e);
-        }
+        self.send_confirmed_with(packet, session_id, None).await?;
 
         tracing::info!(
             "[WAIT] Waiting for response: message_id={}, timeout={:?}",
@@ -780,6 +794,7 @@ impl Transport {
             .unwrap_or(std::time::Duration::from_secs(10));
         match tokio::time::timeout(timeout_duration, rx).await {
             Ok(Ok(resp)) => {
+                guard.disarm();
                 tracing::info!(
                     "[SUCCESS] Received response: message_id={}, biz_type={}, payload_len={}",
                     message_id,
@@ -794,7 +809,6 @@ impl Transport {
                 Err(TransportError::connection_error("Connection closed", true))
             }
             Err(_) => {
-                self.request_registry.abort_waiter(session_id, message_id);
                 tracing::warn!(
                     "[WARN] Request timeout: message_id={}, timeout={:?}",
                     message_id,

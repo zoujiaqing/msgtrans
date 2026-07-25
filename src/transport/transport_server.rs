@@ -351,19 +351,22 @@ impl TransportServer {
             }
         };
 
-        if let Err(e) = self.send_to_session(session_id, packet).await {
-            self.request_registry
-                .abort_waiter(Some(session_id), message_id);
-            tracing::error!(
-                "[ERROR] Session {} request send failed: {:?}",
-                session_id,
-                e
-            );
-            return Err(e);
-        }
+        // RAII: cancelling this future (or any error/timeout exit) aborts the
+        // waiter on drop, so a cancelled server request never leaks a pending
+        // entry. send_to_session is write-confirmed (actor SendWithReply), so
+        // the response timeout below only measures the peer's processing time.
+        let mut guard = crate::transport::request_registry::OutboundRequestGuard::new(
+            self.request_registry.clone(),
+            Some(session_id),
+            message_id,
+        )
+        .armed();
+
+        self.send_to_session(session_id, packet).await?;
 
         match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
             Ok(Ok(response)) => {
+                guard.disarm();
                 tracing::debug!(
                     "[SUCCESS] Session {} received response (response ID: {})",
                     session_id,
@@ -371,19 +374,11 @@ impl TransportServer {
                 );
                 Ok(response)
             }
-            Ok(Err(_)) => {
-                self.request_registry
-                    .abort_waiter(Some(session_id), message_id);
-                Err(TransportError::connection_error("Connection closed", true))
-            }
-            Err(_) => {
-                self.request_registry
-                    .abort_waiter(Some(session_id), message_id);
-                Err(TransportError::timeout_error(
-                    "server request",
-                    std::time::Duration::from_secs(10),
-                ))
-            }
+            Ok(Err(_)) => Err(TransportError::connection_error("Connection closed", true)),
+            Err(_) => Err(TransportError::timeout_error(
+                "server request",
+                std::time::Duration::from_secs(10),
+            )),
         }
     }
 
