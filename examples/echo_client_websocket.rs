@@ -88,6 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     tracing::error!("[ERROR] Transport error: {:?}", error);
                     break;
                 }
+                _ => {}
             }
         }
     });

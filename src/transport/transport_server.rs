@@ -1559,6 +1559,7 @@ impl TransportServer {
 /// requires all of them — session tracker empty, infra really finished,
 /// permits restored.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ShutdownReport {
     /// Session supervisors joined by this shutdown (each join proves that
     /// session's actor + pump ended and its permit returned).

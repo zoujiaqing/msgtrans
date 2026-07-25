@@ -14,10 +14,3 @@ impl Default for TransportConfig {
         }
     }
 }
-
-impl TransportConfig {
-    pub fn validate(&self) -> Result<(), crate::error::TransportError> {
-        // Implement configuration validation logic
-        Ok(())
-    }
-}

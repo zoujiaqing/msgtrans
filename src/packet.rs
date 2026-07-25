@@ -93,8 +93,13 @@ pub enum FramePolicy {
     Strict = 1,
 }
 
-impl From<u8> for FramePolicy {
-    fn from(value: u8) -> Self {
+impl FramePolicy {
+    /// Internal-only round-trip helper. The adapters stash the active policy in
+    /// an `AtomicU8` and read it back on the hot path; the stored byte is always
+    /// a value produced by `self as u8`, so the fallback is never reached in
+    /// practice. Kept `pub(crate)` (not a public `From<u8>`) so no external
+    /// caller can silently downgrade an unknown byte to `Lenient`.
+    pub(crate) fn from_u8(value: u8) -> Self {
         match value {
             1 => FramePolicy::Strict,
             _ => FramePolicy::Lenient,

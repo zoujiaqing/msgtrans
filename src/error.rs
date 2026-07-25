@@ -3,6 +3,7 @@ use std::time::Duration;
 
 /// Connection close reason
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum CloseReason {
     /// Normal close
     Normal,
@@ -16,6 +17,7 @@ pub enum CloseReason {
 
 /// Unified transport error type - simplified version
 #[derive(Debug, thiserror::Error, Clone)]
+#[non_exhaustive]
 pub enum TransportError {
     /// Connection-related errors
     #[error("Connection error: {reason} (retryable: {retryable})")]
@@ -201,24 +203,5 @@ impl From<String> for TransportError {
 impl From<TransportError> for TransportEvent {
     fn from(error: TransportError) -> Self {
         TransportEvent::TransportError { error }
-    }
-}
-
-/// 向后兼容的错误转换 - 用于旧代码迁移
-impl TransportError {
-    /// 兼容旧的Connection错误格式
-    pub fn connection_legacy(reason: impl Into<String>) -> Self {
-        Self::Connection {
-            reason: reason.into(),
-            retryable: true,
-        }
-    }
-
-    /// 兼容旧的Protocol错误格式
-    pub fn protocol_legacy(reason: impl Into<String>) -> Self {
-        Self::Protocol {
-            protocol: "unknown".to_string(),
-            reason: reason.into(),
-        }
     }
 }

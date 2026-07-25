@@ -569,7 +569,7 @@ impl<C> QuicAdapter<C> {
                                         current_session_id
                                     );
 
-                                    let strict = crate::packet::FramePolicy::from(
+                                    let strict = crate::packet::FramePolicy::from_u8(
                                         read_frame_policy
                                             .load(std::sync::atomic::Ordering::Relaxed),
                                     ) == crate::packet::FramePolicy::Strict;

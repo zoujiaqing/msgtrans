@@ -44,21 +44,6 @@ pub enum TransportEvent {
 }
 
 impl TransportEvent {
-    /// Get event related session ID
-    pub fn session_id(&self) -> Option<SessionId> {
-        match self {
-            TransportEvent::ConnectionEstablished { .. } => None,
-            TransportEvent::ConnectionClosed { .. } => None,
-            TransportEvent::MessageReceived(..) => None,
-            TransportEvent::MessageSent { .. } => None,
-            TransportEvent::TransportError { .. } => None,
-            TransportEvent::ServerStarted { .. } => None,
-            TransportEvent::ServerStopped => None,
-            TransportEvent::ClientConnected { .. } => None,
-            TransportEvent::ClientDisconnected => None,
-        }
-    }
-
     /// Check if it's a connection related event
     pub fn is_connection_event(&self) -> bool {
         matches!(
@@ -99,6 +84,7 @@ impl TransportEvent {
 /// Not `Clone`: `Request` carries a consuming responder that must be answered
 /// exactly once.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ClientEvent {
     /// Connection established
     Connected { info: ConnectionInfo },
@@ -185,6 +171,7 @@ impl ClientEvent {
 /// socket". Duplicate/late/unknown responds report `AlreadyHandled` instead of
 /// a fake success, and real failures are `Err` — never conflated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RespondOutcome {
     /// The response was written to the transport (write-confirmed).
     Written,
@@ -419,6 +406,7 @@ pub struct TransportResult {
 
 /// Transport status enumeration
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum TransportStatus {
     /// Send successful
     Sent,

@@ -468,7 +468,7 @@ impl<C> TcpAdapter<C> {
                             Ok(_) => {
                                 last_activity = tokio::time::Instant::now();
                                 // Parse all complete packets currently in the buffer.
-                                let strict = crate::packet::FramePolicy::from(
+                                let strict = crate::packet::FramePolicy::from_u8(
                                     frame_policy.load(std::sync::atomic::Ordering::Relaxed),
                                 ) == crate::packet::FramePolicy::Strict;
                                 loop {

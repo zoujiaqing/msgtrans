@@ -90,6 +90,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     error!("[ERROR] Transport error: {:?}", error);
                     break;
                 }
+                // `ClientEvent` is `#[non_exhaustive]`: tolerate future variants.
+                _ => {}
             }
 
             // Limit event processing count to avoid infinite loop

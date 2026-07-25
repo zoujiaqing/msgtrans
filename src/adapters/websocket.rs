@@ -367,7 +367,7 @@ impl<C> WebSocketAdapter<C> {
                                 if matches!(message, Message::Pong(_)) {
                                     ping_sent_at = None;
                                 }
-                                let policy = crate::packet::FramePolicy::from(
+                                let policy = crate::packet::FramePolicy::from_u8(
                                     frame_policy.load(std::sync::atomic::Ordering::Relaxed),
                                 );
                                 match Self::process_websocket_message(message, policy) {

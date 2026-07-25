@@ -102,10 +102,11 @@ impl TransportClientBuilder {
         self
     }
 
-    /// Set the frame decode policy applied to the connection (default Lenient).
-    ///
-    /// Under `Strict`, an undecodable frame from the server closes the connection
-    /// instead of being downgraded to a raw one-way message.
+    /// Set the frame decode policy applied to the connection. The default is
+    /// [`FramePolicy::Strict`](crate::FramePolicy) (2.0), so an undecodable
+    /// frame from the server closes the connection. Opt into `Lenient` to keep
+    /// the 1.x behavior of downgrading an undecodable frame to a raw one-way
+    /// message.
     pub fn frame_policy(mut self, policy: crate::packet::FramePolicy) -> Self {
         self.frame_policy = policy;
         self
