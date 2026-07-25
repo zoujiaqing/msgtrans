@@ -1,48 +1,24 @@
-// Crate-internal generic lock-free containers: the standard container
-// accessors (len/is_empty/stats) and the stats counters are retained as normal
-// container API even where a given consumer does not call them. Not public API.
-#![allow(dead_code)]
-use std::hash::Hash;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-/// Lock-free optimization enhancement module - focused on first-stage lock-free optimization
-///
-/// Goals:
-/// - Replace Arc<RwLock<HashMap>> hotspots
-/// - Provide 50-150% performance improvement
-/// - Maintain existing API compatibility
-use std::sync::Arc;
-use std::time::Instant;
-
-use dashmap::DashMap;
-use flume::{unbounded, Receiver, Sender};
+//! Crate-internal concurrent containers.
+//!
+//! Thin wrappers over `dashmap::DashMap` and a `flume` MPMC channel, keeping the
+//! small API the transport layer uses. 2.0 removed the per-operation statistics
+//! (read/write counters and a running-average latency computed with
+//! `Instant::now()` + a CAS loop on EVERY `get`): the counters had no consumer,
+//! so the hot path was paying for metrics nobody read.
 
 use crate::error::TransportError;
+use dashmap::DashMap;
+use flume::{unbounded, Receiver, Sender};
+use std::hash::Hash;
 
-/// Lock-free hash map - replacement for Arc<RwLock<HashMap>>
-///
-/// Uses crossbeam's epoch-based memory management to achieve wait-free reads
+/// Concurrent hash map (sharded, lock-free reads) — a `DashMap` with the
+/// clone-on-read / `Result` API the transport layer expects.
 pub struct LockFreeHashMap<K, V>
 where
     K: Hash + Eq + Clone + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
 {
-    /// Concurrent map with internal sharding
     map: DashMap<K, V>,
-    /// Operation statistics
-    stats: Arc<LockFreeStats>,
-}
-
-/// Lock-free statistics
-#[derive(Debug)]
-pub struct LockFreeStats {
-    /// Number of reads
-    pub reads: AtomicU64,
-    /// Number of writes
-    pub writes: AtomicU64,
-    /// Number of CAS retries
-    pub cas_retries: AtomicU64,
-    /// Average read latency (nanoseconds)
-    pub avg_read_latency_ns: AtomicU64,
 }
 
 impl<K, V> LockFreeHashMap<K, V>
@@ -50,177 +26,40 @@ where
     K: Hash + Eq + Clone + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
 {
-    /// Create new lock-free hash map
     pub fn new() -> Self {
-        Self::with_capacity(16) // Default 16 shards
-    }
-
-    /// Create lock-free hash map with specified capacity
-    pub fn with_capacity(shard_count: usize) -> Self {
-        let shard_count = shard_count.max(1).next_power_of_two();
-
+        // Shard by available parallelism, rounded up to a power of two (DashMap
+        // requires that), so concurrent writers rarely contend the same shard.
+        let shard_count = std::thread::available_parallelism()
+            .map(|n| (n.get() * 4).next_power_of_two())
+            .unwrap_or(16);
         Self {
             map: DashMap::with_shard_amount(shard_count),
-            stats: Arc::new(LockFreeStats::new()),
         }
     }
 
-    /// Wait-free read - core optimization point
+    /// Concurrent read (clones the value out).
     pub fn get(&self, key: &K) -> Option<V> {
-        let start = Instant::now();
-        let read_count = self.stats.reads.fetch_add(1, Ordering::Relaxed) + 1;
-        let result = self.map.get(key).map(|v| v.clone());
-        let latency = start.elapsed().as_nanos() as u64;
-
-        // Maintain a running average instead of storing only the last sample.
-        let mut current = self.stats.avg_read_latency_ns.load(Ordering::Relaxed);
-        loop {
-            let next = if read_count <= 1 {
-                latency
-            } else if latency >= current {
-                current + (latency - current) / read_count
-            } else {
-                current - (current - latency) / read_count
-            };
-            match self.stats.avg_read_latency_ns.compare_exchange_weak(
-                current,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(observed) => current = observed,
-            }
-        }
-
-        result
+        self.map.get(key).map(|v| v.clone())
     }
 
-    /// Concurrent write
+    /// Concurrent write.
     pub fn insert(&self, key: K, value: V) -> Result<Option<V>, TransportError> {
-        self.stats.writes.fetch_add(1, Ordering::Relaxed);
         Ok(self.map.insert(key, value))
     }
 
-    /// Concurrent remove
+    /// Concurrent remove.
     pub fn remove(&self, key: &K) -> Result<Option<V>, TransportError> {
-        self.stats.writes.fetch_add(1, Ordering::Relaxed);
         Ok(self.map.remove(key).map(|(_, v)| v))
     }
 
-    /// Get number of entries
+    /// Number of entries.
     pub fn len(&self) -> usize {
         self.map.len()
     }
 
-    /// Check if empty
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Get all keys for iteration
+    /// Snapshot of the current keys.
     pub fn keys(&self) -> Result<Vec<K>, String> {
         Ok(self.map.iter().map(|entry| entry.key().clone()).collect())
-    }
-
-    /// Get statistics
-    pub fn stats(&self) -> LockFreeStats {
-        LockFreeStats {
-            reads: AtomicU64::new(self.stats.reads.load(Ordering::Relaxed)),
-            writes: AtomicU64::new(self.stats.writes.load(Ordering::Relaxed)),
-            cas_retries: AtomicU64::new(self.stats.cas_retries.load(Ordering::Relaxed)),
-            avg_read_latency_ns: AtomicU64::new(
-                self.stats.avg_read_latency_ns.load(Ordering::Relaxed),
-            ),
-        }
-    }
-}
-
-impl LockFreeStats {
-    fn new() -> Self {
-        Self {
-            reads: AtomicU64::new(0),
-            writes: AtomicU64::new(0),
-            cas_retries: AtomicU64::new(0),
-            avg_read_latency_ns: AtomicU64::new(0),
-        }
-    }
-}
-
-/// High-performance lock-free queue - replacement for VecDeque
-pub struct LockFreeQueue<T>
-where
-    T: Send + Sync + 'static,
-{
-    sender: Sender<T>,
-    receiver: Receiver<T>,
-    stats: Arc<QueueStats>,
-}
-
-/// Queue statistics
-#[derive(Debug)]
-pub struct QueueStats {
-    pub enqueued: AtomicU64,
-    pub dequeued: AtomicU64,
-    pub current_size: AtomicUsize,
-}
-
-impl<T> LockFreeQueue<T>
-where
-    T: Send + Sync + 'static,
-{
-    /// Create new lock-free queue
-    pub fn new() -> Self {
-        let (sender, receiver) = unbounded();
-
-        Self {
-            sender,
-            receiver,
-            stats: Arc::new(QueueStats {
-                enqueued: AtomicU64::new(0),
-                dequeued: AtomicU64::new(0),
-                current_size: AtomicUsize::new(0),
-            }),
-        }
-    }
-
-    /// Lock-free enqueue
-    pub fn push(&self, item: T) -> Result<(), TransportError> {
-        match self.sender.send(item) {
-            Ok(_) => {
-                self.stats.enqueued.fetch_add(1, Ordering::Relaxed);
-                self.stats.current_size.fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            }
-            Err(_) => Err(TransportError::resource_error("queue_push", 1, 0)),
-        }
-    }
-
-    /// Lock-free dequeue
-    pub fn pop(&self) -> Option<T> {
-        match self.receiver.try_recv() {
-            Ok(item) => {
-                self.stats.dequeued.fetch_add(1, Ordering::Relaxed);
-                self.stats.current_size.fetch_sub(1, Ordering::Relaxed);
-                Some(item)
-            }
-            Err(_) => None,
-        }
-    }
-
-    /// Get queue length
-    pub fn len(&self) -> usize {
-        self.stats.current_size.load(Ordering::Relaxed)
-    }
-
-    /// Check if empty
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Get statistics
-    pub fn stats(&self) -> &QueueStats {
-        &self.stats
     }
 }
 
@@ -231,6 +70,37 @@ where
 {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Unbounded MPMC queue (a `flume` channel) with a lock-free `push`/`pop` API.
+pub struct LockFreeQueue<T>
+where
+    T: Send + Sync + 'static,
+{
+    sender: Sender<T>,
+    receiver: Receiver<T>,
+}
+
+impl<T> LockFreeQueue<T>
+where
+    T: Send + Sync + 'static,
+{
+    pub fn new() -> Self {
+        let (sender, receiver) = unbounded();
+        Self { sender, receiver }
+    }
+
+    /// Enqueue.
+    pub fn push(&self, item: T) -> Result<(), TransportError> {
+        self.sender
+            .send(item)
+            .map_err(|_| TransportError::resource_error("queue_push", 1, 0))
+    }
+
+    /// Dequeue if non-empty.
+    pub fn pop(&self) -> Option<T> {
+        self.receiver.try_recv().ok()
     }
 }
 
@@ -248,34 +118,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_lockfree_hashmap_basic() {
+    fn hashmap_basic_ops() {
         let map = LockFreeHashMap::new();
-
-        // Test insert
-        assert!(map.insert("key1".to_string(), "value1".to_string()).is_ok());
-        assert_eq!(map.get(&"key1".to_string()), Some("value1".to_string()));
-
-        // Test update
-        assert!(map.insert("key1".to_string(), "value2".to_string()).is_ok());
-        assert_eq!(map.get(&"key1".to_string()), Some("value2".to_string()));
-
-        // Test remove
-        assert!(map.remove(&"key1".to_string()).is_ok());
-        assert_eq!(map.get(&"key1".to_string()), None);
+        assert!(map.insert("k1".to_string(), "v1".to_string()).is_ok());
+        assert_eq!(map.get(&"k1".to_string()), Some("v1".to_string()));
+        assert_eq!(map.len(), 1);
+        assert_eq!(
+            map.remove(&"k1".to_string()).unwrap(),
+            Some("v1".to_string())
+        );
+        assert_eq!(map.len(), 0);
+        assert_eq!(map.get(&"k1".to_string()), None);
     }
 
     #[test]
-    fn test_lockfree_queue() {
-        let queue = LockFreeQueue::new();
-
-        // Test basic operations
-        assert!(queue.push(1).is_ok());
-        assert!(queue.push(2).is_ok());
-        assert_eq!(queue.len(), 2);
-
-        assert_eq!(queue.pop(), Some(1));
-        assert_eq!(queue.pop(), Some(2));
-        assert_eq!(queue.pop(), None);
-        assert!(queue.is_empty());
+    fn queue_fifo() {
+        let q = LockFreeQueue::new();
+        q.push(1).unwrap();
+        q.push(2).unwrap();
+        assert_eq!(q.pop(), Some(1));
+        assert_eq!(q.pop(), Some(2));
+        assert_eq!(q.pop(), None);
     }
 }
