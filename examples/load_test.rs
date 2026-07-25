@@ -13,8 +13,7 @@
 //!   --port            Server port (default: 8001 for tcp, 8002 for websocket, 8003 for quic)
 
 use msgtrans::{
-    ClientEvent, QuicClientConfig, TcpClientConfig, TransportClientBuilder, TransportStatus,
-    WebSocketClientConfig,
+    ClientEvent, QuicClientConfig, TcpClientConfig, TransportClientBuilder, WebSocketClientConfig,
 };
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -574,21 +573,13 @@ async fn run_client(
             TestMode::Request => {
                 let start = Instant::now();
                 match transport.request(payload).await {
-                    Ok(result) => {
+                    Ok(response) => {
                         let latency = start.elapsed().as_micros() as u64;
                         stats.record_send(payload.len() as u64);
                         stats.record_latency(latency);
-
-                        if result.status == TransportStatus::Completed {
-                            let received_len = result
-                                .data
-                                .as_ref()
-                                .map(|data| data.len())
-                                .unwrap_or_default();
-                            stats.record_receive(received_len as u64);
-                        } else {
-                            stats.record_error();
-                        }
+                        // Ok now means a real response arrived (a timeout is an
+                        // Err), so the response bytes are counted directly.
+                        stats.record_receive(response.len() as u64);
                     }
                     Err(_) => {
                         stats.record_error();

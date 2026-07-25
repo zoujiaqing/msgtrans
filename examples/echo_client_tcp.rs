@@ -119,22 +119,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Give event processing some time
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // [TARGET] Demonstrate unified request API - returns TransportResult
+    // Unified request API: Ok carries the response bytes, and every failure
+    // (including a timeout) is an Err.
     info!("[REQUEST] Sending request...");
     match transport.request("What time is it?".as_bytes()).await {
-        Ok(result) => {
-            if let Some(response_data) = &result.data {
-                let response_text = String::from_utf8_lossy(response_data);
-                info!(
-                    "[RECV] Response received (ID: {}): {}",
-                    result.message_id, response_text
-                );
-            } else {
-                warn!(
-                    "[WARN] Request result has no data (ID: {})",
-                    result.message_id
-                );
-            }
+        Ok(response) => {
+            info!(
+                "[RECV] Response received: {}",
+                String::from_utf8_lossy(&response)
+            );
         }
         Err(e) => {
             warn!("[WARN] Request failed: {:?}", e);
@@ -142,21 +135,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     match transport.request(b"Binary request").await {
-        Ok(result) => {
-            if let Some(response) = &result.data {
-                info!(
-                    "[RECV] Binary response received (ID: {}): {} bytes",
-                    result.message_id,
-                    response.len()
-                );
-                if let Ok(text) = String::from_utf8(response.to_vec()) {
-                    info!("   Content: {}", text);
-                }
-            } else {
-                warn!(
-                    "[WARN] Binary request result has no data (ID: {})",
-                    result.message_id
-                );
+        Ok(response) => {
+            info!("[RECV] Binary response received: {} bytes", response.len());
+            if let Ok(text) = String::from_utf8(response.to_vec()) {
+                info!("   Content: {}", text);
             }
         }
         Err(e) => {

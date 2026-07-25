@@ -1,5 +1,5 @@
 pub(crate) mod client;
-/// [TRANSPORT] High-performance transport layer module
+/// TRANSPORT High-performance transport layer module
 ///
 /// Provides unified transport abstraction with support for multiple protocols,
 /// lock-free data structures, and intelligent runtime optimization.

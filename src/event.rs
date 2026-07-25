@@ -6,7 +6,6 @@ use crate::{CloseReason, PacketId, SessionId};
 use bytes::Bytes;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
 
 /// Unified abstraction for transport layer events
 #[derive(Debug, Clone)]
@@ -79,7 +78,7 @@ impl TransportEvent {
     }
 }
 
-/// [SIMPLE] User-friendly client events - completely hide Packet complexity.
+/// SIMPLE User-friendly client events - completely hide Packet complexity.
 ///
 /// Not `Clone`: `Request` carries a consuming responder that must be answered
 /// exactly once.
@@ -389,91 +388,27 @@ impl std::fmt::Debug for ClientRequest {
     }
 }
 
-/// [TARGET] Unified transport result - return value for all send operations
+/// Proof that ONE message was handed to the transport, and its id.
+///
+/// Returned by the send paths. What it proves depends on which one produced it:
+/// `send()` returns it only after the bytes were **written** (write-confirmed),
+/// while `send_detached()` returns it once the message is **queued**. It
+/// replaces the 1.x `TransportResult`/`TransportStatus` pair, which could encode
+/// impossible combinations (e.g. `status: Timeout` together with response data,
+/// or `Sent` with no send having been confirmed): failures are now `Err`, and a
+/// request's response is simply the returned `Bytes`.
 #[derive(Debug, Clone)]
-pub struct TransportResult {
-    /// Target session ID (None for client, Some for server)
-    pub peer: Option<SessionId>,
-    /// System-assigned message ID
-    pub message_id: u32,
-    /// Send timestamp
-    pub timestamp: Instant,
-    /// Response data (only for requests, None for sends)
-    pub data: Option<Bytes>,
-    /// Transport status
-    pub status: TransportStatus,
-}
-
-/// Transport status enumeration
-#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
-pub enum TransportStatus {
-    /// Send successful
-    Sent,
-    /// Request timeout
-    Timeout,
-    /// Connection error
-    ConnectionError,
-    /// Send successful and response received
-    Completed,
+pub struct SendReceipt {
+    /// Target session (server side); `None` on the client's single connection.
+    pub peer: Option<SessionId>,
+    /// The id the transport assigned to this message.
+    pub message_id: u32,
 }
 
-impl TransportResult {
-    /// Create send result  
-    pub fn new_sent(peer: Option<SessionId>, message_id: u32) -> Self {
-        Self {
-            peer,
-            message_id,
-            timestamp: Instant::now(),
-            data: None,
-            status: TransportStatus::Sent,
-        }
-    }
-
-    /// Create request completion result
-    pub fn new_completed(peer: Option<SessionId>, message_id: u32, data: impl Into<Bytes>) -> Self {
-        Self {
-            peer,
-            message_id,
-            timestamp: Instant::now(),
-            data: Some(data.into()),
-            status: TransportStatus::Completed,
-        }
-    }
-
-    /// Create timeout result
-    pub fn new_timeout(peer: Option<SessionId>, message_id: u32) -> Self {
-        Self {
-            peer,
-            message_id,
-            timestamp: Instant::now(),
-            data: None,
-            status: TransportStatus::Timeout,
-        }
-    }
-
-    /// Create connection error result
-    pub fn new_connection_error(peer: Option<SessionId>, message_id: u32) -> Self {
-        Self {
-            peer,
-            message_id,
-            timestamp: Instant::now(),
-            data: None,
-            status: TransportStatus::ConnectionError,
-        }
-    }
-
-    /// Check if send was successful
-    pub fn is_sent(&self) -> bool {
-        matches!(
-            self.status,
-            TransportStatus::Sent | TransportStatus::Completed
-        )
-    }
-
-    /// Check if has response data
-    pub fn has_response(&self) -> bool {
-        self.data.is_some()
+impl SendReceipt {
+    pub(crate) fn new(peer: Option<SessionId>, message_id: u32) -> Self {
+        Self { peer, message_id }
     }
 }
 

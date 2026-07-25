@@ -48,7 +48,7 @@ async fn connect(addr: &str) -> TransportClient {
 async fn echo_ok(c: &TransportClient) -> bool {
     matches!(
         tokio::time::timeout(Duration::from_secs(3), c.request(b"ping".as_slice())).await,
-        Ok(Ok(r)) if r.data.as_deref() == Some(b"ping")
+        Ok(Ok(response)) if response.as_ref() == b"ping"
     )
 }
 

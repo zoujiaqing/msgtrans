@@ -1,7 +1,7 @@
 # 🚀 MsgTrans - Modern Multi-Protocol Communication Framework
 
 [![Rust](https://img.shields.io/badge/rust-1.80+-orange.svg)](https://www.rust-lang.org)
-[![License](https://img.shields.io/badge/license-Apache-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-Apache-blue.svg)](https://github.com/zoujiaqing/msgtrans/blob/main/LICENSE)
 [![Crates.io](https://img.shields.io/crates/v/msgtrans.svg)](https://crates.io/crates/msgtrans)
 [![Docs.rs](https://img.shields.io/docsrs/msgtrans)](https://docs.rs/msgtrans)
 
@@ -122,17 +122,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     client.connect().await?;
 
-    // Send a one-way message.
-    client.send("Hello, MsgTrans!".as_bytes()).await?;
-    println!("Message sent");
+    // Send a one-way message. `send` is write-confirmed: it returns once the
+    // bytes reached the socket (use `send_detached` for fire-and-forget).
+    let receipt = client.send("Hello, MsgTrans!".as_bytes()).await?;
+    println!("Message sent (id {})", receipt.message_id);
 
-    // Send a request and wait for the response.
-    let result = client.request("What time is it?".as_bytes()).await?;
-    if let Some(data) = result.data {
-        println!("Received response: {}", String::from_utf8_lossy(&data));
-    } else {
-        println!("Request timed out");
-    }
+    // Send a request and wait for the response. `Ok` carries the response
+    // bytes; every failure, including a timeout, is an `Err`.
+    let response = client.request("What time is it?".as_bytes()).await?;
+    println!("Received response: {}", String::from_utf8_lossy(&response));
 
     // Consume events. The stream has a single consumer and is taken once.
     let mut events = client.events().await?;
@@ -286,12 +284,9 @@ impl SessionHandler for Echo {
 ```rust,no_run
 # use msgtrans::TransportClient;
 # async fn f(client: &TransportClient) -> Result<(), Box<dyn std::error::Error>> {
+// `Ok` carries the response bytes; a timeout is an `Err`.
 let response = client.request(b"Get user data").await?;
-if let Some(data) = response.data {
-    println!("Got {} bytes", data.len());
-} else {
-    println!("Request timed out");
-}
+println!("Got {} bytes", response.len());
 # Ok(()) }
 ```
 
@@ -503,7 +498,7 @@ cargo run --example echo_client_tcp
 
 ## 📝 License
 
-Licensed under the [Apache License 2.0](LICENSE).
+Licensed under the [Apache License 2.0](https://github.com/zoujiaqing/msgtrans/blob/main/LICENSE).
 
 Copyright © 2024 [zoujiaqing](mailto:zoujiaqing@gmail.com)
 

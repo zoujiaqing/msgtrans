@@ -44,13 +44,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           key: features-${{ matrix.features }}
-      - name: Check all targets
-        run: cargo check --no-default-features --features "${{ matrix.features }}" --all-targets
-        env:
-          RUSTFLAGS: -D warnings
+      # Per-combination clippy (not just `cargo check`): every feature
+      # combination must lint clean, so a warning that only appears under, say,
+      # websocket-only cannot slip through.
+      - name: Clippy all targets
+        run: cargo clippy --no-default-features --features "${{ matrix.features }}" --all-targets -- -D warnings
       # --all-targets does NOT cover doctests. The README (the only doctest
       # source) documents the default build and is attached to the crate docs
       # only when all three protocol features are enabled, so the doctest run
@@ -86,6 +89,22 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-features --all-targets -- -D warnings
 
+  # Documentation is part of the frozen 2.0 contract: broken intra-doc links,
+  # links from public items into private ones, and unescaped HTML in doc
+  # comments all fail the build. Without this gate the rendered docs silently
+  # rot (34 such errors existed before it was added).
+  docs:
+    name: rustdoc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Doc (deny warnings)
+        run: cargo doc --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
   # The 2.0 public API is frozen. `public-api.txt` is the committed snapshot of
   # the crate-root surface plus `msgtrans::spi`; this job diffs the live surface
   # against it and fails on any unrecorded add/remove/change. Widening or
@@ -96,7 +115,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      # Nightly is PINNED to a date. rustdoc's JSON output format changes
+      # between nightlies, so a floating toolchain would make the baseline
+      # diff fail (or pass) for reasons unrelated to the API. Bump this date
+      # and regenerate public-api.txt in the same commit.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-07-23
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-public-api
         # Pinned: the tool's output format can change between releases, which
@@ -105,7 +130,7 @@ jobs:
         run: cargo install cargo-public-api --locked --version 0.52.0
       - name: Check public API against committed baseline
         run: |
-          cargo +nightly public-api --all-features -s > /tmp/public-api.current
+          cargo +nightly-2026-07-23 public-api --all-features -s > /tmp/public-api.current
           if ! diff -u public-api.txt /tmp/public-api.current; then
             echo "::error::Public API drifted from public-api.txt. If intended, regenerate with scripts/gen_public_api.sh and commit the result."
             exit 1

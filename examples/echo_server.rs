@@ -69,17 +69,10 @@ impl SessionHandler for EchoHandler {
                 .request(session_id, "Server asks: What is your status?".as_bytes())
                 .await
             {
-                Ok(result) => match &result.data {
-                    Some(data) => println!(
-                        "[SUCCESS] Received client response (ID: {}): \"{}\"",
-                        result.message_id,
-                        String::from_utf8_lossy(data)
-                    ),
-                    None => println!(
-                        "[WARN] Request result has no data (ID: {})",
-                        result.message_id
-                    ),
-                },
+                Ok(response) => println!(
+                    "[SUCCESS] Received client response: \"{}\"",
+                    String::from_utf8_lossy(&response)
+                ),
                 Err(e) => println!("[ERROR] Server request failed: {:?}", e),
             }
         });

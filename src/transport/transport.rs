@@ -157,7 +157,7 @@ impl Transport {
         }
     }
 
-    /// [TARGET] Core method: disconnect connection (graceful shutdown)
+    /// TARGET Core method: disconnect connection (graceful shutdown)
     pub async fn disconnect(&self) -> Result<(), TransportError> {
         if let Some(session_id) = self.current_session_id().await {
             self.close_session(session_id).await
@@ -197,7 +197,7 @@ impl Transport {
         }
     }
 
-    /// [TARGET] Unified close method: graceful session shutdown
+    /// TARGET Unified close method: graceful session shutdown
     pub async fn close_session(&self, session_id: SessionId) -> Result<(), TransportError> {
         // 1. Check if we can start closing
         if !self.state_manager.try_start_closing(session_id).await {
@@ -321,12 +321,12 @@ impl Transport {
         conn.close().await
     }
 
-    /// [TARGET] Core method: check connection status
+    /// TARGET Core method: check connection status
     pub async fn is_connected(&self) -> bool {
         self.slot.lock().await.is_some()
     }
 
-    /// [TARGET] Core method: get current session ID
+    /// TARGET Core method: get current session ID
     pub async fn current_session_id(&self) -> Option<SessionId> {
         self.slot.lock().await.as_ref().map(|s| s.session_id)
     }
@@ -509,7 +509,7 @@ impl Transport {
         }
     }
 
-    /// [TARGET] Decompress and unpack Packet payload, hiding protocol complexity
+    /// TARGET Decompress and unpack Packet payload, hiding protocol complexity
     fn decode_payload(&self, packet: &Packet) -> Result<Bytes, TransportError> {
         // [FIX] If packet is compressed, decompress it
         if packet.header.compression != crate::packet::CompressionType::None {
@@ -529,7 +529,7 @@ impl Transport {
         }
     }
 
-    /// [TARGET] Unified event handling entry point - complete unpacking and send user-friendly events at this layer
+    /// TARGET Unified event handling entry point - complete unpacking and send user-friendly events at this layer
     /// Handle one event from a connection, keyed by the session (generation)
     /// that produced it — never by "whatever session is current now", which a
     /// delayed event from an old connection could otherwise poison.

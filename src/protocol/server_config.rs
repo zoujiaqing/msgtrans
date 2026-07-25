@@ -68,7 +68,7 @@ impl DynProtocolConfig for TcpServerConfig {
     }
 }
 
-/// [CONFIG] New: Implement server-specific configuration
+/// CONFIG New: Implement server-specific configuration
 #[cfg(feature = "tcp")]
 impl crate::protocol::adapter::DynServerConfig for TcpServerConfig {
     fn build_server_dyn(
@@ -225,7 +225,7 @@ impl DynProtocolConfig for WebSocketServerConfig {
     }
 }
 
-/// [CONFIG] New: Implement WebSocket server-specific configuration
+/// CONFIG New: Implement WebSocket server-specific configuration
 #[cfg(feature = "websocket")]
 impl crate::protocol::adapter::DynServerConfig for WebSocketServerConfig {
     fn build_server_dyn(

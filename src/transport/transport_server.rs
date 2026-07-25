@@ -23,6 +23,7 @@ use crate::{
 /// Because the mailbox is bounded, a handler that falls behind slows down only
 /// its own connection. A fan-out bus would instead drop messages for every
 /// subscriber once one of them lagged.
+use bytes::Bytes;
 use std::sync::Arc;
 const PHASE_IDLE: u8 = 0;
 const PHASE_STARTING: u8 = 1;
@@ -119,13 +120,11 @@ pub struct TransportServer {
 impl TransportServer {
     /// Create a server.
     ///
-    /// Every connection is driven by its own [`SessionActor`], which invokes
+    /// Every connection is driven by its own session actor, which invokes
     /// `handler` for that session's messages and lifecycle. This is the only
     /// mode: there is no fan-out event bus, so a slow consumer applies
     /// backpressure to its own connection instead of silently dropping
     /// messages for everyone.
-    ///
-    /// [`SessionActor`]: crate::transport::SessionActor
     pub async fn new(
         config: TransportConfig,
         protocol_configs: std::collections::HashMap<
@@ -189,7 +188,7 @@ impl TransportServer {
         self
     }
 
-    /// [LOCKFREE] Send packet to specified session
+    /// LOCKFREE Send packet to specified session
     ///
     /// The packet is routed through the session actor's mailbox, which serializes
     /// sends per-connection and avoids Mutex contention on the Transport layer.
@@ -302,7 +301,7 @@ impl TransportServer {
         }
     }
 
-    /// [REQUEST] Send request to specified session and wait for response.
+    /// REQUEST Send request to specified session and wait for response.
     ///
     /// Uses TransportServer's own request tracker so responses are matched
     /// consistently at the server layer.
@@ -379,12 +378,13 @@ impl TransportServer {
         }
     }
 
-    /// [UNIFIED] Send byte data to specified session - unified API returns TransportResult
+    /// Send a one-way message to a session, **write-confirmed**: it returns
+    /// only once the bytes reached that session's socket.
     pub async fn send(
         &self,
         session_id: SessionId,
         data: &[u8],
-    ) -> Result<crate::event::TransportResult, TransportError> {
+    ) -> Result<crate::event::SendReceipt, TransportError> {
         let message_id = self.request_registry.next_message_id();
         let packet = crate::packet::Packet::one_way(message_id, data.to_vec());
 
@@ -395,24 +395,19 @@ impl TransportServer {
             message_id
         );
 
-        match self.send_to_session(session_id, packet).await {
-            Ok(()) => {
-                // Send successful, return TransportResult
-                Ok(crate::event::TransportResult::new_sent(
-                    Some(session_id),
-                    message_id,
-                ))
-            }
-            Err(e) => Err(e),
-        }
+        self.send_to_session(session_id, packet).await?;
+        Ok(crate::event::SendReceipt::new(Some(session_id), message_id))
     }
 
-    /// [UNIFIED] Send byte request to specified session and wait for response - unified API returns TransportResult
+    /// Send a request to a session and await the response payload.
+    ///
+    /// `Ok` carries the response bytes; every failure — including a **timeout**
+    /// — is an `Err` (1.x reported a timeout as `Ok(status: Timeout)`).
     pub async fn request(
         &self,
         session_id: SessionId,
         data: &[u8],
-    ) -> Result<crate::event::TransportResult, TransportError> {
+    ) -> Result<Bytes, TransportError> {
         let message_id = self.request_registry.next_message_id();
         let packet = crate::packet::Packet::request(message_id, data.to_vec());
 
@@ -423,32 +418,14 @@ impl TransportServer {
             message_id
         );
 
-        match self.request_to_session(session_id, packet).await {
-            Ok(response_packet) => {
-                tracing::debug!(
-                    "TransportServer received response from session {}: {} bytes (ID: {})",
-                    session_id,
-                    response_packet.payload.len(),
-                    response_packet.header.message_id
-                );
-                // Request successful, return TransportResult containing response data
-                Ok(crate::event::TransportResult::new_completed(
-                    Some(session_id),
-                    message_id,
-                    response_packet.payload.clone(),
-                ))
-            }
-            Err(e) => {
-                if matches!(e, TransportError::Timeout { .. }) {
-                    Ok(crate::event::TransportResult::new_timeout(
-                        Some(session_id),
-                        message_id,
-                    ))
-                } else {
-                    Err(e)
-                }
-            }
-        }
+        let response_packet = self.request_to_session(session_id, packet).await?;
+        tracing::debug!(
+            "TransportServer received response from session {}: {} bytes (ID: {})",
+            session_id,
+            response_packet.payload.len(),
+            response_packet.header.message_id
+        );
+        Ok(response_packet.payload)
     }
 
     /// Add a session carrying its connection-cap permit. The permit is moved
@@ -777,7 +754,7 @@ impl TransportServer {
         }
     }
 
-    /// [UNIFIED] Unified close method: graceful session close
+    /// UNIFIED Unified close method: graceful session close
     pub async fn close_session(&self, session_id: SessionId) -> Result<(), TransportError> {
         // 1. Check if close can be started
         if !self.state_manager.try_start_closing(session_id).await {
@@ -811,7 +788,7 @@ impl TransportServer {
         Ok(())
     }
 
-    /// [FORCE] Force close session
+    /// FORCE Force close session
     pub async fn force_close_session(&self, session_id: SessionId) -> Result<(), TransportError> {
         // 1. Check if close can be started
         if !self.state_manager.try_start_closing(session_id).await {
@@ -843,7 +820,7 @@ impl TransportServer {
         Ok(())
     }
 
-    /// [BATCH] Batch close all sessions
+    /// BATCH Batch close all sessions
     pub async fn close_all_sessions(&self) -> Result<(), TransportError> {
         let session_ids = self.active_sessions().await;
         let total_sessions = session_ids.len();
@@ -1169,7 +1146,7 @@ impl TransportServer {
         tracing::info!("[TARGET] All protocol servers started, waiting for connections...");
         Ok(())
     }
-    /// [START] Start protocol listener - generic method
+    /// START Start protocol listener - generic method
     async fn start_protocol_listener(
         &self,
         mut server: Box<dyn crate::Server>,
@@ -1323,7 +1300,7 @@ impl TransportServer {
         })
     }
 
-    /// [INTERNAL] Internal method: extract listen address from protocol configuration
+    /// INTERNAL Internal method: extract listen address from protocol configuration
     fn get_protocol_bind_address(
         &self,
         protocol_config: &dyn crate::protocol::adapter::DynServerConfig,
@@ -1331,7 +1308,7 @@ impl TransportServer {
         protocol_config.get_bind_address()
     }
 
-    /// [STOP] Stop accepting new connections (listeners + scanner). Existing
+    /// STOP Stop accepting new connections (listeners + scanner). Existing
     /// sessions keep running; nothing is awaited. For a verifiable teardown
     /// use [`Self::shutdown`].
     pub async fn stop(&self) {

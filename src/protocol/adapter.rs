@@ -26,7 +26,7 @@ pub trait DynProtocolConfig: Send + Sync + 'static {
     /// Convert to Any to support downcasting
     fn as_any(&self) -> &dyn std::any::Any;
 
-    /// Clone as Box<dyn DynProtocolConfig>
+    /// Clone as `Box<dyn DynProtocolConfig>`
     fn clone_dyn(&self) -> Box<dyn DynProtocolConfig>;
 }
 
@@ -49,7 +49,7 @@ pub trait DynServerConfig: DynProtocolConfig {
     /// Get bind address
     fn get_bind_address(&self) -> std::net::SocketAddr;
 
-    /// Clone as Box<dyn DynServerConfig>
+    /// Clone as `Box<dyn DynServerConfig>`
     fn clone_server_dyn(&self) -> Box<dyn DynServerConfig>;
 }
 
@@ -72,7 +72,7 @@ pub trait DynClientConfig: DynProtocolConfig {
     /// Get target information (could be SocketAddr or URL)
     fn get_target_info(&self) -> String;
 
-    /// Clone as Box<dyn DynClientConfig>
+    /// Clone as `Box<dyn DynClientConfig>`
     fn clone_client_dyn(&self) -> Box<dyn DynClientConfig>;
 }
 

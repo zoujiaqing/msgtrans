@@ -181,14 +181,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Send request
     println!("[REQUEST] Sending request...");
-    let response = client.request(b"What time is it?").await?;
-    if let Some(data) = response.data {
-        println!(
+    // Ok carries the response bytes; a timeout is an Err.
+    match client.request(b"What time is it?").await {
+        Ok(response) => println!(
             "[SUCCESS] Received response: {}",
-            String::from_utf8_lossy(&data)
-        );
-    } else {
-        println!("[WARN] Request timeout or no response");
+            String::from_utf8_lossy(&response)
+        ),
+        Err(e) => println!("[WARN] Request failed: {:?}", e),
     }
 
     // Wait for event processing

@@ -85,8 +85,7 @@ impl From<SessionId> for u64 {
 pub use command::{ConnectionInfo, ConnectionState};
 pub use error::{CloseReason, TransportError};
 pub use event::{
-    ClientEvent, ClientMessage, ClientRequest, RespondOutcome, TransportEvent, TransportResult,
-    TransportStatus,
+    ClientEvent, ClientMessage, ClientRequest, RespondOutcome, SendReceipt, TransportEvent,
 };
 pub use packet::{
     CompressionType, DecodeLimits, FramePolicy, Packet, PacketError, PacketType, ReservedFlags,

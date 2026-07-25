@@ -439,7 +439,7 @@ async fn quic_custom_transport_parameters_smoke() {
         .await
         .expect("no timeout")
         .expect("echo works with custom transport parameters");
-    assert_eq!(reply.data.as_deref(), Some(b"ping".as_slice()));
+    assert_eq!(reply.as_ref(), b"ping");
     let _ = client.shutdown().await;
     let _ = server.shutdown_with_timeout(Duration::from_secs(5)).await;
 }

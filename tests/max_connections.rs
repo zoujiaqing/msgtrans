@@ -38,7 +38,7 @@ async fn connect_client(addr: &str) -> TransportClient {
 
 async fn echo_works(client: &TransportClient) -> bool {
     match tokio::time::timeout(Duration::from_secs(3), client.request(b"ping".as_slice())).await {
-        Ok(Ok(result)) => result.data.as_deref() == Some(b"ping"),
+        Ok(Ok(response)) => response.as_ref() == b"ping",
         _ => false,
     }
 }

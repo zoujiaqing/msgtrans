@@ -95,22 +95,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     tracing::info!("[REQUEST] Sending request...");
-    // [TARGET] Simplified request API
+    // Request API: Ok carries the response bytes, a timeout is an Err.
     match transport.request(b"What time is it?").await {
-        Ok(result) => {
-            if let Some(response_data) = result.data {
-                let content = String::from_utf8_lossy(&response_data);
-                tracing::info!(
-                    "[RECV] Response received (ID: {}): {}",
-                    result.message_id,
-                    content
-                );
-            } else {
-                tracing::warn!(
-                    "[WARN] Request response data is empty (ID: {})",
-                    result.message_id
-                );
-            }
+        Ok(response) => {
+            tracing::info!(
+                "[RECV] Response received: {}",
+                String::from_utf8_lossy(&response)
+            );
         }
         Err(e) => {
             tracing::error!("[ERROR] Request failed: {:?}", e);
@@ -118,21 +109,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     match transport.request(b"Binary request").await {
-        Ok(result) => {
-            if let Some(response_data) = result.data {
-                tracing::info!(
-                    "[RECV] Binary response received (ID: {}): {} bytes",
-                    result.message_id,
-                    response_data.len()
-                );
-                let content = String::from_utf8_lossy(&response_data);
-                tracing::info!("   Content: {}", content);
-            } else {
-                tracing::warn!(
-                    "[WARN] Binary request response data is empty (ID: {})",
-                    result.message_id
-                );
-            }
+        Ok(response) => {
+            tracing::info!("[RECV] Binary response received: {} bytes", response.len());
+            tracing::info!("   Content: {}", String::from_utf8_lossy(&response));
         }
         Err(e) => {
             tracing::error!("[ERROR] Binary request failed: {:?}", e);

@@ -73,7 +73,14 @@ pub trait SessionHandler: Send + Sync + 'static {
         let _ = (session_id, info); // Default: no-op
     }
 
-    /// Called once a packet has been handed to the connection for sending
+    /// Called once a packet has been handed to the connection for sending.
+    ///
+    /// **Best-effort / droppable.** Send confirmations travel on the
+    /// diagnostic channel, which is deliberately dropped under load so that a
+    /// backlog of confirmations can never displace real data events. Never
+    /// treat a missing call as "the message was not sent", and never use this
+    /// as a delivery ledger — use the write-confirmed send paths
+    /// (`TransportServer::send`, `Responder::respond`) when you need proof.
     async fn on_message_sent(&self, session_id: SessionId, message_id: u32) {
         let _ = (session_id, message_id); // Default: no-op
     }
@@ -133,7 +140,7 @@ impl SessionSender {
 ///
 /// Not `Clone`: exactly one responder exists per delivered request, minted by
 /// the dispatch layer together with the request's unforgeable
-/// [`RequestToken`]. `respond(self)` consumes it — a second response is a
+/// `RequestToken`. `respond(self)` consumes it — a second response is a
 /// compile error, not a runtime dedup. Dropping it without responding leaves
 /// the request to the lifecycle machinery (timeout scan / session-close
 /// drain), which is the correct outcome for a request the business chose to

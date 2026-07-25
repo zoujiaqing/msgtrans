@@ -1,4 +1,4 @@
-/// [CONFIG] Event-driven QUIC adapter
+/// CONFIG Event-driven QUIC adapter
 ///
 /// This is the modernized version of QUIC adapter, supporting:
 /// - Bidirectional stream multiplexing

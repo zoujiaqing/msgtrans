@@ -151,10 +151,10 @@ impl Default for TransportClientBuilder {
     }
 }
 
-/// [TARGET] Transport layer client - Uses Transport for single connection management
+/// TARGET Transport layer client - Uses Transport for single connection management
 /// Dropping a TransportClient deterministically REQUESTS cancellation (the
 /// abort cannot be skipped) but does not join the task; resources are then
-/// released by cascade — background tasks hold only Weak<Transport>, so the
+/// released by cascade — background tasks hold only `Weak<Transport>`, so the
 /// Transport, connection, socket and the server-side session/permit are freed
 /// shortly after, without an explicit disconnect(). Completion guarantees
 /// belong to [`Self::shutdown`], which joins the owned teardown task.
@@ -230,7 +230,7 @@ impl TransportClient {
         }
     }
 
-    /// [CONNECT] Use protocol configuration specified at build time for connection - Framework's only connection method
+    /// CONNECT Use protocol configuration specified at build time for connection - Framework's only connection method
     pub async fn connect(&mut self) -> Result<(), TransportError> {
         // Lifecycle gate BEFORE any network work: a shut-down client's event
         // receiver is permanently gone, so a connection made here could send
@@ -300,7 +300,7 @@ impl TransportClient {
         *slot = Some(handle.abort_handle());
     }
 
-    /// [CONFIG] Internal method: Connect using stored protocol configuration
+    /// CONFIG Internal method: Connect using stored protocol configuration
     async fn connect_with_stored_config(
         &mut self,
         protocol_config: &dyn DynClientConfig,
@@ -494,7 +494,7 @@ impl TransportClient {
         }
     }
 
-    /// [DISCONNECT] Disconnect (graceful close)
+    /// DISCONNECT Disconnect (graceful close)
     ///
     /// Reconnectable: closes the current connection and this generation's
     /// pending requests, but leaves the client (and its forwarding task)
@@ -517,7 +517,7 @@ impl TransportClient {
         }
     }
 
-    /// [FORCE] Force disconnect
+    /// FORCE Force disconnect
     pub async fn force_disconnect(&self) -> Result<(), TransportError> {
         // Check if already connected
         let mut current_session = self.current_session_id.write().await;
@@ -535,9 +535,12 @@ impl TransportClient {
         }
     }
 
-    /// [SEND] Send byte data - Unified API returns TransportResult
-    pub async fn send(&self, data: &[u8]) -> Result<crate::event::TransportResult, TransportError> {
-        if !self.is_connected().await {
+    /// Send a one-way message, **write-confirmed**: it returns only once the
+    /// bytes have reached the socket, so `Ok` really means sent. Use
+    /// [`Self::send_detached`] for the fire-and-forget throughput path.
+    pub async fn send(&self, data: &[u8]) -> Result<crate::event::SendReceipt, TransportError> {
+        let session_id = self.current_session_id().await;
+        if session_id.is_none() {
             return Err(TransportError::connection_error(
                 "Not connected - call connect() first",
                 false,
@@ -553,20 +556,40 @@ impl TransportClient {
             message_id
         );
 
-        match self.inner.send(packet).await {
-            Ok(()) => {
-                // Send successful, return TransportResult
-                Ok(crate::event::TransportResult::new_sent(None, message_id))
-            }
-            Err(e) => Err(e),
-        }
+        self.inner
+            .send_confirmed_with(packet, session_id, None)
+            .await?;
+        Ok(crate::event::SendReceipt::new(None, message_id))
     }
 
-    /// [REQUEST] Send byte request and wait for response - Unified API returns TransportResult
-    pub async fn request(
+    /// Send a one-way message without waiting for the write: `Ok` means the
+    /// message was **queued**, not that it reached the socket. This is the
+    /// explicit throughput tier — a failure after enqueue is reported only via
+    /// the connection's error/close events.
+    pub async fn send_detached(
         &self,
         data: &[u8],
-    ) -> Result<crate::event::TransportResult, TransportError> {
+    ) -> Result<crate::event::SendReceipt, TransportError> {
+        if !self.is_connected().await {
+            return Err(TransportError::connection_error(
+                "Not connected - call connect() first",
+                false,
+            ));
+        }
+
+        let message_id = self.inner.next_message_id();
+        let packet = crate::packet::Packet::one_way(message_id, data.to_vec());
+        self.inner.send(packet).await?;
+        Ok(crate::event::SendReceipt::new(None, message_id))
+    }
+
+    /// Send a request and await the response payload.
+    ///
+    /// `Ok` carries the response bytes; every failure — including a **timeout**
+    /// — is an `Err`. (1.x returned `Ok(TransportResult { status: Timeout })`
+    /// for a timeout, so a caller who only checked `is_ok()` treated a request
+    /// that never got an answer as success.)
+    pub async fn request(&self, data: &[u8]) -> Result<Bytes, TransportError> {
         if !self.is_connected().await {
             return Err(TransportError::connection_error(
                 "Not connected - call connect() first",
@@ -583,31 +606,16 @@ impl TransportClient {
             message_id
         );
 
-        match self.inner.request(packet).await {
-            Ok(response_packet) => {
-                tracing::debug!(
-                    "TransportClient received response: {} bytes (ID: {})",
-                    response_packet.payload.len(),
-                    response_packet.header.message_id
-                );
-                // Request successful, return TransportResult containing response data
-                Ok(crate::event::TransportResult::new_completed(
-                    None,
-                    message_id,
-                    response_packet.payload.clone(),
-                ))
-            }
-            Err(e) => {
-                if matches!(e, TransportError::Timeout { .. }) {
-                    Ok(crate::event::TransportResult::new_timeout(None, message_id))
-                } else {
-                    Err(e)
-                }
-            }
-        }
+        let response_packet = self.inner.request(packet).await?;
+        tracing::debug!(
+            "TransportClient received response: {} bytes (ID: {})",
+            response_packet.payload.len(),
+            response_packet.header.message_id
+        );
+        Ok(response_packet.payload)
     }
 
-    /// [STATUS] Check connection status
+    /// STATUS Check connection status
     pub async fn is_connected(&self) -> bool {
         self.inner.is_connected().await
     }
@@ -634,7 +642,7 @@ impl TransportClient {
         }
     }
 
-    /// [START] Start event forwarding task
+    /// START Start event forwarding task
     async fn start_event_forwarding(&self) -> Result<(), TransportError> {
         if self
             .event_forwarding_running
@@ -792,7 +800,7 @@ impl TransportClient {
         }
     }
 
-    /// [SEND] Send request and wait for response (with options)
+    /// SEND Send request and wait for response (with options)
     pub async fn request_with_options(
         &self,
         data: Bytes,
@@ -801,7 +809,7 @@ impl TransportClient {
         self.inner.request_with_options(data, options).await
     }
 
-    /// [SEND] Send one-way message (with options)
+    /// SEND Send one-way message (with options)
     pub async fn send_with_options(
         &self,
         data: Bytes,

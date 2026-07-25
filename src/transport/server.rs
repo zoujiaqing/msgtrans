@@ -66,7 +66,7 @@ impl TransportServerBuilder {
 
     /// Set buffer size for actor channels (default: 2048).
     ///
-    /// Prefer [`Self::limits`] with [`ServerLimits::mailbox_capacity`]; this
+    /// Prefer [`Self::limits`] with `ServerLimits::mailbox_capacity`; this
     /// remains as a focused shortcut.
     pub fn actor_buffer_size(mut self, size: usize) -> Self {
         self.actor_buffer_size = Some(size);
