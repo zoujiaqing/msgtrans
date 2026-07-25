@@ -109,7 +109,7 @@ pub use protocol::{QuicClientConfig, QuicServerConfig};
 #[cfg(feature = "tcp")]
 pub use protocol::{TcpClientConfig, TcpServerConfig};
 // Re-export new abstractions
-pub use connection::{Connection, Server, WriteCompletion};
+pub use connection::{Connection, ConnectionWriter, Server, WriteCompletion};
 pub use transport::limits::{ClientLimits, ConnectionLimits, ServerLimits};
 
 // Convenient type aliases

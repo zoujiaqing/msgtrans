@@ -24,6 +24,11 @@ pub struct TaggedClientEvent {
 struct ConnectionSlot {
     session_id: SessionId,
     connection: Box<dyn Connection>,
+    /// This connection's write handle, captured once when the connection is
+    /// installed. Senders clone it under the slot lock and then RELEASE the
+    /// lock before awaiting the enqueue, so a saturated outbound queue can
+    /// never park reconnect/close/shutdown behind the waiting senders.
+    writer: Arc<dyn crate::connection::ConnectionWriter>,
 }
 
 /// Single connection transport abstraction — one instance per socket.
@@ -83,24 +88,29 @@ impl Transport {
     /// path). Fire-and-forget tier of the single send SPI: the enqueue result
     /// is the only signal.
     pub async fn send(&self, packet: Packet) -> Result<(), TransportError> {
-        let mut guard = self.slot.lock().await;
-        match guard.as_mut() {
-            Some(slot) => {
-                slot.connection
-                    .send_with_completion(packet, crate::connection::WriteCompletion::detached())
-                    .await
+        // Clone the writer under the lock, then DROP the lock: the enqueue
+        // below may wait on backpressure, and holding the slot lock across
+        // that wait would serialize reconnect/close/shutdown behind senders.
+        let writer = {
+            let guard = self.slot.lock().await;
+            match guard.as_ref() {
+                Some(slot) => slot.writer.clone(),
+                None => return Err(TransportError::connection_error("Not connected", false)),
             }
-            None => Err(TransportError::connection_error("Not connected", false)),
-        }
+        };
+        writer
+            .send_with_completion(packet, crate::connection::WriteCompletion::detached())
+            .await
     }
 
     /// Confirmed send bound to a connection generation and (optionally) a
     /// respond claim.
     ///
     /// - `expected_session`: validated against the CURRENT slot's generation
-    ///   under the slot lock, atomically with the enqueue. A response created
-    ///   against generation N can therefore never be written onto generation
-    ///   N+1 after a reconnect.
+    ///   under the slot lock, atomically with taking that generation's writer.
+    ///   A response created against generation N is therefore enqueued on
+    ///   generation N's queue or not at all — never onto generation N+1 after a
+    ///   reconnect — even though the lock is released before the enqueue.
     /// - `claim`: moved into the [`WriteCompletion`] in the same poll that
     ///   created it, BEFORE the first await. From that point every path —
     ///   cancellation of this future, enqueue rejection, connection death,
@@ -115,9 +125,14 @@ impl Transport {
         // Created before the first await: cancellation from here on drops the
         // completion, which reports failure to the claim and the observer.
         let completion = crate::connection::WriteCompletion::new(Some(observer_tx), claim);
-        {
-            let mut guard = self.slot.lock().await;
-            match guard.as_mut() {
+        // Validate the generation and take the writer under the lock, then
+        // release it. The captured writer belongs to the generation we just
+        // validated, so the "never write onto a replacement connection"
+        // guarantee is preserved WITHOUT holding the lock across the enqueue's
+        // backpressure wait.
+        let writer = {
+            let guard = self.slot.lock().await;
+            match guard.as_ref() {
                 Some(slot) => {
                     if let Some(expected) = expected_session {
                         if slot.session_id != expected {
@@ -130,15 +145,14 @@ impl Transport {
                             ));
                         }
                     }
-                    slot.connection
-                        .send_with_completion(packet, completion)
-                        .await?
+                    slot.writer.clone()
                 }
                 None => {
                     return Err(TransportError::connection_error("Not connected", false));
                 }
             }
-        }
+        };
+        writer.send_with_completion(packet, completion).await?;
         crate::adapters::outbound::await_receipt(observer_rx, "connection closed before write")
             .await
     }
@@ -357,9 +371,11 @@ impl Transport {
             let session_id = SessionId::new(epoch);
             connection.set_session_id(session_id);
             let event_pipe_opt = connection.take_event_pipe();
+            let writer = connection.writer();
             *guard = Some(ConnectionSlot {
                 session_id,
                 connection,
+                writer,
             });
             (session_id, event_pipe_opt)
         };
@@ -428,9 +444,11 @@ impl Transport {
         session_id: SessionId,
     ) {
         connection.set_session_id(session_id);
+        let writer = connection.writer();
         *self.slot.lock().await = Some(ConnectionSlot {
             session_id,
             connection,
+            writer,
         });
         self.state_manager.add_connection(session_id);
         tracing::debug!(
@@ -878,16 +896,30 @@ mod generation_tests {
         sent: Arc<std::sync::atomic::AtomicUsize>,
     }
 
+    /// Writer half of `MockConn`: counts sends and confirms immediately.
+    struct MockWriter {
+        sent: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
     #[async_trait::async_trait]
-    impl Connection for MockConn {
+    impl crate::connection::ConnectionWriter for MockWriter {
         async fn send_with_completion(
-            &mut self,
+            &self,
             _packet: Packet,
             completion: crate::connection::WriteCompletion,
         ) -> Result<(), TransportError> {
             self.sent.fetch_add(1, Ordering::SeqCst);
             completion.complete(Ok(()));
             Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Connection for MockConn {
+        fn writer(&self) -> Arc<dyn crate::connection::ConnectionWriter> {
+            Arc::new(MockWriter {
+                sent: self.sent.clone(),
+            })
         }
         async fn close(&mut self) -> Result<(), TransportError> {
             self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1064,5 +1096,94 @@ mod generation_tests {
             .on_event(id2, crate::event::TransportEvent::MessageReceived(good))
             .await;
         assert_eq!(rx.try_recv().expect("delivered").payload, b"good"[..]);
+    }
+
+    /// The connection lock must NOT be held across the enqueue await.
+    ///
+    /// A writer that parks forever stands in for a saturated outbound queue.
+    /// While a sender is parked inside `send_with_completion`, a lifecycle
+    /// operation that needs the slot lock must still make progress. Before the
+    /// `ConnectionWriter` split the lock was held across the enqueue, so this
+    /// deadlocked (the assert below timed out).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lifecycle_lock_is_free_while_a_sender_is_parked() {
+        /// Never resolves: models an outbound queue that never drains.
+        struct ParkedWriter;
+
+        #[async_trait::async_trait]
+        impl crate::connection::ConnectionWriter for ParkedWriter {
+            async fn send_with_completion(
+                &self,
+                _packet: Packet,
+                completion: crate::connection::WriteCompletion,
+            ) -> Result<(), TransportError> {
+                std::future::pending::<()>().await;
+                drop(completion);
+                Ok(())
+            }
+        }
+
+        struct ParkedConn {
+            session_id: SessionId,
+        }
+
+        #[async_trait::async_trait]
+        impl Connection for ParkedConn {
+            fn writer(&self) -> Arc<dyn crate::connection::ConnectionWriter> {
+                Arc::new(ParkedWriter)
+            }
+            async fn close(&mut self) -> Result<(), TransportError> {
+                Ok(())
+            }
+            fn set_frame_policy(&self, _policy: crate::packet::FramePolicy) {}
+            fn session_id(&self) -> SessionId {
+                self.session_id
+            }
+            fn set_session_id(&mut self, session_id: SessionId) {
+                self.session_id = session_id;
+            }
+            fn connection_info(&self) -> crate::command::ConnectionInfo {
+                crate::command::ConnectionInfo::default()
+            }
+            fn is_connected(&self) -> bool {
+                true
+            }
+            async fn flush(&mut self) -> Result<(), TransportError> {
+                Ok(())
+            }
+            fn take_event_pipe(&mut self) -> Option<crate::spi::ConnectionEvents> {
+                None
+            }
+        }
+
+        let ctx = TransportContext::new().await.expect("ctx");
+        let transport = Arc::new(Transport::with_context(TransportConfig::default(), &ctx));
+        let session_id = transport
+            .set_connection(Box::new(ParkedConn {
+                session_id: SessionId::new(0),
+            }))
+            .await;
+
+        // Park a sender inside the enqueue, forever.
+        let sender = {
+            let transport = transport.clone();
+            tokio::spawn(async move { transport.send(Packet::one_way(1, b"x".to_vec())).await })
+        };
+        // Let it actually reach the enqueue.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // A lifecycle operation needing the SAME slot lock must not block.
+        let closed = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            transport.close_session(session_id),
+        )
+        .await;
+        assert!(
+            closed.is_ok(),
+            "close_session blocked behind a sender parked in the enqueue: the \
+             connection lock is being held across the await"
+        );
+
+        sender.abort();
     }
 }

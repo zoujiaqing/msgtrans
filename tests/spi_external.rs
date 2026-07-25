@@ -3,8 +3,8 @@
 
 use async_trait::async_trait;
 use msgtrans::spi::{
-    event_channel, CloseReason, Connection, ConnectionEvents, ConnectionInfo, EventSink, Packet,
-    SessionId, TransportError, TransportEvent, WriteCompletion,
+    event_channel, CloseReason, Connection, ConnectionEvents, ConnectionInfo, ConnectionWriter,
+    EventSink, Packet, SessionId, TransportError, TransportEvent, WriteCompletion,
 };
 use msgtrans::FramePolicy;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -34,10 +34,14 @@ impl MyConnection {
     }
 }
 
+/// The connection's write half. Separating it from the connection object is
+/// what lets the transport enqueue without holding its connection lock.
+struct MyWriter;
+
 #[async_trait]
-impl Connection for MyConnection {
+impl ConnectionWriter for MyWriter {
     async fn send_with_completion(
-        &mut self,
+        &self,
         _packet: Packet,
         completion: WriteCompletion,
     ) -> Result<(), TransportError> {
@@ -45,6 +49,13 @@ impl Connection for MyConnection {
         // confirm immediately to exercise the completion API.
         completion.complete(Ok(()));
         Ok(())
+    }
+}
+
+#[async_trait]
+impl Connection for MyConnection {
+    fn writer(&self) -> Arc<dyn ConnectionWriter> {
+        Arc::new(MyWriter)
     }
     async fn close(&mut self) -> Result<(), TransportError> {
         self.connected = false;

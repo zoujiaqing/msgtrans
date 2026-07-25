@@ -826,19 +826,12 @@ impl QuicAdapter<QuicClientConfig> {
 
 #[async_trait]
 impl<C: Send + Sync + 'static> Connection for QuicAdapter<C> {
-    async fn send_with_completion(
-        &mut self,
-        packet: Packet,
-        completion: crate::connection::WriteCompletion,
-    ) -> Result<(), TransportError> {
-        crate::adapters::outbound::send_with_completion_bounded(
-            &self.send_queue,
-            packet,
-            completion,
+    fn writer(&self) -> std::sync::Arc<dyn crate::connection::ConnectionWriter> {
+        std::sync::Arc::new(crate::adapters::outbound::QueueWriter::new(
+            self.send_queue.clone(),
             "quic_outbound_queue",
             "QUIC connection closed",
-        )
-        .await
+        ))
     }
 
     async fn close(&mut self) -> Result<(), TransportError> {

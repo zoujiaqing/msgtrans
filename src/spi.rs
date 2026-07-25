@@ -8,7 +8,7 @@
 //! implement [`ServerConfig`]/[`ClientConfig`] (and their object-safe
 //! `DynServerConfig`/`DynClientConfig`).
 
-pub use crate::connection::{Connection, Server, WriteCompletion};
+pub use crate::connection::{Connection, ConnectionWriter, Server, WriteCompletion};
 pub use crate::packet::Packet;
 pub use crate::protocol::adapter::{
     ClientConfig, ConfigError, DynClientConfig, DynProtocolConfig, DynServerConfig, ProtocolConfig,

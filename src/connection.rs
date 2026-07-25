@@ -1,7 +1,34 @@
 use crate::transport::request_registry::RespondClaim;
 use crate::{command::ConnectionInfo, error::TransportError, packet::Packet, SessionId};
 use async_trait::async_trait;
+use std::sync::Arc;
 use tokio::sync::oneshot;
+
+/// The SINGLE send entry point, split off the connection object so the send
+/// path never holds the transport's connection lock (see
+/// [`Connection::writer`]).
+///
+/// There is deliberately no parallel `send()` — the fire-and-forget tier is
+/// [`WriteCompletion::detached`], so enqueue, write receipt, cancellation and
+/// close all flow through one ownership model.
+#[async_trait]
+pub trait ConnectionWriter: Send + Sync {
+    /// Enqueue a packet carrying its write completion.
+    ///
+    /// Contract: the completion must be resolved with the REAL write result —
+    /// `complete(Ok(()))` only after the bytes reached the socket (or its OS
+    /// buffer), `complete(Err(..))` when the write failed. An implementation
+    /// that can no longer write must DROP the completion (dropping reports
+    /// failure by construction); it must never invent an `Ok`.
+    ///
+    /// This only enqueues, and may await backpressure while the outbound queue
+    /// is full — which is safe precisely because no lock is held here.
+    async fn send_with_completion(
+        &self,
+        packet: Packet,
+        completion: WriteCompletion,
+    ) -> Result<(), TransportError>;
+}
 
 /// The completion of one write: the single ownership handle for "what
 /// happened to this packet". Stable SPI type — adapters receive it with
@@ -63,25 +90,19 @@ impl WriteCompletion {
 /// In v2.0, adapters implement this trait directly — no wrapper types needed.
 #[async_trait]
 pub trait Connection: Send + Sync + std::any::Any {
-    /// The SINGLE send entry point: enqueue a packet carrying its write
-    /// completion. There is deliberately no parallel `send()` — the
-    /// fire-and-forget tier is [`WriteCompletion::detached`], so enqueue,
-    /// write receipt, cancellation and close all flow through one ownership
-    /// model.
+    /// Hand out this connection's write handle.
     ///
-    /// Contract: the completion must be resolved with the REAL write result —
-    /// `complete(Ok(()))` only after the bytes reached the socket (or its OS
-    /// buffer), `complete(Err(..))` when the write failed. An implementation
-    /// that can no longer write must DROP the completion (dropping reports
-    /// failure by construction); it must never invent an Ok. This method only
-    /// enqueues: callers reach it through a connection lock and await the
-    /// completion's observer AFTER releasing it, or one slow write would
-    /// serialize every other sender.
-    async fn send_with_completion(
-        &mut self,
-        packet: Packet,
-        completion: WriteCompletion,
-    ) -> Result<(), TransportError>;
+    /// The handle is cheap to clone and independent of the connection object,
+    /// which is what keeps the transport's connection lock OFF the send path:
+    /// the transport takes the lock only long enough to validate the generation
+    /// and clone the writer, then releases it and awaits the (possibly
+    /// backpressured) enqueue. Holding the lock across that wait would let one
+    /// saturated queue park reconnect/close/shutdown behind every sender.
+    ///
+    /// Implementations return a handle over their outbound queue sender; it
+    /// must stay bound to THIS connection, so a writer captured before a
+    /// reconnect can never write onto the replacement connection.
+    fn writer(&self) -> Arc<dyn ConnectionWriter>;
 
     /// Close connection
     async fn close(&mut self) -> Result<(), TransportError>;

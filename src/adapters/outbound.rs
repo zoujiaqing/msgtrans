@@ -100,6 +100,53 @@ async fn send_item(
     }
 }
 
+/// The `ConnectionWriter` every built-in adapter hands out: a clone of its
+/// bounded outbound-queue sender plus the labels used in its error messages.
+///
+/// It is independent of the adapter object, so the transport can clone it under
+/// the connection lock and then release the lock BEFORE awaiting the (possibly
+/// backpressured) enqueue. The clone stays bound to the queue of the connection
+/// it came from, so a writer captured before a reconnect drains into the old
+/// connection's queue (whose writes fail once it dies) and can never write onto
+/// the replacement connection.
+pub(crate) struct QueueWriter {
+    queue: mpsc::Sender<Outbound>,
+    queue_name: &'static str,
+    closed_msg: &'static str,
+}
+
+impl QueueWriter {
+    pub(crate) fn new(
+        queue: mpsc::Sender<Outbound>,
+        queue_name: &'static str,
+        closed_msg: &'static str,
+    ) -> Self {
+        Self {
+            queue,
+            queue_name,
+            closed_msg,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::connection::ConnectionWriter for QueueWriter {
+    async fn send_with_completion(
+        &self,
+        packet: Packet,
+        completion: WriteCompletion,
+    ) -> Result<(), TransportError> {
+        send_with_completion_bounded(
+            &self.queue,
+            packet,
+            completion,
+            self.queue_name,
+            self.closed_msg,
+        )
+        .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
