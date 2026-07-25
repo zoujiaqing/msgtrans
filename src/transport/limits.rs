@@ -20,7 +20,7 @@ pub const DEFAULT_OUTBOUND_CAPACITY: usize = 2048;
 pub const DEFAULT_MAILBOX_CAPACITY: usize = 2048;
 
 /// The immutable per-connection limits threaded into every adapter — the SPI
-/// parameter for [`crate::protocol::adapter::ServerConfig::build_server`] /
+/// parameter for the protocol config's server builder /
 /// `build_connection`. Construct via [`ServerLimits`]/[`ClientLimits`]; read
 /// the values with the accessors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

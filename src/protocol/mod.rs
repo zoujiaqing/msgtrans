@@ -23,7 +23,7 @@ pub use server_config::TcpServerConfig;
 pub use server_config::WebSocketServerConfig;
 
 // Re-export adapter configuration
-pub use adapter::{ClientConfig, ServerConfig};
+
 // `ProtocolConfig`/`ConfigError` are only referenced by the protocol adapters
 // and their configs, all of which are feature-gated; a no-protocol build uses
 // neither. (The SPI re-exports them from `adapter` directly.)

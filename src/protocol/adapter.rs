@@ -22,12 +22,6 @@ pub trait DynProtocolConfig: Send + Sync + 'static {
 
     /// Validate configuration
     fn validate_dyn(&self) -> Result<(), ConfigError>;
-
-    /// Convert to Any to support downcasting
-    fn as_any(&self) -> &dyn std::any::Any;
-
-    /// Clone as `Box<dyn DynProtocolConfig>`
-    fn clone_dyn(&self) -> Box<dyn DynProtocolConfig>;
 }
 
 /// 🔧 Server-specific dynamic configuration
@@ -69,9 +63,6 @@ pub trait DynClientConfig: DynProtocolConfig {
         >,
     >;
 
-    /// Get target information (could be SocketAddr or URL)
-    fn get_target_info(&self) -> String;
-
     /// Clone as `Box<dyn DynClientConfig>`
     fn clone_client_dyn(&self) -> Box<dyn DynClientConfig>;
 }
@@ -112,15 +103,6 @@ pub enum ConfigError {
 impl ServerConfig for TcpServerConfig {
     type Server = crate::adapters::factories::TcpServerWrapper;
 
-    fn validate(&self) -> Result<(), TransportError> {
-        ProtocolConfig::validate(self).map_err(|e| {
-            TransportError::config_error(
-                "protocol",
-                format!("TCP config validation failed: {:?}", e),
-            )
-        })
-    }
-
     async fn build_server(
         &self,
         limits: crate::transport::limits::ConnectionLimits,
@@ -142,24 +124,11 @@ impl ServerConfig for TcpServerConfig {
 
         Ok(crate::adapters::factories::TcpServerWrapper::new(server))
     }
-
-    fn protocol_name(&self) -> &'static str {
-        "tcp"
-    }
 }
 
 #[cfg(feature = "tcp")]
 impl ClientConfig for TcpClientConfig {
     type Connection = crate::adapters::tcp::TcpAdapter<TcpClientConfig>;
-
-    fn validate(&self) -> Result<(), TransportError> {
-        ProtocolConfig::validate(self).map_err(|e| {
-            TransportError::config_error(
-                "protocol",
-                format!("TCP config validation failed: {:?}", e),
-            )
-        })
-    }
 
     async fn build_connection(
         &self,
@@ -180,24 +149,11 @@ impl ClientConfig for TcpClientConfig {
                 )
             })
     }
-
-    fn protocol_name(&self) -> &'static str {
-        "tcp"
-    }
 }
 
 #[cfg(feature = "websocket")]
 impl ServerConfig for WebSocketServerConfig {
     type Server = crate::adapters::factories::WebSocketServerWrapper;
-
-    fn validate(&self) -> Result<(), TransportError> {
-        ProtocolConfig::validate(self).map_err(|e| {
-            TransportError::config_error(
-                "protocol",
-                format!("WebSocket config validation failed: {:?}", e),
-            )
-        })
-    }
 
     async fn build_server(
         &self,
@@ -222,24 +178,11 @@ impl ServerConfig for WebSocketServerConfig {
             server,
         ))
     }
-
-    fn protocol_name(&self) -> &'static str {
-        "websocket"
-    }
 }
 
 #[cfg(feature = "websocket")]
 impl ClientConfig for WebSocketClientConfig {
     type Connection = crate::adapters::websocket::WebSocketAdapter<WebSocketClientConfig>;
-
-    fn validate(&self) -> Result<(), TransportError> {
-        ProtocolConfig::validate(self).map_err(|e| {
-            TransportError::config_error(
-                "protocol",
-                format!("WebSocket config validation failed: {:?}", e),
-            )
-        })
-    }
 
     async fn build_connection(
         &self,
@@ -260,24 +203,11 @@ impl ClientConfig for WebSocketClientConfig {
                 )
             })
     }
-
-    fn protocol_name(&self) -> &'static str {
-        "websocket"
-    }
 }
 
 #[cfg(feature = "quic")]
 impl ServerConfig for QuicServerConfig {
     type Server = crate::adapters::factories::QuicServerWrapper;
-
-    fn validate(&self) -> Result<(), TransportError> {
-        ProtocolConfig::validate(self).map_err(|e| {
-            TransportError::config_error(
-                "protocol",
-                format!("QUIC config validation failed: {:?}", e),
-            )
-        })
-    }
 
     async fn build_server(
         &self,
@@ -300,24 +230,11 @@ impl ServerConfig for QuicServerConfig {
 
         Ok(crate::adapters::factories::QuicServerWrapper::new(server))
     }
-
-    fn protocol_name(&self) -> &'static str {
-        "quic"
-    }
 }
 
 #[cfg(feature = "quic")]
 impl ClientConfig for QuicClientConfig {
     type Connection = crate::adapters::quic::QuicAdapter<QuicClientConfig>;
-
-    fn validate(&self) -> Result<(), TransportError> {
-        ProtocolConfig::validate(self).map_err(|e| {
-            TransportError::config_error(
-                "protocol",
-                format!("QUIC config validation failed: {:?}", e),
-            )
-        })
-    }
 
     async fn build_connection(
         &self,
@@ -338,44 +255,37 @@ impl ClientConfig for QuicClientConfig {
                 )
             })
     }
-
-    fn protocol_name(&self) -> &'static str {
-        "quic"
-    }
 }
 
-/// Server configuration trait - for type-safe server startup
-pub trait ServerConfig: Send + Sync + 'static {
+/// Server configuration trait — the typed builder used internally by each
+/// protocol's `DynServerConfig` impl.
+///
+/// Crate-private on purpose: its `type Server` associated type names the
+/// concrete (private) adapter, so exposing this trait would have written the
+/// internal adapter types into the frozen public API and made any internal
+/// adapter refactor a breaking change. External protocols implement the
+/// object-safe [`DynServerConfig`] instead.
+pub(crate) trait ServerConfig: Send + Sync + 'static {
     type Server: crate::Server;
-
-    /// Validate configuration correctness
-    fn validate(&self) -> Result<(), TransportError>;
 
     /// Build server instance with the per-connection resource limits.
     fn build_server(
         &self,
         limits: crate::transport::limits::ConnectionLimits,
     ) -> impl std::future::Future<Output = Result<Self::Server, TransportError>> + Send;
-
-    /// Get protocol name
-    fn protocol_name(&self) -> &'static str;
 }
 
-/// Client configuration trait - for type-safe client connections
-pub trait ClientConfig: Send + Sync + 'static {
+/// Client configuration trait — the typed builder used internally by each
+/// protocol's `DynClientConfig` impl. Crate-private for the same reason as
+/// [`ServerConfig`]: `type Connection` names the private adapter.
+pub(crate) trait ClientConfig: Send + Sync + 'static {
     type Connection: crate::Connection;
-
-    /// Validate configuration correctness
-    fn validate(&self) -> Result<(), TransportError>;
 
     /// Build connection instance with the per-connection resource limits.
     fn build_connection(
         &self,
         limits: crate::transport::limits::ConnectionLimits,
     ) -> impl std::future::Future<Output = Result<Self::Connection, TransportError>> + Send;
-
-    /// Get protocol name
-    fn protocol_name(&self) -> &'static str;
 }
 
 // ConnectableConfig implementation has been moved to client_config.rs

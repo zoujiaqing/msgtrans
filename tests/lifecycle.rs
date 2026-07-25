@@ -774,12 +774,6 @@ impl DynProtocolConfig for GatedBuildConfig {
     fn validate_dyn(&self) -> Result<(), msgtrans::spi::ConfigError> {
         Ok(())
     }
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-    fn clone_dyn(&self) -> Box<dyn DynProtocolConfig> {
-        Box::new(self.clone())
-    }
 }
 
 impl DynServerConfig for GatedBuildConfig {
@@ -859,12 +853,6 @@ impl DynProtocolConfig for PanicBuildConfig {
     }
     fn validate_dyn(&self) -> Result<(), msgtrans::spi::ConfigError> {
         Ok(())
-    }
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-    fn clone_dyn(&self) -> Box<dyn DynProtocolConfig> {
-        Box::new(self.clone())
     }
 }
 

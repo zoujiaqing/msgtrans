@@ -58,14 +58,6 @@ impl DynProtocolConfig for TcpServerConfig {
     fn validate_dyn(&self) -> Result<(), ConfigError> {
         ProtocolConfig::validate(self)
     }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn clone_dyn(&self) -> Box<dyn DynProtocolConfig> {
-        Box::new(self.clone())
-    }
 }
 
 /// CONFIG New: Implement server-specific configuration
@@ -214,14 +206,6 @@ impl DynProtocolConfig for WebSocketServerConfig {
 
     fn validate_dyn(&self) -> Result<(), ConfigError> {
         ProtocolConfig::validate(self)
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn clone_dyn(&self) -> Box<dyn DynProtocolConfig> {
-        Box::new(self.clone())
     }
 }
 
@@ -423,14 +407,6 @@ impl DynProtocolConfig for QuicServerConfig {
 
     fn validate_dyn(&self) -> Result<(), ConfigError> {
         ProtocolConfig::validate(self)
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn clone_dyn(&self) -> Box<dyn DynProtocolConfig> {
-        Box::new(self.clone())
     }
 }
 

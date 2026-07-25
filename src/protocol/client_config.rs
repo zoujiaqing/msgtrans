@@ -594,14 +594,6 @@ impl DynProtocolConfig for QuicClientConfig {
     fn validate_dyn(&self) -> Result<(), ConfigError> {
         ProtocolConfig::validate(self)
     }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn clone_dyn(&self) -> Box<dyn DynProtocolConfig> {
-        Box::new(self.clone())
-    }
 }
 
 /// 🔧 新增：实现 WebSocket 客户端专用配置
@@ -623,10 +615,6 @@ impl crate::protocol::adapter::DynClientConfig for WebSocketClientConfig {
                 crate::protocol::adapter::ClientConfig::build_connection(self, limits).await?;
             Ok(Box::new(connection) as Box<dyn crate::Connection>)
         })
-    }
-
-    fn get_target_info(&self) -> String {
-        self.target_url.clone()
     }
 
     fn clone_client_dyn(&self) -> Box<dyn crate::protocol::adapter::DynClientConfig> {
@@ -655,10 +643,6 @@ impl crate::protocol::adapter::DynClientConfig for TcpClientConfig {
         })
     }
 
-    fn get_target_info(&self) -> String {
-        self.target_address.to_string()
-    }
-
     fn clone_client_dyn(&self) -> Box<dyn crate::protocol::adapter::DynClientConfig> {
         Box::new(self.clone())
     }
@@ -685,10 +669,6 @@ impl crate::protocol::adapter::DynClientConfig for QuicClientConfig {
         })
     }
 
-    fn get_target_info(&self) -> String {
-        self.target_address.to_string()
-    }
-
     fn clone_client_dyn(&self) -> Box<dyn crate::protocol::adapter::DynClientConfig> {
         Box::new(self.clone())
     }
@@ -703,14 +683,6 @@ impl DynProtocolConfig for TcpClientConfig {
     fn validate_dyn(&self) -> Result<(), ConfigError> {
         ProtocolConfig::validate(self)
     }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn clone_dyn(&self) -> Box<dyn DynProtocolConfig> {
-        Box::new(self.clone())
-    }
 }
 
 #[cfg(feature = "websocket")]
@@ -721,13 +693,5 @@ impl DynProtocolConfig for WebSocketClientConfig {
 
     fn validate_dyn(&self) -> Result<(), ConfigError> {
         ProtocolConfig::validate(self)
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn clone_dyn(&self) -> Box<dyn DynProtocolConfig> {
-        Box::new(self.clone())
     }
 }

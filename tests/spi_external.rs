@@ -90,15 +90,10 @@ async fn external_connection_impl_drives_the_event_sink() {
     let mut conn = MyConnection::new();
     let mut events = conn.take_event_pipe().expect("events taken once");
 
-    // The adapter pushes a data event through the public sink...
-    assert!(
-        conn.sink
-            .deliver(TransportEvent::MessageReceived(Packet::one_way(
-                1,
-                b"hi".to_vec()
-            )))
-            .await
-    );
+    // The adapter pushes a data event through the public sink. The typed
+    // `message()` picks the data plane for us — there is no way to accidentally
+    // route it onto the droppable diagnostic channel.
+    assert!(conn.sink.message(Packet::one_way(1, b"hi".to_vec())).await);
     // ...the consumer sees it, then exactly one ConnectionClosed after close().
     assert!(matches!(
         events.next().await,

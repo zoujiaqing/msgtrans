@@ -5,35 +5,61 @@
 //! for accept/connect), drive the read loop by pushing [`TransportEvent`]s into
 //! an `EventSink`, and hand the paired `ConnectionEvents` back from
 //! [`Connection::take_event_pipe`]. To advertise the config to the builder,
-//! implement [`ServerConfig`]/[`ClientConfig`] (and their object-safe
-//! `DynServerConfig`/`DynClientConfig`).
+//! implement the object-safe `DynProtocolConfig` plus `DynServerConfig`
+//! and/or `DynClientConfig` — one trait set, no generic variant, so no
+//! internal adapter type is written into the frozen contract.
 
 pub use crate::connection::{Connection, ConnectionWriter, Server, WriteCompletion};
 pub use crate::packet::Packet;
 pub use crate::protocol::adapter::{
-    ClientConfig, ConfigError, DynClientConfig, DynProtocolConfig, DynServerConfig, ProtocolConfig,
-    ServerConfig,
+    ConfigError, DynClientConfig, DynProtocolConfig, DynServerConfig, ProtocolConfig,
 };
 pub use crate::transport::limits::ConnectionLimits;
 pub use crate::{CloseReason, ConnectionInfo, SessionId, TransportError, TransportEvent};
 
 /// Producer half of a connection's event channel, held by the adapter's read
-/// loop. Public wrapper over the internal bounded backbone — the data plane
-/// backpressures, the control plane (close) never blocks.
+/// loop.
+///
+/// The methods are **typed by plane**, not by event: each kind of thing an
+/// adapter can report has exactly one method, and that method picks the correct
+/// plane. An untyped `deliver(TransportEvent)`/`diagnostic(TransportEvent)`
+/// pair let a custom adapter push real data onto the droppable diagnostic
+/// channel (silently losing messages under load) or push a close onto the
+/// backpressured data queue (losing the close to a full queue) — mistakes the
+/// type system now prevents.
+///
+/// - Data plane ([`Self::message`]): bounded and backpressured, never dropped.
+/// - Diagnostic plane ([`Self::message_sent`]): droppable under load, so a
+///   backlog of confirmations can never displace real data.
+/// - Control plane ([`Self::close`]): never blocks, never queues behind data.
 #[derive(Debug)]
 pub struct EventSink(pub(crate) crate::adapters::events::EventPipe);
 
 impl EventSink {
-    /// Deliver a data-plane event with backpressure. Returns `false` when the
-    /// consumer is gone — the adapter should stop reading.
-    pub async fn deliver(&self, event: TransportEvent) -> bool {
-        self.0.deliver(event).await
+    /// Deliver a received packet on the data plane, with backpressure. Returns
+    /// `false` when the consumer is gone — the adapter should stop reading.
+    pub async fn message(&self, packet: Packet) -> bool {
+        self.0
+            .deliver(TransportEvent::MessageReceived(packet))
+            .await
     }
 
-    /// Emit a droppable diagnostic (e.g. a send confirmation). Never blocks;
-    /// under load the diagnostic is dropped, never a data event.
-    pub fn diagnostic(&self, event: TransportEvent) {
-        self.0.diagnostic(event)
+    /// Report a non-fatal transport error on the data plane (it reaches the
+    /// consumer as `ClientEvent::Error`). A fatal condition should use
+    /// [`Self::close`] with `CloseReason::Error` instead.
+    pub async fn error(&self, error: TransportError) -> bool {
+        self.0
+            .deliver(TransportEvent::TransportError { error })
+            .await
+    }
+
+    /// Confirm that a message was written. **Droppable**: this rides the
+    /// diagnostic plane and is discarded under load, so it must never be used
+    /// as a delivery ledger.
+    pub fn message_sent(&self, message_id: crate::PacketId) {
+        self.0.diagnostic(TransportEvent::MessageSent {
+            packet_id: message_id,
+        })
     }
 
     /// Publish the terminal close reason. Non-blocking and immune to

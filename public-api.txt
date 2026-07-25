@@ -1,6 +1,6 @@
 pub mod msgtrans
 pub mod msgtrans::spi
-pub enum msgtrans::spi::CloseReason
+#[non_exhaustive] pub enum msgtrans::spi::CloseReason
 pub msgtrans::spi::CloseReason::Error(alloc::string::String)
 pub msgtrans::spi::CloseReason::Forced
 pub msgtrans::spi::CloseReason::Normal
@@ -51,7 +51,7 @@ impl core::marker::Unpin for msgtrans::spi::ConfigError
 impl core::marker::UnsafeUnpin for msgtrans::spi::ConfigError
 impl !core::panic::unwind_safe::RefUnwindSafe for msgtrans::spi::ConfigError
 impl !core::panic::unwind_safe::UnwindSafe for msgtrans::spi::ConfigError
-pub enum msgtrans::spi::TransportError
+#[non_exhaustive] pub enum msgtrans::spi::TransportError
 pub msgtrans::spi::TransportError::Configuration
 pub msgtrans::spi::TransportError::Configuration::field: alloc::string::String
 pub msgtrans::spi::TransportError::Configuration::reason: alloc::string::String
@@ -74,9 +74,6 @@ pub fn msgtrans::TransportError::connection_error(impl core::convert::Into<alloc
 pub fn msgtrans::TransportError::protocol_error(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn msgtrans::TransportError::resource_error(impl core::convert::Into<alloc::string::String>, usize, usize) -> Self
 pub fn msgtrans::TransportError::timeout_error(impl core::convert::Into<alloc::string::String>, core::time::Duration) -> Self
-impl msgtrans::TransportError
-pub fn msgtrans::TransportError::connection_legacy(impl core::convert::Into<alloc::string::String>) -> Self
-pub fn msgtrans::TransportError::protocol_legacy(impl core::convert::Into<alloc::string::String>) -> Self
 impl msgtrans::TransportError
 pub fn msgtrans::TransportError::error_code(&self) -> &'static str
 pub fn msgtrans::TransportError::is_retryable(&self) -> bool
@@ -125,7 +122,6 @@ pub fn msgtrans::TransportEvent::is_connection_event(&self) -> bool
 pub fn msgtrans::TransportEvent::is_data_event(&self) -> bool
 pub fn msgtrans::TransportEvent::is_error_event(&self) -> bool
 pub fn msgtrans::TransportEvent::is_server_event(&self) -> bool
-pub fn msgtrans::TransportEvent::session_id(&self) -> core::option::Option<msgtrans::SessionId>
 impl core::clone::Clone for msgtrans::TransportEvent
 pub fn msgtrans::TransportEvent::clone(&self) -> msgtrans::TransportEvent
 impl core::convert::From<msgtrans::TransportError> for msgtrans::TransportEvent
@@ -151,25 +147,16 @@ impl core::marker::Unpin for msgtrans::spi::ConnectionEvents
 impl core::marker::UnsafeUnpin for msgtrans::spi::ConnectionEvents
 impl !core::panic::unwind_safe::RefUnwindSafe for msgtrans::spi::ConnectionEvents
 impl !core::panic::unwind_safe::UnwindSafe for msgtrans::spi::ConnectionEvents
-pub struct msgtrans::spi::ConnectionInfo
-pub msgtrans::spi::ConnectionInfo::bytes_received: u64
-pub msgtrans::spi::ConnectionInfo::bytes_sent: u64
+#[non_exhaustive] pub struct msgtrans::spi::ConnectionInfo
 pub msgtrans::spi::ConnectionInfo::closed_at: core::option::Option<std::time::SystemTime>
 pub msgtrans::spi::ConnectionInfo::established_at: std::time::SystemTime
-pub msgtrans::spi::ConnectionInfo::last_activity: std::time::SystemTime
 pub msgtrans::spi::ConnectionInfo::local_addr: core::net::socket_addr::SocketAddr
-pub msgtrans::spi::ConnectionInfo::packets_received: u64
-pub msgtrans::spi::ConnectionInfo::packets_sent: u64
 pub msgtrans::spi::ConnectionInfo::peer_addr: core::net::socket_addr::SocketAddr
 pub msgtrans::spi::ConnectionInfo::protocol: alloc::string::String
 pub msgtrans::spi::ConnectionInfo::session_id: msgtrans::SessionId
 pub msgtrans::spi::ConnectionInfo::state: msgtrans::ConnectionState
 impl msgtrans::ConnectionInfo
 pub fn msgtrans::ConnectionInfo::connection_duration(&self) -> core::time::Duration
-pub fn msgtrans::ConnectionInfo::idle_duration(&self) -> core::time::Duration
-pub fn msgtrans::ConnectionInfo::record_packet_received(&mut self, usize)
-pub fn msgtrans::ConnectionInfo::record_packet_sent(&mut self, usize)
-pub fn msgtrans::ConnectionInfo::update_activity(&mut self)
 impl core::clone::Clone for msgtrans::ConnectionInfo
 pub fn msgtrans::ConnectionInfo::clone(&self) -> msgtrans::ConnectionInfo
 impl core::default::Default for msgtrans::ConnectionInfo
@@ -209,8 +196,9 @@ impl core::panic::unwind_safe::UnwindSafe for msgtrans::ConnectionLimits
 pub struct msgtrans::spi::EventSink(_)
 impl msgtrans::spi::EventSink
 pub fn msgtrans::spi::EventSink::close(&self, msgtrans::CloseReason)
-pub async fn msgtrans::spi::EventSink::deliver(&self, msgtrans::TransportEvent) -> bool
-pub fn msgtrans::spi::EventSink::diagnostic(&self, msgtrans::TransportEvent)
+pub async fn msgtrans::spi::EventSink::error(&self, msgtrans::TransportError) -> bool
+pub async fn msgtrans::spi::EventSink::message(&self, msgtrans::Packet) -> bool
+pub fn msgtrans::spi::EventSink::message_sent(&self, msgtrans::PacketId)
 impl core::fmt::Debug for msgtrans::spi::EventSink
 pub fn msgtrans::spi::EventSink::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Freeze for msgtrans::spi::EventSink
@@ -326,85 +314,49 @@ impl core::marker::Unpin for msgtrans::WriteCompletion
 impl core::marker::UnsafeUnpin for msgtrans::WriteCompletion
 impl !core::panic::unwind_safe::RefUnwindSafe for msgtrans::WriteCompletion
 impl !core::panic::unwind_safe::UnwindSafe for msgtrans::WriteCompletion
-pub trait msgtrans::spi::ClientConfig: core::marker::Send + core::marker::Sync + 'static
-pub type msgtrans::spi::ClientConfig::Connection: msgtrans::Connection
-pub fn msgtrans::spi::ClientConfig::build_connection(&self, msgtrans::ConnectionLimits) -> impl core::future::future::Future<Output = core::result::Result<Self::Connection, msgtrans::TransportError>> + core::marker::Send
-pub fn msgtrans::spi::ClientConfig::protocol_name(&self) -> &'static str
-pub fn msgtrans::spi::ClientConfig::validate(&self) -> core::result::Result<(), msgtrans::TransportError>
-impl msgtrans::ClientConfig for msgtrans::QuicClientConfig
-pub type msgtrans::QuicClientConfig::Connection = msgtrans::adapters::quic::QuicAdapter<msgtrans::QuicClientConfig>
-pub async fn msgtrans::QuicClientConfig::build_connection(&self, msgtrans::ConnectionLimits) -> core::result::Result<Self::Connection, msgtrans::TransportError>
-pub fn msgtrans::QuicClientConfig::protocol_name(&self) -> &'static str
-pub fn msgtrans::QuicClientConfig::validate(&self) -> core::result::Result<(), msgtrans::TransportError>
-impl msgtrans::ClientConfig for msgtrans::TcpClientConfig
-pub type msgtrans::TcpClientConfig::Connection = msgtrans::adapters::tcp::TcpAdapter<msgtrans::TcpClientConfig>
-pub async fn msgtrans::TcpClientConfig::build_connection(&self, msgtrans::ConnectionLimits) -> core::result::Result<Self::Connection, msgtrans::TransportError>
-pub fn msgtrans::TcpClientConfig::protocol_name(&self) -> &'static str
-pub fn msgtrans::TcpClientConfig::validate(&self) -> core::result::Result<(), msgtrans::TransportError>
-impl msgtrans::ClientConfig for msgtrans::WebSocketClientConfig
-pub type msgtrans::WebSocketClientConfig::Connection = msgtrans::adapters::websocket::WebSocketAdapter<msgtrans::WebSocketClientConfig>
-pub async fn msgtrans::WebSocketClientConfig::build_connection(&self, msgtrans::ConnectionLimits) -> core::result::Result<Self::Connection, msgtrans::TransportError>
-pub fn msgtrans::WebSocketClientConfig::protocol_name(&self) -> &'static str
-pub fn msgtrans::WebSocketClientConfig::validate(&self) -> core::result::Result<(), msgtrans::TransportError>
 pub trait msgtrans::spi::Connection: core::marker::Send + core::marker::Sync + core::any::Any
 pub fn msgtrans::spi::Connection::close<'life0, 'async_trait>(&'life0 mut self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), msgtrans::TransportError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
 pub fn msgtrans::spi::Connection::connection_info(&self) -> msgtrans::ConnectionInfo
 pub fn msgtrans::spi::Connection::flush<'life0, 'async_trait>(&'life0 mut self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), msgtrans::TransportError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
 pub fn msgtrans::spi::Connection::is_connected(&self) -> bool
-pub fn msgtrans::spi::Connection::send_with_completion<'life0, 'async_trait>(&'life0 mut self, msgtrans::Packet, msgtrans::WriteCompletion) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), msgtrans::TransportError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
 pub fn msgtrans::spi::Connection::session_id(&self) -> msgtrans::SessionId
 pub fn msgtrans::spi::Connection::set_frame_policy(&self, msgtrans::FramePolicy)
 pub fn msgtrans::spi::Connection::set_session_id(&mut self, msgtrans::SessionId)
 pub fn msgtrans::spi::Connection::take_event_pipe(&mut self) -> core::option::Option<msgtrans::spi::ConnectionEvents>
+pub fn msgtrans::spi::Connection::writer(&self) -> alloc::sync::Arc<dyn msgtrans::ConnectionWriter>
+pub trait msgtrans::spi::ConnectionWriter: core::marker::Send + core::marker::Sync
+pub fn msgtrans::spi::ConnectionWriter::send_with_completion<'life0, 'async_trait>(&'life0 self, msgtrans::Packet, msgtrans::WriteCompletion) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), msgtrans::TransportError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
 pub trait msgtrans::spi::DynClientConfig: msgtrans::spi::DynProtocolConfig
 pub fn msgtrans::spi::DynClientConfig::build_connection_dyn(&self, msgtrans::ConnectionLimits) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::boxed::Box<dyn msgtrans::Connection>, msgtrans::TransportError>> + core::marker::Send + '_)>>
 pub fn msgtrans::spi::DynClientConfig::clone_client_dyn(&self) -> alloc::boxed::Box<dyn msgtrans::spi::DynClientConfig>
-pub fn msgtrans::spi::DynClientConfig::get_target_info(&self) -> alloc::string::String
 impl msgtrans::spi::DynClientConfig for msgtrans::QuicClientConfig
 pub fn msgtrans::QuicClientConfig::build_connection_dyn(&self, msgtrans::ConnectionLimits) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::boxed::Box<dyn msgtrans::Connection>, msgtrans::TransportError>> + core::marker::Send + '_)>>
 pub fn msgtrans::QuicClientConfig::clone_client_dyn(&self) -> alloc::boxed::Box<dyn msgtrans::spi::DynClientConfig>
-pub fn msgtrans::QuicClientConfig::get_target_info(&self) -> alloc::string::String
 impl msgtrans::spi::DynClientConfig for msgtrans::TcpClientConfig
 pub fn msgtrans::TcpClientConfig::build_connection_dyn(&self, msgtrans::ConnectionLimits) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::boxed::Box<dyn msgtrans::Connection>, msgtrans::TransportError>> + core::marker::Send + '_)>>
 pub fn msgtrans::TcpClientConfig::clone_client_dyn(&self) -> alloc::boxed::Box<dyn msgtrans::spi::DynClientConfig>
-pub fn msgtrans::TcpClientConfig::get_target_info(&self) -> alloc::string::String
 impl msgtrans::spi::DynClientConfig for msgtrans::WebSocketClientConfig
 pub fn msgtrans::WebSocketClientConfig::build_connection_dyn(&self, msgtrans::ConnectionLimits) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::boxed::Box<dyn msgtrans::Connection>, msgtrans::TransportError>> + core::marker::Send + '_)>>
 pub fn msgtrans::WebSocketClientConfig::clone_client_dyn(&self) -> alloc::boxed::Box<dyn msgtrans::spi::DynClientConfig>
-pub fn msgtrans::WebSocketClientConfig::get_target_info(&self) -> alloc::string::String
 pub trait msgtrans::spi::DynProtocolConfig: core::marker::Send + core::marker::Sync + 'static
-pub fn msgtrans::spi::DynProtocolConfig::as_any(&self) -> &dyn core::any::Any
-pub fn msgtrans::spi::DynProtocolConfig::clone_dyn(&self) -> alloc::boxed::Box<dyn msgtrans::spi::DynProtocolConfig>
 pub fn msgtrans::spi::DynProtocolConfig::protocol_name(&self) -> &'static str
 pub fn msgtrans::spi::DynProtocolConfig::validate_dyn(&self) -> core::result::Result<(), msgtrans::spi::ConfigError>
 impl msgtrans::spi::DynProtocolConfig for msgtrans::QuicClientConfig
-pub fn msgtrans::QuicClientConfig::as_any(&self) -> &dyn core::any::Any
-pub fn msgtrans::QuicClientConfig::clone_dyn(&self) -> alloc::boxed::Box<dyn msgtrans::spi::DynProtocolConfig>
 pub fn msgtrans::QuicClientConfig::protocol_name(&self) -> &'static str
 pub fn msgtrans::QuicClientConfig::validate_dyn(&self) -> core::result::Result<(), msgtrans::spi::ConfigError>
 impl msgtrans::spi::DynProtocolConfig for msgtrans::QuicServerConfig
-pub fn msgtrans::QuicServerConfig::as_any(&self) -> &dyn core::any::Any
-pub fn msgtrans::QuicServerConfig::clone_dyn(&self) -> alloc::boxed::Box<dyn msgtrans::spi::DynProtocolConfig>
 pub fn msgtrans::QuicServerConfig::protocol_name(&self) -> &'static str
 pub fn msgtrans::QuicServerConfig::validate_dyn(&self) -> core::result::Result<(), msgtrans::spi::ConfigError>
 impl msgtrans::spi::DynProtocolConfig for msgtrans::TcpClientConfig
-pub fn msgtrans::TcpClientConfig::as_any(&self) -> &dyn core::any::Any
-pub fn msgtrans::TcpClientConfig::clone_dyn(&self) -> alloc::boxed::Box<dyn msgtrans::spi::DynProtocolConfig>
 pub fn msgtrans::TcpClientConfig::protocol_name(&self) -> &'static str
 pub fn msgtrans::TcpClientConfig::validate_dyn(&self) -> core::result::Result<(), msgtrans::spi::ConfigError>
 impl msgtrans::spi::DynProtocolConfig for msgtrans::TcpServerConfig
-pub fn msgtrans::TcpServerConfig::as_any(&self) -> &dyn core::any::Any
-pub fn msgtrans::TcpServerConfig::clone_dyn(&self) -> alloc::boxed::Box<dyn msgtrans::spi::DynProtocolConfig>
 pub fn msgtrans::TcpServerConfig::protocol_name(&self) -> &'static str
 pub fn msgtrans::TcpServerConfig::validate_dyn(&self) -> core::result::Result<(), msgtrans::spi::ConfigError>
 impl msgtrans::spi::DynProtocolConfig for msgtrans::WebSocketClientConfig
-pub fn msgtrans::WebSocketClientConfig::as_any(&self) -> &dyn core::any::Any
-pub fn msgtrans::WebSocketClientConfig::clone_dyn(&self) -> alloc::boxed::Box<dyn msgtrans::spi::DynProtocolConfig>
 pub fn msgtrans::WebSocketClientConfig::protocol_name(&self) -> &'static str
 pub fn msgtrans::WebSocketClientConfig::validate_dyn(&self) -> core::result::Result<(), msgtrans::spi::ConfigError>
 impl msgtrans::spi::DynProtocolConfig for msgtrans::WebSocketServerConfig
-pub fn msgtrans::WebSocketServerConfig::as_any(&self) -> &dyn core::any::Any
-pub fn msgtrans::WebSocketServerConfig::clone_dyn(&self) -> alloc::boxed::Box<dyn msgtrans::spi::DynProtocolConfig>
 pub fn msgtrans::WebSocketServerConfig::protocol_name(&self) -> &'static str
 pub fn msgtrans::WebSocketServerConfig::validate_dyn(&self) -> core::result::Result<(), msgtrans::spi::ConfigError>
 pub trait msgtrans::spi::DynServerConfig: msgtrans::spi::DynProtocolConfig
@@ -448,28 +400,8 @@ pub trait msgtrans::spi::Server: core::marker::Send + core::marker::Sync
 pub fn msgtrans::spi::Server::accept<'life0, 'async_trait>(&'life0 mut self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::boxed::Box<dyn msgtrans::Connection>, msgtrans::TransportError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
 pub fn msgtrans::spi::Server::local_addr(&self) -> core::result::Result<core::net::socket_addr::SocketAddr, msgtrans::TransportError>
 pub fn msgtrans::spi::Server::shutdown<'life0, 'async_trait>(&'life0 mut self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), msgtrans::TransportError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
-pub trait msgtrans::spi::ServerConfig: core::marker::Send + core::marker::Sync + 'static
-pub type msgtrans::spi::ServerConfig::Server: msgtrans::Server
-pub fn msgtrans::spi::ServerConfig::build_server(&self, msgtrans::ConnectionLimits) -> impl core::future::future::Future<Output = core::result::Result<Self::Server, msgtrans::TransportError>> + core::marker::Send
-pub fn msgtrans::spi::ServerConfig::protocol_name(&self) -> &'static str
-pub fn msgtrans::spi::ServerConfig::validate(&self) -> core::result::Result<(), msgtrans::TransportError>
-impl msgtrans::ServerConfig for msgtrans::QuicServerConfig
-pub type msgtrans::QuicServerConfig::Server = msgtrans::adapters::factories::QuicServerWrapper
-pub async fn msgtrans::QuicServerConfig::build_server(&self, msgtrans::ConnectionLimits) -> core::result::Result<Self::Server, msgtrans::TransportError>
-pub fn msgtrans::QuicServerConfig::protocol_name(&self) -> &'static str
-pub fn msgtrans::QuicServerConfig::validate(&self) -> core::result::Result<(), msgtrans::TransportError>
-impl msgtrans::ServerConfig for msgtrans::TcpServerConfig
-pub type msgtrans::TcpServerConfig::Server = msgtrans::adapters::factories::TcpServerWrapper
-pub async fn msgtrans::TcpServerConfig::build_server(&self, msgtrans::ConnectionLimits) -> core::result::Result<Self::Server, msgtrans::TransportError>
-pub fn msgtrans::TcpServerConfig::protocol_name(&self) -> &'static str
-pub fn msgtrans::TcpServerConfig::validate(&self) -> core::result::Result<(), msgtrans::TransportError>
-impl msgtrans::ServerConfig for msgtrans::WebSocketServerConfig
-pub type msgtrans::WebSocketServerConfig::Server = msgtrans::adapters::factories::WebSocketServerWrapper
-pub async fn msgtrans::WebSocketServerConfig::build_server(&self, msgtrans::ConnectionLimits) -> core::result::Result<Self::Server, msgtrans::TransportError>
-pub fn msgtrans::WebSocketServerConfig::protocol_name(&self) -> &'static str
-pub fn msgtrans::WebSocketServerConfig::validate(&self) -> core::result::Result<(), msgtrans::TransportError>
-pub fn msgtrans::spi::event_channel(usize) -> (msgtrans::spi::EventSink, msgtrans::spi::ConnectionEvents)
-pub enum msgtrans::ClientEvent
+pub fn msgtrans::spi::event_channel(core::num::nonzero::NonZeroUsize) -> (msgtrans::spi::EventSink, msgtrans::spi::ConnectionEvents)
+#[non_exhaustive] pub enum msgtrans::ClientEvent
 pub msgtrans::ClientEvent::Connected
 pub msgtrans::ClientEvent::Connected::info: msgtrans::ConnectionInfo
 pub msgtrans::ClientEvent::Disconnected
@@ -519,7 +451,7 @@ impl core::marker::Unpin for msgtrans::ClientTls
 impl core::marker::UnsafeUnpin for msgtrans::ClientTls
 impl core::panic::unwind_safe::RefUnwindSafe for msgtrans::ClientTls
 impl core::panic::unwind_safe::UnwindSafe for msgtrans::ClientTls
-pub enum msgtrans::CloseReason
+#[non_exhaustive] pub enum msgtrans::CloseReason
 pub msgtrans::CloseReason::Error(alloc::string::String)
 pub msgtrans::CloseReason::Forced
 pub msgtrans::CloseReason::Normal
@@ -560,7 +492,7 @@ impl core::marker::Unpin for msgtrans::CompressionType
 impl core::marker::UnsafeUnpin for msgtrans::CompressionType
 impl core::panic::unwind_safe::RefUnwindSafe for msgtrans::CompressionType
 impl core::panic::unwind_safe::UnwindSafe for msgtrans::CompressionType
-pub enum msgtrans::ConnectionState
+#[non_exhaustive] pub enum msgtrans::ConnectionState
 pub msgtrans::ConnectionState::Closed
 pub msgtrans::ConnectionState::Closing
 pub msgtrans::ConnectionState::Connected
@@ -593,8 +525,6 @@ pub fn msgtrans::FramePolicy::clone(&self) -> msgtrans::FramePolicy
 impl core::cmp::Eq for msgtrans::FramePolicy
 impl core::cmp::PartialEq for msgtrans::FramePolicy
 pub fn msgtrans::FramePolicy::eq(&self, &msgtrans::FramePolicy) -> bool
-impl core::convert::From<u8> for msgtrans::FramePolicy
-pub fn msgtrans::FramePolicy::from(u8) -> Self
 impl core::default::Default for msgtrans::FramePolicy
 pub fn msgtrans::FramePolicy::default() -> msgtrans::FramePolicy
 impl core::fmt::Debug for msgtrans::FramePolicy
@@ -657,7 +587,7 @@ impl core::marker::Unpin for msgtrans::PacketType
 impl core::marker::UnsafeUnpin for msgtrans::PacketType
 impl core::panic::unwind_safe::RefUnwindSafe for msgtrans::PacketType
 impl core::panic::unwind_safe::UnwindSafe for msgtrans::PacketType
-pub enum msgtrans::RespondOutcome
+#[non_exhaustive] pub enum msgtrans::RespondOutcome
 pub msgtrans::RespondOutcome::AlreadyHandled
 pub msgtrans::RespondOutcome::Written
 impl core::clone::Clone for msgtrans::RespondOutcome
@@ -676,7 +606,7 @@ impl core::marker::Unpin for msgtrans::RespondOutcome
 impl core::marker::UnsafeUnpin for msgtrans::RespondOutcome
 impl core::panic::unwind_safe::RefUnwindSafe for msgtrans::RespondOutcome
 impl core::panic::unwind_safe::UnwindSafe for msgtrans::RespondOutcome
-pub enum msgtrans::TransportError
+#[non_exhaustive] pub enum msgtrans::TransportError
 pub msgtrans::TransportError::Configuration
 pub msgtrans::TransportError::Configuration::field: alloc::string::String
 pub msgtrans::TransportError::Configuration::reason: alloc::string::String
@@ -699,9 +629,6 @@ pub fn msgtrans::TransportError::connection_error(impl core::convert::Into<alloc
 pub fn msgtrans::TransportError::protocol_error(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn msgtrans::TransportError::resource_error(impl core::convert::Into<alloc::string::String>, usize, usize) -> Self
 pub fn msgtrans::TransportError::timeout_error(impl core::convert::Into<alloc::string::String>, core::time::Duration) -> Self
-impl msgtrans::TransportError
-pub fn msgtrans::TransportError::connection_legacy(impl core::convert::Into<alloc::string::String>) -> Self
-pub fn msgtrans::TransportError::protocol_legacy(impl core::convert::Into<alloc::string::String>) -> Self
 impl msgtrans::TransportError
 pub fn msgtrans::TransportError::error_code(&self) -> &'static str
 pub fn msgtrans::TransportError::is_retryable(&self) -> bool
@@ -750,7 +677,6 @@ pub fn msgtrans::TransportEvent::is_connection_event(&self) -> bool
 pub fn msgtrans::TransportEvent::is_data_event(&self) -> bool
 pub fn msgtrans::TransportEvent::is_error_event(&self) -> bool
 pub fn msgtrans::TransportEvent::is_server_event(&self) -> bool
-pub fn msgtrans::TransportEvent::session_id(&self) -> core::option::Option<msgtrans::SessionId>
 impl core::clone::Clone for msgtrans::TransportEvent
 pub fn msgtrans::TransportEvent::clone(&self) -> msgtrans::TransportEvent
 impl core::convert::From<msgtrans::TransportError> for msgtrans::TransportEvent
@@ -764,25 +690,6 @@ impl core::marker::Unpin for msgtrans::TransportEvent
 impl core::marker::UnsafeUnpin for msgtrans::TransportEvent
 impl core::panic::unwind_safe::RefUnwindSafe for msgtrans::TransportEvent
 impl core::panic::unwind_safe::UnwindSafe for msgtrans::TransportEvent
-pub enum msgtrans::TransportStatus
-pub msgtrans::TransportStatus::Completed
-pub msgtrans::TransportStatus::ConnectionError
-pub msgtrans::TransportStatus::Sent
-pub msgtrans::TransportStatus::Timeout
-impl core::clone::Clone for msgtrans::TransportStatus
-pub fn msgtrans::TransportStatus::clone(&self) -> msgtrans::TransportStatus
-impl core::cmp::PartialEq for msgtrans::TransportStatus
-pub fn msgtrans::TransportStatus::eq(&self, &msgtrans::TransportStatus) -> bool
-impl core::fmt::Debug for msgtrans::TransportStatus
-pub fn msgtrans::TransportStatus::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::marker::StructuralPartialEq for msgtrans::TransportStatus
-impl core::marker::Freeze for msgtrans::TransportStatus
-impl core::marker::Send for msgtrans::TransportStatus
-impl core::marker::Sync for msgtrans::TransportStatus
-impl core::marker::Unpin for msgtrans::TransportStatus
-impl core::marker::UnsafeUnpin for msgtrans::TransportStatus
-impl core::panic::unwind_safe::RefUnwindSafe for msgtrans::TransportStatus
-impl core::panic::unwind_safe::UnwindSafe for msgtrans::TransportStatus
 pub struct msgtrans::ClientEvents
 impl msgtrans::ClientEvents
 pub async fn msgtrans::ClientEvents::next(&mut self) -> core::option::Option<msgtrans::ClientEvent>
@@ -851,6 +758,8 @@ pub async fn msgtrans::ClientRequest::respond(self, impl core::convert::Into<byt
 pub fn msgtrans::ClientRequest::respond_detached(self, impl core::convert::Into<bytes::bytes::Bytes>)
 impl core::fmt::Debug for msgtrans::ClientRequest
 pub fn msgtrans::ClientRequest::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::ops::drop::Drop for msgtrans::ClientRequest
+pub fn msgtrans::ClientRequest::drop(&mut self)
 impl !core::marker::Freeze for msgtrans::ClientRequest
 impl core::marker::Send for msgtrans::ClientRequest
 impl core::marker::Sync for msgtrans::ClientRequest
@@ -858,25 +767,16 @@ impl core::marker::Unpin for msgtrans::ClientRequest
 impl core::marker::UnsafeUnpin for msgtrans::ClientRequest
 impl !core::panic::unwind_safe::RefUnwindSafe for msgtrans::ClientRequest
 impl !core::panic::unwind_safe::UnwindSafe for msgtrans::ClientRequest
-pub struct msgtrans::ConnectionInfo
-pub msgtrans::ConnectionInfo::bytes_received: u64
-pub msgtrans::ConnectionInfo::bytes_sent: u64
+#[non_exhaustive] pub struct msgtrans::ConnectionInfo
 pub msgtrans::ConnectionInfo::closed_at: core::option::Option<std::time::SystemTime>
 pub msgtrans::ConnectionInfo::established_at: std::time::SystemTime
-pub msgtrans::ConnectionInfo::last_activity: std::time::SystemTime
 pub msgtrans::ConnectionInfo::local_addr: core::net::socket_addr::SocketAddr
-pub msgtrans::ConnectionInfo::packets_received: u64
-pub msgtrans::ConnectionInfo::packets_sent: u64
 pub msgtrans::ConnectionInfo::peer_addr: core::net::socket_addr::SocketAddr
 pub msgtrans::ConnectionInfo::protocol: alloc::string::String
 pub msgtrans::ConnectionInfo::session_id: msgtrans::SessionId
 pub msgtrans::ConnectionInfo::state: msgtrans::ConnectionState
 impl msgtrans::ConnectionInfo
 pub fn msgtrans::ConnectionInfo::connection_duration(&self) -> core::time::Duration
-pub fn msgtrans::ConnectionInfo::idle_duration(&self) -> core::time::Duration
-pub fn msgtrans::ConnectionInfo::record_packet_received(&mut self, usize)
-pub fn msgtrans::ConnectionInfo::record_packet_sent(&mut self, usize)
-pub fn msgtrans::ConnectionInfo::update_activity(&mut self)
 impl core::clone::Clone for msgtrans::ConnectionInfo
 pub fn msgtrans::ConnectionInfo::clone(&self) -> msgtrans::ConnectionInfo
 impl core::default::Default for msgtrans::ConnectionInfo
@@ -1020,18 +920,10 @@ impl core::default::Default for msgtrans::QuicClientConfig
 pub fn msgtrans::QuicClientConfig::default() -> Self
 impl core::fmt::Debug for msgtrans::QuicClientConfig
 pub fn msgtrans::QuicClientConfig::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl msgtrans::ClientConfig for msgtrans::QuicClientConfig
-pub type msgtrans::QuicClientConfig::Connection = msgtrans::adapters::quic::QuicAdapter<msgtrans::QuicClientConfig>
-pub async fn msgtrans::QuicClientConfig::build_connection(&self, msgtrans::ConnectionLimits) -> core::result::Result<Self::Connection, msgtrans::TransportError>
-pub fn msgtrans::QuicClientConfig::protocol_name(&self) -> &'static str
-pub fn msgtrans::QuicClientConfig::validate(&self) -> core::result::Result<(), msgtrans::TransportError>
 impl msgtrans::spi::DynClientConfig for msgtrans::QuicClientConfig
 pub fn msgtrans::QuicClientConfig::build_connection_dyn(&self, msgtrans::ConnectionLimits) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::boxed::Box<dyn msgtrans::Connection>, msgtrans::TransportError>> + core::marker::Send + '_)>>
 pub fn msgtrans::QuicClientConfig::clone_client_dyn(&self) -> alloc::boxed::Box<dyn msgtrans::spi::DynClientConfig>
-pub fn msgtrans::QuicClientConfig::get_target_info(&self) -> alloc::string::String
 impl msgtrans::spi::DynProtocolConfig for msgtrans::QuicClientConfig
-pub fn msgtrans::QuicClientConfig::as_any(&self) -> &dyn core::any::Any
-pub fn msgtrans::QuicClientConfig::clone_dyn(&self) -> alloc::boxed::Box<dyn msgtrans::spi::DynProtocolConfig>
 pub fn msgtrans::QuicClientConfig::protocol_name(&self) -> &'static str
 pub fn msgtrans::QuicClientConfig::validate_dyn(&self) -> core::result::Result<(), msgtrans::spi::ConfigError>
 impl msgtrans::spi::ProtocolConfig for msgtrans::QuicClientConfig
@@ -1069,14 +961,7 @@ impl core::default::Default for msgtrans::QuicServerConfig
 pub fn msgtrans::QuicServerConfig::default() -> Self
 impl core::fmt::Debug for msgtrans::QuicServerConfig
 pub fn msgtrans::QuicServerConfig::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl msgtrans::ServerConfig for msgtrans::QuicServerConfig
-pub type msgtrans::QuicServerConfig::Server = msgtrans::adapters::factories::QuicServerWrapper
-pub async fn msgtrans::QuicServerConfig::build_server(&self, msgtrans::ConnectionLimits) -> core::result::Result<Self::Server, msgtrans::TransportError>
-pub fn msgtrans::QuicServerConfig::protocol_name(&self) -> &'static str
-pub fn msgtrans::QuicServerConfig::validate(&self) -> core::result::Result<(), msgtrans::TransportError>
 impl msgtrans::spi::DynProtocolConfig for msgtrans::QuicServerConfig
-pub fn msgtrans::QuicServerConfig::as_any(&self) -> &dyn core::any::Any
-pub fn msgtrans::QuicServerConfig::clone_dyn(&self) -> alloc::boxed::Box<dyn msgtrans::spi::DynProtocolConfig>
 pub fn msgtrans::QuicServerConfig::protocol_name(&self) -> &'static str
 pub fn msgtrans::QuicServerConfig::validate_dyn(&self) -> core::result::Result<(), msgtrans::spi::ConfigError>
 impl msgtrans::spi::DynServerConfig for msgtrans::QuicServerConfig
@@ -1132,6 +1017,8 @@ pub fn msgtrans::Responder::message_id(&self) -> u32
 pub async fn msgtrans::Responder::respond(self, impl core::convert::Into<bytes::bytes::Bytes>) -> core::result::Result<msgtrans::RespondOutcome, msgtrans::TransportError>
 pub fn msgtrans::Responder::respond_detached(self, impl core::convert::Into<bytes::bytes::Bytes>)
 pub fn msgtrans::Responder::session_id(&self) -> msgtrans::SessionId
+impl core::ops::drop::Drop for msgtrans::Responder
+pub fn msgtrans::Responder::drop(&mut self)
 impl core::marker::Freeze for msgtrans::Responder
 impl core::marker::Send for msgtrans::Responder
 impl core::marker::Sync for msgtrans::Responder
@@ -1158,6 +1045,20 @@ impl core::marker::Unpin for msgtrans::RetryConfig
 impl core::marker::UnsafeUnpin for msgtrans::RetryConfig
 impl core::panic::unwind_safe::RefUnwindSafe for msgtrans::RetryConfig
 impl core::panic::unwind_safe::UnwindSafe for msgtrans::RetryConfig
+#[non_exhaustive] pub struct msgtrans::SendReceipt
+pub msgtrans::SendReceipt::message_id: u32
+pub msgtrans::SendReceipt::peer: core::option::Option<msgtrans::SessionId>
+impl core::clone::Clone for msgtrans::SendReceipt
+pub fn msgtrans::SendReceipt::clone(&self) -> msgtrans::SendReceipt
+impl core::fmt::Debug for msgtrans::SendReceipt
+pub fn msgtrans::SendReceipt::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for msgtrans::SendReceipt
+impl core::marker::Send for msgtrans::SendReceipt
+impl core::marker::Sync for msgtrans::SendReceipt
+impl core::marker::Unpin for msgtrans::SendReceipt
+impl core::marker::UnsafeUnpin for msgtrans::SendReceipt
+impl core::panic::unwind_safe::RefUnwindSafe for msgtrans::SendReceipt
+impl core::panic::unwind_safe::UnwindSafe for msgtrans::SendReceipt
 pub struct msgtrans::ServerLimits
 impl msgtrans::ServerLimits
 pub fn msgtrans::ServerLimits::mailbox_capacity(self, usize) -> Self
@@ -1230,7 +1131,7 @@ impl core::marker::Unpin for msgtrans::SessionSender
 impl core::marker::UnsafeUnpin for msgtrans::SessionSender
 impl !core::panic::unwind_safe::RefUnwindSafe for msgtrans::SessionSender
 impl !core::panic::unwind_safe::UnwindSafe for msgtrans::SessionSender
-pub struct msgtrans::ShutdownReport
+#[non_exhaustive] pub struct msgtrans::ShutdownReport
 pub msgtrans::ShutdownReport::clean: bool
 pub msgtrans::ShutdownReport::elapsed: core::time::Duration
 pub msgtrans::ShutdownReport::infra_stopped: bool
@@ -1268,18 +1169,10 @@ impl core::default::Default for msgtrans::TcpClientConfig
 pub fn msgtrans::TcpClientConfig::default() -> Self
 impl core::fmt::Debug for msgtrans::TcpClientConfig
 pub fn msgtrans::TcpClientConfig::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl msgtrans::ClientConfig for msgtrans::TcpClientConfig
-pub type msgtrans::TcpClientConfig::Connection = msgtrans::adapters::tcp::TcpAdapter<msgtrans::TcpClientConfig>
-pub async fn msgtrans::TcpClientConfig::build_connection(&self, msgtrans::ConnectionLimits) -> core::result::Result<Self::Connection, msgtrans::TransportError>
-pub fn msgtrans::TcpClientConfig::protocol_name(&self) -> &'static str
-pub fn msgtrans::TcpClientConfig::validate(&self) -> core::result::Result<(), msgtrans::TransportError>
 impl msgtrans::spi::DynClientConfig for msgtrans::TcpClientConfig
 pub fn msgtrans::TcpClientConfig::build_connection_dyn(&self, msgtrans::ConnectionLimits) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::boxed::Box<dyn msgtrans::Connection>, msgtrans::TransportError>> + core::marker::Send + '_)>>
 pub fn msgtrans::TcpClientConfig::clone_client_dyn(&self) -> alloc::boxed::Box<dyn msgtrans::spi::DynClientConfig>
-pub fn msgtrans::TcpClientConfig::get_target_info(&self) -> alloc::string::String
 impl msgtrans::spi::DynProtocolConfig for msgtrans::TcpClientConfig
-pub fn msgtrans::TcpClientConfig::as_any(&self) -> &dyn core::any::Any
-pub fn msgtrans::TcpClientConfig::clone_dyn(&self) -> alloc::boxed::Box<dyn msgtrans::spi::DynProtocolConfig>
 pub fn msgtrans::TcpClientConfig::protocol_name(&self) -> &'static str
 pub fn msgtrans::TcpClientConfig::validate_dyn(&self) -> core::result::Result<(), msgtrans::spi::ConfigError>
 impl msgtrans::spi::ProtocolConfig for msgtrans::TcpClientConfig
@@ -1312,14 +1205,7 @@ impl core::default::Default for msgtrans::TcpServerConfig
 pub fn msgtrans::TcpServerConfig::default() -> Self
 impl core::fmt::Debug for msgtrans::TcpServerConfig
 pub fn msgtrans::TcpServerConfig::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl msgtrans::ServerConfig for msgtrans::TcpServerConfig
-pub type msgtrans::TcpServerConfig::Server = msgtrans::adapters::factories::TcpServerWrapper
-pub async fn msgtrans::TcpServerConfig::build_server(&self, msgtrans::ConnectionLimits) -> core::result::Result<Self::Server, msgtrans::TransportError>
-pub fn msgtrans::TcpServerConfig::protocol_name(&self) -> &'static str
-pub fn msgtrans::TcpServerConfig::validate(&self) -> core::result::Result<(), msgtrans::TransportError>
 impl msgtrans::spi::DynProtocolConfig for msgtrans::TcpServerConfig
-pub fn msgtrans::TcpServerConfig::as_any(&self) -> &dyn core::any::Any
-pub fn msgtrans::TcpServerConfig::clone_dyn(&self) -> alloc::boxed::Box<dyn msgtrans::spi::DynProtocolConfig>
 pub fn msgtrans::TcpServerConfig::protocol_name(&self) -> &'static str
 pub fn msgtrans::TcpServerConfig::validate_dyn(&self) -> core::result::Result<(), msgtrans::spi::ConfigError>
 impl msgtrans::spi::DynServerConfig for msgtrans::TcpServerConfig
@@ -1348,9 +1234,10 @@ pub async fn msgtrans::TransportClient::disconnect(&self) -> core::result::Resul
 pub async fn msgtrans::TransportClient::events(&self) -> core::result::Result<msgtrans::ClientEvents, msgtrans::TransportError>
 pub async fn msgtrans::TransportClient::force_disconnect(&self) -> core::result::Result<(), msgtrans::TransportError>
 pub async fn msgtrans::TransportClient::is_connected(&self) -> bool
-pub async fn msgtrans::TransportClient::request(&self, &[u8]) -> core::result::Result<msgtrans::TransportResult, msgtrans::TransportError>
+pub async fn msgtrans::TransportClient::request(&self, &[u8]) -> core::result::Result<bytes::bytes::Bytes, msgtrans::TransportError>
 pub async fn msgtrans::TransportClient::request_with_options(&self, bytes::bytes::Bytes, msgtrans::TransportOptions) -> core::result::Result<bytes::bytes::Bytes, msgtrans::TransportError>
-pub async fn msgtrans::TransportClient::send(&self, &[u8]) -> core::result::Result<msgtrans::TransportResult, msgtrans::TransportError>
+pub async fn msgtrans::TransportClient::send(&self, &[u8]) -> core::result::Result<msgtrans::SendReceipt, msgtrans::TransportError>
+pub async fn msgtrans::TransportClient::send_detached(&self, &[u8]) -> core::result::Result<msgtrans::SendReceipt, msgtrans::TransportError>
 pub async fn msgtrans::TransportClient::send_with_options(&self, bytes::bytes::Bytes, msgtrans::TransportOptions) -> core::result::Result<(), msgtrans::TransportError>
 pub async fn msgtrans::TransportClient::shutdown(&mut self) -> core::result::Result<(), msgtrans::TransportError>
 impl core::ops::drop::Drop for msgtrans::TransportClient
@@ -1382,8 +1269,6 @@ impl !core::panic::unwind_safe::RefUnwindSafe for msgtrans::TransportClientBuild
 impl !core::panic::unwind_safe::UnwindSafe for msgtrans::TransportClientBuilder
 pub struct msgtrans::TransportConfig
 pub msgtrans::TransportConfig::graceful_timeout: core::time::Duration
-impl msgtrans::TransportConfig
-pub fn msgtrans::TransportConfig::validate(&self) -> core::result::Result<(), msgtrans::TransportError>
 impl core::clone::Clone for msgtrans::TransportConfig
 pub fn msgtrans::TransportConfig::clone(&self) -> msgtrans::TransportConfig
 impl core::default::Default for msgtrans::TransportConfig
@@ -1402,7 +1287,6 @@ impl msgtrans::TransportOptions
 pub fn msgtrans::TransportOptions::biz_type(self, u8) -> Self
 pub fn msgtrans::TransportOptions::compression(self, msgtrans::CompressionType) -> Self
 pub fn msgtrans::TransportOptions::ext_header(self, bytes::bytes::Bytes) -> Self
-pub fn msgtrans::TransportOptions::message_id(self, u32) -> Self
 pub fn msgtrans::TransportOptions::new() -> Self
 pub fn msgtrans::TransportOptions::timeout(self, core::time::Duration) -> Self
 impl core::clone::Clone for msgtrans::TransportOptions
@@ -1418,30 +1302,6 @@ impl core::marker::Unpin for msgtrans::TransportOptions
 impl core::marker::UnsafeUnpin for msgtrans::TransportOptions
 impl core::panic::unwind_safe::RefUnwindSafe for msgtrans::TransportOptions
 impl core::panic::unwind_safe::UnwindSafe for msgtrans::TransportOptions
-pub struct msgtrans::TransportResult
-pub msgtrans::TransportResult::data: core::option::Option<bytes::bytes::Bytes>
-pub msgtrans::TransportResult::message_id: u32
-pub msgtrans::TransportResult::peer: core::option::Option<msgtrans::SessionId>
-pub msgtrans::TransportResult::status: msgtrans::TransportStatus
-pub msgtrans::TransportResult::timestamp: std::time::Instant
-impl msgtrans::TransportResult
-pub fn msgtrans::TransportResult::has_response(&self) -> bool
-pub fn msgtrans::TransportResult::is_sent(&self) -> bool
-pub fn msgtrans::TransportResult::new_completed(core::option::Option<msgtrans::SessionId>, u32, impl core::convert::Into<bytes::bytes::Bytes>) -> Self
-pub fn msgtrans::TransportResult::new_connection_error(core::option::Option<msgtrans::SessionId>, u32) -> Self
-pub fn msgtrans::TransportResult::new_sent(core::option::Option<msgtrans::SessionId>, u32) -> Self
-pub fn msgtrans::TransportResult::new_timeout(core::option::Option<msgtrans::SessionId>, u32) -> Self
-impl core::clone::Clone for msgtrans::TransportResult
-pub fn msgtrans::TransportResult::clone(&self) -> msgtrans::TransportResult
-impl core::fmt::Debug for msgtrans::TransportResult
-pub fn msgtrans::TransportResult::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl !core::marker::Freeze for msgtrans::TransportResult
-impl core::marker::Send for msgtrans::TransportResult
-impl core::marker::Sync for msgtrans::TransportResult
-impl core::marker::Unpin for msgtrans::TransportResult
-impl core::marker::UnsafeUnpin for msgtrans::TransportResult
-impl core::panic::unwind_safe::RefUnwindSafe for msgtrans::TransportResult
-impl core::panic::unwind_safe::UnwindSafe for msgtrans::TransportResult
 pub struct msgtrans::TransportServer
 impl msgtrans::TransportServer
 pub async fn msgtrans::TransportServer::active_sessions(&self) -> alloc::vec::Vec<msgtrans::SessionId>
@@ -1451,9 +1311,9 @@ pub async fn msgtrans::TransportServer::close_session(&self, msgtrans::SessionId
 pub async fn msgtrans::TransportServer::force_close_session(&self, msgtrans::SessionId) -> core::result::Result<(), msgtrans::TransportError>
 pub async fn msgtrans::TransportServer::new(msgtrans::TransportConfig, std::collections::hash::map::HashMap<alloc::string::String, alloc::boxed::Box<dyn msgtrans::spi::DynServerConfig>>, alloc::sync::Arc<dyn msgtrans::SessionHandler>, core::option::Option<usize>) -> core::result::Result<Self, msgtrans::TransportError>
 pub async fn msgtrans::TransportServer::remove_session(&self, msgtrans::SessionId) -> core::result::Result<(), msgtrans::TransportError>
-pub async fn msgtrans::TransportServer::request(&self, msgtrans::SessionId, &[u8]) -> core::result::Result<msgtrans::TransportResult, msgtrans::TransportError>
+pub async fn msgtrans::TransportServer::request(&self, msgtrans::SessionId, &[u8]) -> core::result::Result<bytes::bytes::Bytes, msgtrans::TransportError>
 pub async fn msgtrans::TransportServer::request_to_session(&self, msgtrans::SessionId, msgtrans::Packet) -> core::result::Result<msgtrans::Packet, msgtrans::TransportError>
-pub async fn msgtrans::TransportServer::send(&self, msgtrans::SessionId, &[u8]) -> core::result::Result<msgtrans::TransportResult, msgtrans::TransportError>
+pub async fn msgtrans::TransportServer::send(&self, msgtrans::SessionId, &[u8]) -> core::result::Result<msgtrans::SendReceipt, msgtrans::TransportError>
 pub async fn msgtrans::TransportServer::send_to_session(&self, msgtrans::SessionId, msgtrans::Packet) -> core::result::Result<(), msgtrans::TransportError>
 pub async fn msgtrans::TransportServer::serve(&self) -> core::result::Result<(), msgtrans::TransportError>
 pub async fn msgtrans::TransportServer::session_count(&self) -> usize
@@ -1515,18 +1375,10 @@ impl core::default::Default for msgtrans::WebSocketClientConfig
 pub fn msgtrans::WebSocketClientConfig::default() -> Self
 impl core::fmt::Debug for msgtrans::WebSocketClientConfig
 pub fn msgtrans::WebSocketClientConfig::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl msgtrans::ClientConfig for msgtrans::WebSocketClientConfig
-pub type msgtrans::WebSocketClientConfig::Connection = msgtrans::adapters::websocket::WebSocketAdapter<msgtrans::WebSocketClientConfig>
-pub async fn msgtrans::WebSocketClientConfig::build_connection(&self, msgtrans::ConnectionLimits) -> core::result::Result<Self::Connection, msgtrans::TransportError>
-pub fn msgtrans::WebSocketClientConfig::protocol_name(&self) -> &'static str
-pub fn msgtrans::WebSocketClientConfig::validate(&self) -> core::result::Result<(), msgtrans::TransportError>
 impl msgtrans::spi::DynClientConfig for msgtrans::WebSocketClientConfig
 pub fn msgtrans::WebSocketClientConfig::build_connection_dyn(&self, msgtrans::ConnectionLimits) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::boxed::Box<dyn msgtrans::Connection>, msgtrans::TransportError>> + core::marker::Send + '_)>>
 pub fn msgtrans::WebSocketClientConfig::clone_client_dyn(&self) -> alloc::boxed::Box<dyn msgtrans::spi::DynClientConfig>
-pub fn msgtrans::WebSocketClientConfig::get_target_info(&self) -> alloc::string::String
 impl msgtrans::spi::DynProtocolConfig for msgtrans::WebSocketClientConfig
-pub fn msgtrans::WebSocketClientConfig::as_any(&self) -> &dyn core::any::Any
-pub fn msgtrans::WebSocketClientConfig::clone_dyn(&self) -> alloc::boxed::Box<dyn msgtrans::spi::DynProtocolConfig>
 pub fn msgtrans::WebSocketClientConfig::protocol_name(&self) -> &'static str
 pub fn msgtrans::WebSocketClientConfig::validate_dyn(&self) -> core::result::Result<(), msgtrans::spi::ConfigError>
 impl msgtrans::spi::ProtocolConfig for msgtrans::WebSocketClientConfig
@@ -1563,14 +1415,7 @@ impl core::default::Default for msgtrans::WebSocketServerConfig
 pub fn msgtrans::WebSocketServerConfig::default() -> Self
 impl core::fmt::Debug for msgtrans::WebSocketServerConfig
 pub fn msgtrans::WebSocketServerConfig::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl msgtrans::ServerConfig for msgtrans::WebSocketServerConfig
-pub type msgtrans::WebSocketServerConfig::Server = msgtrans::adapters::factories::WebSocketServerWrapper
-pub async fn msgtrans::WebSocketServerConfig::build_server(&self, msgtrans::ConnectionLimits) -> core::result::Result<Self::Server, msgtrans::TransportError>
-pub fn msgtrans::WebSocketServerConfig::protocol_name(&self) -> &'static str
-pub fn msgtrans::WebSocketServerConfig::validate(&self) -> core::result::Result<(), msgtrans::TransportError>
 impl msgtrans::spi::DynProtocolConfig for msgtrans::WebSocketServerConfig
-pub fn msgtrans::WebSocketServerConfig::as_any(&self) -> &dyn core::any::Any
-pub fn msgtrans::WebSocketServerConfig::clone_dyn(&self) -> alloc::boxed::Box<dyn msgtrans::spi::DynProtocolConfig>
 pub fn msgtrans::WebSocketServerConfig::protocol_name(&self) -> &'static str
 pub fn msgtrans::WebSocketServerConfig::validate_dyn(&self) -> core::result::Result<(), msgtrans::spi::ConfigError>
 impl msgtrans::spi::DynServerConfig for msgtrans::WebSocketServerConfig
@@ -1607,60 +1452,22 @@ impl !core::panic::unwind_safe::RefUnwindSafe for msgtrans::WriteCompletion
 impl !core::panic::unwind_safe::UnwindSafe for msgtrans::WriteCompletion
 pub const msgtrans::DEFAULT_MAX_FRAME_SIZE: usize
 pub const msgtrans::WS_SUBPROTOCOL_MSGTRANS: &str
-pub trait msgtrans::ClientConfig: core::marker::Send + core::marker::Sync + 'static
-pub type msgtrans::ClientConfig::Connection: msgtrans::Connection
-pub fn msgtrans::ClientConfig::build_connection(&self, msgtrans::ConnectionLimits) -> impl core::future::future::Future<Output = core::result::Result<Self::Connection, msgtrans::TransportError>> + core::marker::Send
-pub fn msgtrans::ClientConfig::protocol_name(&self) -> &'static str
-pub fn msgtrans::ClientConfig::validate(&self) -> core::result::Result<(), msgtrans::TransportError>
-impl msgtrans::ClientConfig for msgtrans::QuicClientConfig
-pub type msgtrans::QuicClientConfig::Connection = msgtrans::adapters::quic::QuicAdapter<msgtrans::QuicClientConfig>
-pub async fn msgtrans::QuicClientConfig::build_connection(&self, msgtrans::ConnectionLimits) -> core::result::Result<Self::Connection, msgtrans::TransportError>
-pub fn msgtrans::QuicClientConfig::protocol_name(&self) -> &'static str
-pub fn msgtrans::QuicClientConfig::validate(&self) -> core::result::Result<(), msgtrans::TransportError>
-impl msgtrans::ClientConfig for msgtrans::TcpClientConfig
-pub type msgtrans::TcpClientConfig::Connection = msgtrans::adapters::tcp::TcpAdapter<msgtrans::TcpClientConfig>
-pub async fn msgtrans::TcpClientConfig::build_connection(&self, msgtrans::ConnectionLimits) -> core::result::Result<Self::Connection, msgtrans::TransportError>
-pub fn msgtrans::TcpClientConfig::protocol_name(&self) -> &'static str
-pub fn msgtrans::TcpClientConfig::validate(&self) -> core::result::Result<(), msgtrans::TransportError>
-impl msgtrans::ClientConfig for msgtrans::WebSocketClientConfig
-pub type msgtrans::WebSocketClientConfig::Connection = msgtrans::adapters::websocket::WebSocketAdapter<msgtrans::WebSocketClientConfig>
-pub async fn msgtrans::WebSocketClientConfig::build_connection(&self, msgtrans::ConnectionLimits) -> core::result::Result<Self::Connection, msgtrans::TransportError>
-pub fn msgtrans::WebSocketClientConfig::protocol_name(&self) -> &'static str
-pub fn msgtrans::WebSocketClientConfig::validate(&self) -> core::result::Result<(), msgtrans::TransportError>
 pub trait msgtrans::Connection: core::marker::Send + core::marker::Sync + core::any::Any
 pub fn msgtrans::Connection::close<'life0, 'async_trait>(&'life0 mut self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), msgtrans::TransportError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
 pub fn msgtrans::Connection::connection_info(&self) -> msgtrans::ConnectionInfo
 pub fn msgtrans::Connection::flush<'life0, 'async_trait>(&'life0 mut self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), msgtrans::TransportError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
 pub fn msgtrans::Connection::is_connected(&self) -> bool
-pub fn msgtrans::Connection::send_with_completion<'life0, 'async_trait>(&'life0 mut self, msgtrans::Packet, msgtrans::WriteCompletion) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), msgtrans::TransportError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
 pub fn msgtrans::Connection::session_id(&self) -> msgtrans::SessionId
 pub fn msgtrans::Connection::set_frame_policy(&self, msgtrans::FramePolicy)
 pub fn msgtrans::Connection::set_session_id(&mut self, msgtrans::SessionId)
 pub fn msgtrans::Connection::take_event_pipe(&mut self) -> core::option::Option<msgtrans::spi::ConnectionEvents>
+pub fn msgtrans::Connection::writer(&self) -> alloc::sync::Arc<dyn msgtrans::ConnectionWriter>
+pub trait msgtrans::ConnectionWriter: core::marker::Send + core::marker::Sync
+pub fn msgtrans::ConnectionWriter::send_with_completion<'life0, 'async_trait>(&'life0 self, msgtrans::Packet, msgtrans::WriteCompletion) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), msgtrans::TransportError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
 pub trait msgtrans::Server: core::marker::Send + core::marker::Sync
 pub fn msgtrans::Server::accept<'life0, 'async_trait>(&'life0 mut self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<alloc::boxed::Box<dyn msgtrans::Connection>, msgtrans::TransportError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
 pub fn msgtrans::Server::local_addr(&self) -> core::result::Result<core::net::socket_addr::SocketAddr, msgtrans::TransportError>
 pub fn msgtrans::Server::shutdown<'life0, 'async_trait>(&'life0 mut self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), msgtrans::TransportError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
-pub trait msgtrans::ServerConfig: core::marker::Send + core::marker::Sync + 'static
-pub type msgtrans::ServerConfig::Server: msgtrans::Server
-pub fn msgtrans::ServerConfig::build_server(&self, msgtrans::ConnectionLimits) -> impl core::future::future::Future<Output = core::result::Result<Self::Server, msgtrans::TransportError>> + core::marker::Send
-pub fn msgtrans::ServerConfig::protocol_name(&self) -> &'static str
-pub fn msgtrans::ServerConfig::validate(&self) -> core::result::Result<(), msgtrans::TransportError>
-impl msgtrans::ServerConfig for msgtrans::QuicServerConfig
-pub type msgtrans::QuicServerConfig::Server = msgtrans::adapters::factories::QuicServerWrapper
-pub async fn msgtrans::QuicServerConfig::build_server(&self, msgtrans::ConnectionLimits) -> core::result::Result<Self::Server, msgtrans::TransportError>
-pub fn msgtrans::QuicServerConfig::protocol_name(&self) -> &'static str
-pub fn msgtrans::QuicServerConfig::validate(&self) -> core::result::Result<(), msgtrans::TransportError>
-impl msgtrans::ServerConfig for msgtrans::TcpServerConfig
-pub type msgtrans::TcpServerConfig::Server = msgtrans::adapters::factories::TcpServerWrapper
-pub async fn msgtrans::TcpServerConfig::build_server(&self, msgtrans::ConnectionLimits) -> core::result::Result<Self::Server, msgtrans::TransportError>
-pub fn msgtrans::TcpServerConfig::protocol_name(&self) -> &'static str
-pub fn msgtrans::TcpServerConfig::validate(&self) -> core::result::Result<(), msgtrans::TransportError>
-impl msgtrans::ServerConfig for msgtrans::WebSocketServerConfig
-pub type msgtrans::WebSocketServerConfig::Server = msgtrans::adapters::factories::WebSocketServerWrapper
-pub async fn msgtrans::WebSocketServerConfig::build_server(&self, msgtrans::ConnectionLimits) -> core::result::Result<Self::Server, msgtrans::TransportError>
-pub fn msgtrans::WebSocketServerConfig::protocol_name(&self) -> &'static str
-pub fn msgtrans::WebSocketServerConfig::validate(&self) -> core::result::Result<(), msgtrans::TransportError>
 pub trait msgtrans::SessionHandler: core::marker::Send + core::marker::Sync + 'static
 pub fn msgtrans::SessionHandler::on_connected<'life0, 'async_trait>(&'life0 self, msgtrans::SessionId, msgtrans::ConnectionInfo) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = ()> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
 pub fn msgtrans::SessionHandler::on_disconnected<'life0, 'async_trait>(&'life0 self, msgtrans::SessionId, msgtrans::CloseReason) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = ()> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait

@@ -99,7 +99,6 @@ pub use transport::{
     TransportServerBuilder,
 };
 
-pub use protocol::{ClientConfig, ServerConfig};
 #[cfg(feature = "websocket")]
 pub use protocol::{
     ClientTls, WebSocketClientConfig, WebSocketServerConfig, WS_SUBPROTOCOL_MSGTRANS,
