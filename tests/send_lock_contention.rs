@@ -9,6 +9,8 @@
 //! deadline itself. 2.0 clones a `ConnectionWriter` under the lock and releases
 //! it before awaiting, so lifecycle work stays responsive under saturation.
 
+#![cfg(feature = "tcp")]
+
 use async_trait::async_trait;
 use msgtrans::{
     ClientLimits, Packet, SessionHandler, SessionId, SessionSender, TcpClientConfig,

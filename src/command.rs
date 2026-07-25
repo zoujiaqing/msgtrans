@@ -1,7 +1,15 @@
 use crate::SessionId;
 
-/// Connection information
+/// What is actually known about one connection.
+///
+/// Every field here is real and set by the adapter that owns the socket. 2.0
+/// deleted the `last_activity`/`packets_sent`/`packets_received`/`bytes_sent`/
+/// `bytes_received` fields: no adapter ever updated them, so a handler reading
+/// them got a constant zero that looked like a live counter. If per-connection
+/// traffic accounting is needed, it belongs in a metrics facility that is
+/// actually wired, not in a struct that silently reports zero.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ConnectionInfo {
     /// Session ID
     pub session_id: SessionId,
@@ -17,16 +25,6 @@ pub struct ConnectionInfo {
     pub established_at: std::time::SystemTime,
     /// Closed time
     pub closed_at: Option<std::time::SystemTime>,
-    /// Last activity time
-    pub last_activity: std::time::SystemTime,
-    /// Packets sent count
-    pub packets_sent: u64,
-    /// Packets received count
-    pub packets_received: u64,
-    /// Bytes sent count
-    pub bytes_sent: u64,
-    /// Bytes received count
-    pub bytes_received: u64,
 }
 
 impl Default for ConnectionInfo {
@@ -40,38 +38,14 @@ impl Default for ConnectionInfo {
             state: ConnectionState::Connecting,
             established_at: now,
             closed_at: None,
-            last_activity: now,
-            packets_sent: 0,
-            packets_received: 0,
-            bytes_sent: 0,
-            bytes_received: 0,
         }
     }
 }
 
 impl ConnectionInfo {
-    pub fn update_activity(&mut self) {
-        self.last_activity = std::time::SystemTime::now();
-    }
-
-    pub fn record_packet_sent(&mut self, size: usize) {
-        self.packets_sent += 1;
-        self.bytes_sent += size as u64;
-        self.update_activity();
-    }
-
-    pub fn record_packet_received(&mut self, size: usize) {
-        self.packets_received += 1;
-        self.bytes_received += size as u64;
-        self.update_activity();
-    }
-
+    /// How long this connection has been up.
     pub fn connection_duration(&self) -> std::time::Duration {
         self.established_at.elapsed().unwrap_or_default()
-    }
-
-    pub fn idle_duration(&self) -> std::time::Duration {
-        self.last_activity.elapsed().unwrap_or_default()
     }
 }
 

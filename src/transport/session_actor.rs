@@ -64,11 +64,17 @@ pub trait SessionHandler: Send + Sync + 'static {
     /// request to the lifecycle machinery (timeout / session-close drain).
     async fn on_request(&self, session_id: SessionId, request: Packet, responder: Responder);
 
-    /// Called when a session is established
+    /// Called when a session is established.
     ///
-    /// Runs before any `on_message` for this session, so the handler can set up
-    /// per-session state (and reject the peer via `info.peer_addr`) without
-    /// racing the first inbound packet.
+    /// Runs before any `on_message`/`on_request` for this session, so the
+    /// handler can set up per-session state without racing the first inbound
+    /// packet.
+    ///
+    /// This is a **notification, not an admission decision**: it returns `()`
+    /// and hands out no close handle, so returning early does NOT reject the
+    /// connection. To drop an unwanted peer, close its session explicitly
+    /// (e.g. `TransportServer::close_session`) from here or from the first
+    /// message; the connection stays open until you do.
     async fn on_connected(&self, session_id: SessionId, info: ConnectionInfo) {
         let _ = (session_id, info); // Default: no-op
     }

@@ -19,7 +19,7 @@ use std::{convert::TryInto, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::sync::mpsc;
 
 use crate::{
-    command::ConnectionInfo,
+    command::{ConnectionInfo, ConnectionState},
     connection::Connection,
     error::TransportError,
     event::TransportEvent,
@@ -361,8 +361,8 @@ pub struct QuicAdapter<C> {
     // Retained for the generic `C` / diagnostics; not read on the hot path.
     #[allow(dead_code)]
     config: C,
-    #[allow(dead_code)]
-    #[allow(dead_code)]
+    /// Real, immutable-at-connect facts about this connection (protocol,
+    /// local/peer address, established time). Returned by `connection_info()`.
     connection_info: ConnectionInfo,
     /// Send queue
     send_queue: mpsc::Sender<crate::adapters::outbound::Outbound>,
@@ -391,12 +391,15 @@ impl<C> QuicAdapter<C> {
         connection_info.protocol = "quic".to_string();
         connection_info.session_id = state.session_id();
 
-        // Get address information
-        if let Some(local_addr) = connection.local_ip() {
-            connection_info.local_addr = format!("{}:0", local_addr)
-                .parse()
-                .unwrap_or(connection_info.local_addr);
+        // Real addresses from the quinn connection. `local_ip()` only exposes
+        // the IP (quinn binds one endpoint for many connections), so the port
+        // is taken from the endpoint-less default of 0 — the peer address is
+        // fully known.
+        connection_info.peer_addr = connection.remote_address();
+        if let Some(local_ip) = connection.local_ip() {
+            connection_info.local_addr = std::net::SocketAddr::new(local_ip, 0);
         }
+        connection_info.state = ConnectionState::Connected;
 
         // Create communication channels
         let (send_queue_tx, send_queue_rx) = mpsc::channel(limits.outbound_capacity);
@@ -856,11 +859,14 @@ impl<C: Send + Sync + 'static> Connection for QuicAdapter<C> {
 
     fn set_session_id(&mut self, session_id: SessionId) {
         self.state.set_session_id(session_id);
+        self.connection_info.session_id = session_id;
     }
 
     fn connection_info(&self) -> ConnectionInfo {
-        let mut info = ConnectionInfo::default();
-        info.protocol = "quic".to_string();
+        // Return the REAL info captured at construction (protocol + both
+        // addresses), refreshed with the live session id. It used to build a
+        // `default()` here, throwing away the addresses and reporting 0.0.0.0:0.
+        let mut info = self.connection_info.clone();
         info.session_id = self.state.session_id();
         info
     }

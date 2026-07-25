@@ -248,6 +248,24 @@ impl<C> WebSocketAdapter<C> {
         connection_info.protocol = "websocket".to_string();
         connection_info.state = ConnectionState::Connected;
         connection_info.established_at = std::time::SystemTime::now();
+        // Real addresses off the underlying TCP socket. These used to be left
+        // at the 0.0.0.0:0 default, so every handler saw a fake peer address.
+        {
+            let tcp = match stream.get_ref() {
+                MaybeTlsStream::Plain(tcp) => Some(tcp),
+                #[cfg(feature = "websocket")]
+                MaybeTlsStream::Rustls(tls) => Some(tls.get_ref().0),
+                _ => None,
+            };
+            if let Some(tcp) = tcp {
+                if let Ok(peer) = tcp.peer_addr() {
+                    connection_info.peer_addr = peer;
+                }
+                if let Ok(local) = tcp.local_addr() {
+                    connection_info.local_addr = local;
+                }
+            }
+        }
 
         // The stream is already established when this adapter is created.
         let state =
@@ -639,10 +657,15 @@ impl<C: Send + Sync + 'static> Connection for WebSocketAdapter<C> {
 
     fn set_session_id(&mut self, session_id: SessionId) {
         self.state.set_session_id(session_id);
+        self.connection_info.session_id = session_id;
     }
 
     fn connection_info(&self) -> ConnectionInfo {
-        self.connection_info.clone()
+        // Refresh the live session id: `set_session_id` keeps the stored copy
+        // in sync, but reading from `state` is the single source of truth.
+        let mut info = self.connection_info.clone();
+        info.session_id = self.state.session_id();
+        info
     }
 
     fn is_connected(&self) -> bool {
