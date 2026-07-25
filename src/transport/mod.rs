@@ -38,6 +38,9 @@ pub(crate) mod transport_server;
 
 pub(crate) mod context;
 pub(crate) mod lockfree;
+// The read-buffer pool is a byte-stream (TCP/QUIC) optimization; WebSocket
+// framing does its own buffering, so the pool is gated to those protocols.
+#[cfg(any(feature = "tcp", feature = "quic"))]
 pub(crate) mod memory_pool;
 pub(crate) mod session_actor;
 

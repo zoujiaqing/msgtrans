@@ -8,7 +8,6 @@
 
 use crate::error::TransportError;
 use dashmap::DashMap;
-use flume::{unbounded, Receiver, Sender};
 use std::hash::Hash;
 
 /// Concurrent hash map (sharded, lock-free reads) — a `DashMap` with the
@@ -74,20 +73,25 @@ where
 }
 
 /// Unbounded MPMC queue (a `flume` channel) with a lock-free `push`/`pop` API.
+///
+/// Only the TCP/QUIC read-buffer pool uses it, so it is gated to those
+/// protocols — a WebSocket-only build carries neither the queue nor `flume`.
+#[cfg(any(feature = "tcp", feature = "quic"))]
 pub struct LockFreeQueue<T>
 where
     T: Send + Sync + 'static,
 {
-    sender: Sender<T>,
-    receiver: Receiver<T>,
+    sender: flume::Sender<T>,
+    receiver: flume::Receiver<T>,
 }
 
+#[cfg(any(feature = "tcp", feature = "quic"))]
 impl<T> LockFreeQueue<T>
 where
     T: Send + Sync + 'static,
 {
     pub fn new() -> Self {
-        let (sender, receiver) = unbounded();
+        let (sender, receiver) = flume::unbounded();
         Self { sender, receiver }
     }
 
@@ -102,8 +106,14 @@ where
     pub fn pop(&self) -> Option<T> {
         self.receiver.try_recv().ok()
     }
+
+    /// Number of queued items (used to bound the buffer cache).
+    pub fn len(&self) -> usize {
+        self.receiver.len()
+    }
 }
 
+#[cfg(any(feature = "tcp", feature = "quic"))]
 impl<T> Default for LockFreeQueue<T>
 where
     T: Send + Sync + 'static,
@@ -131,6 +141,7 @@ mod tests {
         assert_eq!(map.get(&"k1".to_string()), None);
     }
 
+    #[cfg(any(feature = "tcp", feature = "quic"))]
     #[test]
     fn queue_fifo() {
         let q = LockFreeQueue::new();

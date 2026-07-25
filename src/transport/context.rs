@@ -1,23 +1,17 @@
-use std::sync::Arc;
-
-use crate::transport::memory_pool::{shared_memory_pool, OptimizedMemoryPool};
 use crate::TransportError;
 
-/// Shared context holding heavy resources that should be created once and reused.
+/// Shared context (dependency-injection seam) created once by the builder and
+/// handed to every `Transport`.
 ///
-/// The memory pool is also registered as the global shared pool so that adapters
-/// (TCP, QUIC) created by factories automatically use the same instance —
-/// eliminating the previous split between TransportContext's pool and the
-/// global OnceLock pool.
+/// The TCP/QUIC read-buffer pool is a global `OnceLock` the adapters reach
+/// directly (`shared_memory_pool()`), so it no longer travels through this
+/// context; the seam is retained for future shared resources.
 #[derive(Clone)]
-pub(crate) struct TransportContext {
-    pub(crate) memory_pool: Arc<OptimizedMemoryPool>,
-}
+pub(crate) struct TransportContext {}
 
 impl TransportContext {
-    /// Create a new context holding the shared memory pool.
+    /// Create a new context.
     pub(crate) async fn new() -> Result<Self, TransportError> {
-        let pool = shared_memory_pool();
-        Ok(Self { memory_pool: pool })
+        Ok(Self {})
     }
 }

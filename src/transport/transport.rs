@@ -3,7 +3,7 @@ use crate::{
     event::TransportEvent,
     transport::{
         config::TransportConfig, connection_state::ConnectionStateManager,
-        context::TransportContext, memory_pool::OptimizedMemoryPool,
+        context::TransportContext,
     },
     Packet, SessionId, TransportError,
 };
@@ -32,7 +32,6 @@ struct ConnectionSlot {
 /// which is created once by the builder and shared across all Transport instances.
 pub struct Transport {
     config: TransportConfig,
-    memory_pool: Arc<OptimizedMemoryPool>,
     /// The connection and its generation id live in ONE slot under ONE lock:
     /// validating the generation and taking/replacing the connection is a
     /// single atomic operation, so a stale close can never observe the old
@@ -68,9 +67,9 @@ impl Transport {
     /// Create Transport from a shared context (synchronous — no global singletons).
     pub(crate) fn with_context(config: TransportConfig, ctx: &TransportContext) -> Self {
         let (client_events_tx, client_events_rx) = mpsc::channel(8192);
+        let _ = ctx;
         Self {
             config,
-            memory_pool: ctx.memory_pool.clone(),
             slot: Arc::new(Mutex::new(None)),
             state_manager: ConnectionStateManager::new(),
             client_events_tx,
@@ -448,10 +447,6 @@ impl Transport {
     /// Get configuration
     pub fn config(&self) -> &TransportConfig {
         &self.config
-    }
-
-    pub fn memory_pool_stats(&self) -> crate::transport::memory_pool::OptimizedMemoryStatsSnapshot {
-        self.memory_pool.get_stats()
     }
 
     /// Take the client event queue (single consumer, once). The queue spans
@@ -863,7 +858,6 @@ impl Clone for Transport {
     fn clone(&self) -> Self {
         Self {
             config: self.config.clone(),
-            memory_pool: self.memory_pool.clone(),
             slot: self.slot.clone(),
             state_manager: self.state_manager.clone(),
             client_events_tx: self.client_events_tx.clone(),
