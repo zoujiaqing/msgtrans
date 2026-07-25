@@ -6,22 +6,30 @@ use msgtrans::spi::{
     event_channel, CloseReason, Connection, ConnectionEvents, ConnectionInfo, EventSink, Packet,
     SessionId, TransportError, TransportEvent, WriteCompletion,
 };
+use msgtrans::FramePolicy;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 
 struct MyConnection {
     session_id: SessionId,
     connected: bool,
     sink: EventSink,
     events: Option<ConnectionEvents>,
+    // `set_frame_policy` is a required method — the SPI no longer lets an
+    // external adapter silently ignore the policy. Record it so the test can
+    // prove the transport actually pushed it down.
+    frame_policy: Arc<AtomicU8>,
 }
 
 impl MyConnection {
     fn new() -> Self {
-        let (sink, events) = event_channel(1024);
+        let (sink, events) = event_channel(std::num::NonZeroUsize::new(1024).unwrap());
         Self {
             session_id: SessionId::new(0),
             connected: true,
             sink,
             events: Some(events),
+            frame_policy: Arc::new(AtomicU8::new(FramePolicy::Strict as u8)),
         }
     }
 }
@@ -60,6 +68,9 @@ impl Connection for MyConnection {
     }
     fn take_event_pipe(&mut self) -> Option<ConnectionEvents> {
         self.events.take()
+    }
+    fn set_frame_policy(&self, policy: FramePolicy) {
+        self.frame_policy.store(policy as u8, Ordering::Relaxed);
     }
 }
 

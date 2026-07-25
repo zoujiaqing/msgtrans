@@ -60,7 +60,11 @@ impl ConnectionEvents {
 /// Create a connected event channel with the given data-plane capacity. The
 /// adapter keeps the [`EventSink`] and returns the [`ConnectionEvents`] from
 /// [`Connection::take_event_pipe`].
-pub fn event_channel(capacity: usize) -> (EventSink, ConnectionEvents) {
-    let (tx, rx) = crate::adapters::events::event_pipe(capacity);
+///
+/// Capacity is a [`NonZeroUsize`](std::num::NonZeroUsize): a zero-capacity
+/// data plane is a programming error (the bounded channel would panic at
+/// construction), so it is rejected at the type level instead.
+pub fn event_channel(capacity: std::num::NonZeroUsize) -> (EventSink, ConnectionEvents) {
+    let (tx, rx) = crate::adapters::events::event_pipe(capacity.get());
     (EventSink(tx), ConnectionEvents(rx))
 }

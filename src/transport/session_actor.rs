@@ -112,12 +112,14 @@ impl SessionSender {
         self.transport.send(packet).await
     }
 
-    /// Send raw data to this session (one-way message)
+    /// Send raw data to this session (one-way message). Each message gets a
+    /// unique, monotonically increasing id (the fixed id 0 collided across
+    /// every one-way message and could alias an in-flight request id).
     pub async fn send_data(
         &self,
         data: impl Into<bytes::Bytes>,
     ) -> Result<(), crate::TransportError> {
-        let packet = Packet::one_way(0, data);
+        let packet = Packet::one_way(self.transport.next_message_id(), data);
         self.transport.send(packet).await
     }
 

@@ -107,10 +107,12 @@ pub trait Connection: Send + Sync + std::any::Any {
     /// with the [`crate::spi::EventSink`] the read loop pushes into.
     fn take_event_pipe(&mut self) -> Option<crate::spi::ConnectionEvents>;
 
-    /// Set the frame decode policy for this connection. Adapters that support it
-    /// (WebSocket, QUIC) override this; others (e.g. TCP, which is always strict
-    /// on a malformed first packet) keep the default no-op.
-    fn set_frame_policy(&self, _policy: crate::packet::FramePolicy) {}
+    /// Apply the frame decode policy to this connection. **Required**: there is
+    /// no default, because a silent no-op default let external adapters ignore
+    /// `Strict` and keep delivering undecodable frames as raw one-way messages.
+    /// An adapter whose framing cannot honor the policy must still implement
+    /// this — either enforcing it or documenting/erroring that it is fixed.
+    fn set_frame_policy(&self, policy: crate::packet::FramePolicy);
 }
 
 /// Unified server interface - Accept new connections

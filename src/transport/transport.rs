@@ -893,6 +893,7 @@ mod generation_tests {
             self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
+        fn set_frame_policy(&self, _policy: crate::packet::FramePolicy) {}
         fn session_id(&self) -> SessionId {
             self.session_id
         }
