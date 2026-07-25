@@ -216,6 +216,19 @@ impl Responder {
     }
 }
 
+impl Drop for Responder {
+    fn drop(&mut self) {
+        // Deterministic cleanup: if the handler dropped this responder without
+        // answering, the inbound request is still `Pending`. Resolve it as
+        // `Dropped` right now (generation-aware, so a reused id is never
+        // touched) instead of leaking the entry until the timeout scanner.
+        // A no-op once `respond`/`respond_detached` moved the entry past
+        // `Pending` (`respond_detached` keeps `self` alive inside its spawned
+        // task until the send resolves, so the state has already advanced).
+        self.registry.abort_request_token(&self.token);
+    }
+}
+
 /// Handle to a session actor, held by TransportServer
 ///
 /// Contains only the sender side of the channel.

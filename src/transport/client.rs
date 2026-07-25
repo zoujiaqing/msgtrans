@@ -176,6 +176,12 @@ pub struct TransportClient {
     /// Synchronously accessible abort handle for Drop (try_write on the
     /// RwLock could silently skip the abort under contention).
     forwarding_abort: Arc<std::sync::Mutex<Option<tokio::task::AbortHandle>>>,
+    /// Fallback request-timeout scanner (spawned once on first connect). The
+    /// `Responder`/`ClientRequest` drop guards resolve unanswered inbound
+    /// requests deterministically; this scanner only reaps an inbound request
+    /// that is HELD (neither answered nor dropped) past its lifecycle deadline,
+    /// so a long-lived client cannot accumulate stranded `Pending` entries.
+    request_scanner_abort: Arc<std::sync::Mutex<Option<tokio::task::AbortHandle>>>,
     /// Client lifecycle: 0 Active, 1 ShuttingDown, 2 Stopped. Once Stopped,
     /// connect() rejects before touching the network — the take-once event
     /// receiver is gone, so a new connection could never receive events and
@@ -215,6 +221,7 @@ impl TransportClient {
             event_forwarding_running: Arc::new(AtomicBool::new(false)),
             event_forwarding_task: Arc::new(RwLock::new(None)),
             forwarding_abort: Arc::new(std::sync::Mutex::new(None)),
+            request_scanner_abort: Arc::new(std::sync::Mutex::new(None)),
             phase: Arc::new(AtomicU8::new(CLIENT_ACTIVE)),
             teardown_task: Arc::new(std::sync::Mutex::new(None)),
             teardown_done: Arc::new(tokio::sync::watch::channel(false).0),
@@ -263,9 +270,33 @@ impl TransportClient {
         // aborting it would strand the take-once receiver and make every
         // later connect() unable to receive events.
         self.start_event_forwarding().await?;
+        self.start_request_scanner();
 
         tracing::info!("[SUCCESS] TransportClient connected successfully");
         Ok(())
+    }
+
+    /// Spawn the fallback request-timeout scanner exactly once. Idempotent
+    /// across reconnects (guarded by the presence of its abort handle). The
+    /// task holds only the registry `Arc`, ticks at the registry's cadence, and
+    /// is aborted on client `Drop`.
+    fn start_request_scanner(&self) {
+        let mut slot = self
+            .request_scanner_abort
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if slot.is_some() {
+            return;
+        }
+        let registry = self.inner.request_registry().clone();
+        let tick = registry.tick_duration();
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(tick).await;
+                registry.scan_timeout_bucket();
+            }
+        });
+        *slot = Some(handle.abort_handle());
     }
 
     /// [CONFIG] Internal method: Connect using stored protocol configuration
@@ -789,6 +820,14 @@ impl Drop for TransportClient {
         // join — deterministic completion is the async shutdown path's job.
         if let Some(abort) = self
             .forwarding_abort
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            abort.abort();
+        }
+        if let Some(abort) = self
+            .request_scanner_abort
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()

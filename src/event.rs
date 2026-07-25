@@ -324,9 +324,13 @@ impl ClientRequest {
     pub fn payload(&self) -> &Bytes {
         &self.data
     }
-    /// Take ownership of the request payload.
-    pub fn into_payload(self) -> Bytes {
-        self.data
+    /// Take ownership of the request payload. The request is thereby given up
+    /// without a response and is resolved as `Dropped` when it falls out of
+    /// scope (see the `Drop` impl).
+    pub fn into_payload(mut self) -> Bytes {
+        // `ClientRequest` has a `Drop` impl, so a field cannot be moved out;
+        // swap the payload out and let the (now empty) request drop normally.
+        std::mem::take(&mut self.data)
     }
     /// Request payload as a lossy UTF-8 string.
     pub fn as_text_lossy(&self) -> String {
@@ -370,6 +374,20 @@ impl ClientRequest {
                 tracing::debug!("[RESPOND] detached response send failed: {:?}", e);
             }
         });
+    }
+}
+
+impl Drop for ClientRequest {
+    fn drop(&mut self) {
+        // Deterministic cleanup: an inbound request dropped without a response
+        // (the consumer ignored it, took only its payload, or was cancelled) is
+        // resolved as `Dropped` now instead of lingering `Pending` until a
+        // scanner (clients run one only as a fallback). Generation-aware, so a
+        // reused id is never touched; a no-op once `respond`/`respond_detached`
+        // advanced the entry past `Pending`.
+        if let (Some(registry), Some(token)) = (self.registry.as_ref(), self.token.as_ref()) {
+            registry.abort_request_token(token);
+        }
     }
 }
 
@@ -558,6 +576,48 @@ mod respond_tests {
     // (The former `respond_on_one_way_is_error` test is gone: a one-way message
     // is now a `ClientMessage`, which has no `respond` method at all, so the
     // error is a compile error by construction rather than a runtime check.)
+
+    /// Dropping a `ClientRequest` without responding must deterministically
+    /// resolve the inbound entry (Pending -> Dropped), not leak it until a
+    /// scanner. Covers the "consumer ignored the request" path.
+    #[tokio::test]
+    async fn dropping_unanswered_request_resolves_it() {
+        let (registry, token) = tracked(7, 1);
+        let ctx = tracked_ctx(&registry, token, responder_with(false));
+        assert_eq!(registry.counters_snapshot().pending_requests, 1);
+        drop(ctx); // never responded
+        assert_eq!(
+            registry.get_state(
+                Some(SessionId(7)),
+                1,
+                crate::transport::request_registry::RequestDirection::Inbound
+            ),
+            None,
+            "a dropped-unanswered request must not stay pending"
+        );
+        assert_eq!(registry.counters_snapshot().pending_requests, 0);
+    }
+
+    /// `into_payload` gives up the request without answering: same deterministic
+    /// resolution as a bare drop (it must not leave a `Pending` entry).
+    #[tokio::test]
+    async fn into_payload_resolves_the_request() {
+        let (registry, token) = tracked(7, 2);
+        let ctx = crate::event::ClientRequest::new(
+            Some(SessionId(7)),
+            2,
+            0,
+            None,
+            b"body".to_vec(),
+            responder_with(false),
+            Some(registry.clone()),
+            Some(token),
+        );
+        assert_eq!(registry.counters_snapshot().pending_requests, 1);
+        let payload = ctx.into_payload();
+        assert_eq!(&payload[..], b"body");
+        assert_eq!(registry.counters_snapshot().pending_requests, 0);
+    }
 
     /// Cancelling a respond mid-send must not strand the registry in
     /// Responding: the claim travels with the responder future, so dropping

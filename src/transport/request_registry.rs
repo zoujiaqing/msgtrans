@@ -263,7 +263,7 @@ impl OutboundRequestGuard {
 impl Drop for OutboundRequestGuard {
     fn drop(&mut self) {
         if !self.disarmed {
-            self.registry.abort_waiter_token(&self.token);
+            self.registry.abort_request_token(&self.token);
         }
     }
 }
@@ -773,13 +773,16 @@ impl RequestRegistry {
         }
     }
 
-    /// Generation-aware abort for the outbound waiter path: mark the request
-    /// `Dropped` and drop its waiter — but ONLY if the live entry is the same
+    /// Generation-aware abort for a tracked request (either direction): mark it
+    /// `Dropped` and drop any waiter — but ONLY if the live entry is the same
     /// registration the token was minted for. A token from an earlier life of a
     /// reused message id observes a generation mismatch and touches nothing, so
-    /// cancelling a completed request's future can never abort the *new* request
-    /// that reused its id (the outbound ABA the by-key `abort_waiter` had).
-    pub fn abort_waiter_token(&self, token: &RequestToken) -> bool {
+    /// cancelling/dropping a completed request can never abort the *new* request
+    /// that reused its id. Used by the outbound waiter guard AND by the inbound
+    /// `Responder`/`ClientRequest` drop guards (an unanswered inbound request is
+    /// resolved as `Dropped` deterministically, the timeout scanner is only the
+    /// fallback). For an inbound key the `waiters` removal is a harmless no-op.
+    pub fn abort_request_token(&self, token: &RequestToken) -> bool {
         let key = token.key();
         let Some(entry) = self.entries.get(&key) else {
             return false;
@@ -1041,10 +1044,10 @@ mod tests {
         assert_eq!(registry.pending_count(), 1);
 
         // The OLD request's future is cancelled -> its guard's Drop calls
-        // abort_waiter_token(token1). Generation mismatch => no-op; the NEW
+        // abort_request_token(token1). Generation mismatch => no-op; the NEW
         // request's waiter must survive.
         assert!(
-            !registry.abort_waiter_token(&token1),
+            !registry.abort_request_token(&token1),
             "stale token must not abort anything"
         );
         assert_eq!(
