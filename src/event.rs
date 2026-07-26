@@ -262,8 +262,12 @@ pub struct ClientRequest {
     ext_header: Option<Vec<u8>>,
     data: Bytes,
     responder: ResponderFn,
-    registry: Option<Arc<RequestRegistry>>,
-    token: Option<crate::transport::request_registry::RequestToken>,
+    /// The registry that owns this request's lifecycle, and the unforgeable
+    /// registration token. Both are REQUIRED: the registry is the only arbiter
+    /// of "exactly one response per request", so a request that could not be
+    /// registered must never be handed to a consumer (it is dropped upstream).
+    registry: Arc<RequestRegistry>,
+    token: crate::transport::request_registry::RequestToken,
 }
 
 impl ClientRequest {
@@ -275,8 +279,8 @@ impl ClientRequest {
         ext_header: Option<Vec<u8>>,
         data: impl Into<Bytes>,
         responder: ResponderFn,
-        registry: Option<Arc<RequestRegistry>>,
-        token: Option<crate::transport::request_registry::RequestToken>,
+        registry: Arc<RequestRegistry>,
+        token: crate::transport::request_registry::RequestToken,
     ) -> Self {
         Self {
             peer,
@@ -335,15 +339,15 @@ impl ClientRequest {
         response: impl Into<Bytes>,
     ) -> Result<RespondOutcome, crate::error::TransportError> {
         let response: Bytes = response.into();
-        let claim = match (self.registry.as_ref(), self.token.as_ref()) {
-            (Some(registry), Some(token)) => match registry.begin_respond(token) {
-                MarkResult::Updated => Some(crate::transport::request_registry::RespondClaim::new(
-                    registry.clone(),
-                    *token,
-                )),
-                _ => return Ok(RespondOutcome::AlreadyHandled),
-            },
-            _ => None,
+        // The registry decides whether this response may be written at all;
+        // there is no bypass path. A duplicate/late/reused-id respond loses the
+        // claim and reports AlreadyHandled instead of writing a second response.
+        let claim = match self.registry.begin_respond(&self.token) {
+            MarkResult::Updated => Some(crate::transport::request_registry::RespondClaim::new(
+                self.registry.clone(),
+                self.token,
+            )),
+            _ => return Ok(RespondOutcome::AlreadyHandled),
         };
         (self.responder)(response, claim)
             .await
@@ -371,9 +375,7 @@ impl Drop for ClientRequest {
         // scanner (clients run one only as a fallback). Generation-aware, so a
         // reused id is never touched; a no-op once `respond`/`respond_detached`
         // advanced the entry past `Pending`.
-        if let (Some(registry), Some(token)) = (self.registry.as_ref(), self.token.as_ref()) {
-            registry.abort_request_token(token);
-        }
+        self.registry.abort_request_token(&self.token);
     }
 }
 
@@ -464,8 +466,8 @@ mod respond_tests {
             None,
             b"req".to_vec(),
             responder,
-            Some(registry.clone()),
-            Some(token),
+            registry.clone(),
+            token,
         )
     }
 
@@ -533,8 +535,8 @@ mod respond_tests {
             None,
             b"body".to_vec(),
             responder_with(false),
-            Some(registry.clone()),
-            Some(token),
+            registry.clone(),
+            token,
         );
         assert_eq!(registry.counters_snapshot().pending_requests, 1);
         let payload = ctx.into_payload();

@@ -301,11 +301,13 @@ impl TransportServer {
         }
     }
 
-    /// REQUEST Send request to specified session and wait for response.
+    /// Send a pre-built request packet to a session and await its response.
     ///
-    /// Uses TransportServer's own request tracker so responses are matched
-    /// consistently at the server layer.
-    pub async fn request_to_session(
+    /// Crate-internal: it trusts the caller's `message_id`, and a caller-chosen
+    /// id could collide with a live request (responses are matched by
+    /// `(session_id, message_id)`). The public entry point is
+    /// [`Self::request`], which always allocates the id itself.
+    pub(crate) async fn request_to_session(
         &self,
         session_id: SessionId,
         packet: Packet,
@@ -385,7 +387,7 @@ impl TransportServer {
         session_id: SessionId,
         data: &[u8],
     ) -> Result<crate::event::SendReceipt, TransportError> {
-        let message_id = self.request_registry.next_message_id();
+        let message_id = self.request_registry.next_oneway_id();
         let packet = crate::packet::Packet::one_way(message_id, data.to_vec());
 
         tracing::debug!(
@@ -408,7 +410,16 @@ impl TransportServer {
         session_id: SessionId,
         data: &[u8],
     ) -> Result<Bytes, TransportError> {
-        let message_id = self.request_registry.next_message_id();
+        // Per-session, strictly monotonic, never wraps (see next_request_id):
+        // an id is never reused within a session, so a late response cannot
+        // complete a newer request.
+        let Some(message_id) = self.request_registry.next_request_id(Some(session_id)) else {
+            return Err(TransportError::resource_error(
+                "request_id_space",
+                u32::MAX as usize,
+                u32::MAX as usize,
+            ));
+        };
         let packet = crate::packet::Packet::request(message_id, data.to_vec());
 
         tracing::debug!(

@@ -4,7 +4,7 @@
 use crate::packet::Packet;
 use crate::SessionId;
 use dashmap::{DashMap, DashSet};
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
@@ -315,6 +315,17 @@ struct SessionRuntime {
     state: AtomicU8,
     /// Keys of this session's live requests, drained on close.
     requests: DashSet<RequestKey>,
+    /// Strictly monotonic OUTBOUND request id counter, scoped to this session.
+    ///
+    /// Request ids are matched on the wire by `(session_id, message_id)` with no
+    /// generation field (the 16-byte header has no room for one), so the ONLY
+    /// way a late response cannot be delivered to the wrong request is if an id
+    /// is never reused within a session. A single global `fetch_add` on a `u32`
+    /// wraps — at 100k requests/s in about 12 hours — and the id space then
+    /// silently restarts under still-live requests. Scoping the counter to the
+    /// session and REFUSING to wrap (see `next_request_id`) makes reuse
+    /// impossible: a reconnect starts a new session with a fresh space.
+    next_request_id: AtomicU32,
 }
 
 impl SessionRuntime {
@@ -325,6 +336,7 @@ impl SessionRuntime {
         Self {
             state: AtomicU8::new(Self::OPEN),
             requests: DashSet::new(),
+            next_request_id: AtomicU32::new(1),
         }
     }
 
@@ -387,10 +399,46 @@ impl RequestRegistry {
             .or_insert_with(|| Arc::new(SessionRuntime::new()));
     }
 
-    /// Allocate the next outbound request id.
-    pub fn next_message_id(&self) -> u32 {
+    /// Allocate an id for a ONE-WAY message.
+    ///
+    /// One-way messages are never matched against anything (no response, no
+    /// registry entry), so this counter may wrap harmlessly. Do NOT use it for
+    /// requests — see [`Self::next_request_id`].
+    pub fn next_oneway_id(&self) -> u32 {
         self.next_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Allocate the next OUTBOUND request id for `session_id`, or `None` when
+    /// this session's id space is exhausted or the session is not open.
+    ///
+    /// Strictly monotonic per session and, crucially, it REFUSES TO WRAP.
+    /// Responses are matched on the wire by `(session_id, message_id)` with no
+    /// generation, so reusing an id within a session is what would let a late
+    /// response complete a different request. Exhaustion is surfaced to the
+    /// caller (which fails the request and closes the connection) instead of
+    /// silently restarting the space; a reconnect gets a fresh session with a
+    /// fresh counter.
+    pub fn next_request_id(&self, session_id: Option<SessionId>) -> Option<u32> {
+        let Some(sid) = session_id else {
+            // Session-less requests share the wrapping counter; they exist only
+            // in unit tests, where no long-lived id space is at stake.
+            return Some(self.next_oneway_id());
+        };
+        let runtime = self.sessions.get(&sid)?;
+        if !runtime.is_open() {
+            return None;
+        }
+        // `fetch_update` so exhaustion is detected atomically: the counter
+        // saturates at u32::MAX and never rolls over to 0.
+        runtime
+            .next_request_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                // `then`, not `then_some`: the latter evaluates `cur + 1`
+                // eagerly and overflows at the saturation point.
+                (cur != u32::MAX).then(|| cur + 1)
+            })
+            .ok()
     }
 
     pub fn new_with_timing(bucket_count: usize, tick_duration: Duration) -> Self {
@@ -1638,5 +1686,54 @@ mod tests {
         assert_eq!(registry.abort_all(), 2);
         assert!(rx1.try_recv().is_err());
         assert!(rx2.try_recv().is_err());
+    }
+
+    /// Request ids must be strictly monotonic PER SESSION and must never wrap.
+    ///
+    /// Responses are matched on the wire by `(session_id, message_id)` with no
+    /// generation, so reusing an id inside a session is exactly what would let a
+    /// late response complete a different request. The counter therefore
+    /// saturates and reports exhaustion instead of rolling over.
+    #[test]
+    fn request_ids_are_per_session_monotonic_and_never_wrap() {
+        let registry = RequestRegistry::new();
+        open(&registry, &[1, 2]);
+        let s1 = Some(SessionId(1));
+        let s2 = Some(SessionId(2));
+
+        // Per-session spaces are independent and each starts fresh.
+        assert_eq!(registry.next_request_id(s1), Some(1));
+        assert_eq!(registry.next_request_id(s1), Some(2));
+        assert_eq!(registry.next_request_id(s2), Some(1));
+
+        // Strictly increasing within a session.
+        let a = registry.next_request_id(s1).unwrap();
+        let b = registry.next_request_id(s1).unwrap();
+        assert!(b > a);
+
+        // Exhaustion is reported, NOT wrapped back onto live ids.
+        let rt = registry.sessions.get(&SessionId(1)).unwrap().clone();
+        rt.next_request_id.store(u32::MAX, Ordering::Relaxed);
+        assert_eq!(
+            registry.next_request_id(s1),
+            None,
+            "an exhausted id space must refuse to allocate, never wrap to 0"
+        );
+        // Still refuses on every subsequent call (saturated, not rolled over).
+        assert_eq!(registry.next_request_id(s1), None);
+        // A different session is unaffected.
+        assert!(registry.next_request_id(s2).is_some());
+    }
+
+    /// A closed session cannot hand out request ids (its space is gone; the
+    /// reconnect gets a brand-new session with a fresh counter).
+    #[test]
+    fn closed_session_allocates_no_request_ids() {
+        let registry = RequestRegistry::new();
+        open(&registry, &[5]);
+        let sid = Some(SessionId(5));
+        assert!(registry.next_request_id(sid).is_some());
+        registry.close_session_pending(SessionId(5));
+        assert_eq!(registry.next_request_id(sid), None);
     }
 }

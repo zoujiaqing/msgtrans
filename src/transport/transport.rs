@@ -600,29 +600,36 @@ impl Transport {
                         // Register the inbound request under ITS generation so the
                         // respond path gets the full claimed lifecycle (single
                         // responder, duplicate refusal, drain on session close).
-                        // A refused registration (duplicate id from the peer) is
-                        // still forwarded; its respond will observe AlreadyHandled.
-                        let token = self.request_registry.register(
+                        let Some(token) = self.request_registry.register(
                             id,
                             Some(source_session),
                             packet.header.biz_type,
                             INBOUND_REQUEST_TIMEOUT,
-                        );
-                        if token.is_none() {
-                            tracing::debug!(
-                                "[PROC] Inbound request not registered (duplicate or closing session): ID={}, session={}",
+                        ) else {
+                            // Registration refused: the peer reused an id that is
+                            // still in flight, or the session is closing. DROP it.
+                            //
+                            // Forwarding it anyway (as 2.0.0-alpha.3 did) handed the
+                            // consumer a request with no registration token, and the
+                            // respond path then skipped the registry entirely and
+                            // wrote a SECOND real response for the same request id.
+                            // The registry is the only arbiter of "one response per
+                            // request", so an unregistrable request must never reach
+                            // the consumer.
+                            tracing::warn!(
+                                "[PROC] Dropping unregistrable inbound request (duplicate in-flight id or closing session): ID={}, session={}",
                                 id,
                                 source_session
                             );
-                        }
-                        // [TARGET] Send MessageReceived event directly, let ClientEvent handle Request logic during conversion
+                            return;
+                        };
                         tracing::debug!(
                             "[SEND] Sending unified MessageReceived event (Request): ID={}",
                             id
                         );
                         self.forward_client_event_with_token(
                             source_session,
-                            token,
+                            Some(token),
                             crate::event::TransportEvent::MessageReceived(packet),
                         )
                         .await;
@@ -722,12 +729,20 @@ impl Transport {
         data: Bytes,
         options: super::TransportOptions,
     ) -> Result<Bytes, TransportError> {
-        // Always allocate a unique, monotonically increasing message id. A
-        // caller-chosen id could be reused while a previous request with the
-        // same id still had a response in flight; the peer echoes the id on the
-        // wire with no generation, so a late old response would be delivered to
-        // the new caller. Unique allocation removes that ABA at the source.
-        let message_id = self.request_registry.next_message_id();
+        // Always allocate a unique, strictly monotonic, per-session request id.
+        // A caller-chosen (or wrapped) id could be reused while a previous
+        // request with the same id still had a response in flight; the peer
+        // echoes the id on the wire with no generation, so a late old response
+        // would be delivered to the new caller. Exhaustion fails the request
+        // instead of restarting the id space under live requests.
+        let session_id = self.current_session_id().await;
+        let Some(message_id) = self.request_registry.next_request_id(session_id) else {
+            return Err(TransportError::resource_error(
+                "request_id_space",
+                u32::MAX as usize,
+                u32::MAX as usize,
+            ));
+        };
 
         // Create request packet
         let mut packet = crate::packet::Packet::request(message_id, data.clone());
@@ -824,8 +839,17 @@ impl Transport {
         }
     }
 
-    pub(crate) fn next_message_id(&self) -> u32 {
-        self.request_registry.next_message_id()
+    /// Id for a ONE-WAY message (wrapping is harmless: nothing matches on it).
+    pub(crate) fn next_oneway_id(&self) -> u32 {
+        self.request_registry.next_oneway_id()
+    }
+
+    /// Id for an OUTBOUND request on the current session. `None` means the
+    /// session's request-id space is exhausted (or the session is gone): the
+    /// caller must fail the request rather than reuse an id.
+    pub(crate) async fn next_request_id(&self) -> Option<u32> {
+        let session_id = self.current_session_id().await;
+        self.request_registry.next_request_id(session_id)
     }
 
     /// Send one-way message (with options)
@@ -834,8 +858,8 @@ impl Transport {
         data: Bytes,
         options: super::TransportOptions,
     ) -> Result<(), TransportError> {
-        // Always allocate a unique message id (see request_with_options).
-        let message_id = self.request_registry.next_message_id();
+        // One-way: nothing matches on this id, so a wrapping counter is fine.
+        let message_id = self.request_registry.next_oneway_id();
 
         // Create one-way message packet
         let mut packet = crate::packet::Packet::one_way(message_id, data.clone());
@@ -1185,5 +1209,56 @@ mod generation_tests {
         );
 
         sender.abort();
+    }
+
+    /// A duplicate inbound request id (one already in flight) must be DROPPED,
+    /// never forwarded.
+    ///
+    /// 2.0.0-alpha.3 forwarded it with `token: None`, and `ClientRequest::respond`
+    /// then took a bypass branch that skipped the registry entirely and wrote a
+    /// SECOND real response for the same request id. The registry is the only
+    /// arbiter of "exactly one response per request", so an unregistrable
+    /// request must not reach the consumer at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn duplicate_inbound_request_is_dropped_not_forwarded() {
+        let ctx = TransportContext::new().await.expect("ctx");
+        let transport = Arc::new(Transport::with_context(TransportConfig::default(), &ctx));
+        let closed = Arc::new(AtomicBool::new(false));
+        let session_id = transport.set_connection(mock(&closed)).await;
+
+        // Take the client event queue so we can observe what is forwarded.
+        let mut events = transport
+            .get_event_stream()
+            .await
+            .expect("client events taken once");
+
+        // First inbound request with id 7: registers and is forwarded WITH a token.
+        let req = Packet::request(7, b"one".to_vec());
+        transport
+            .on_event(
+                session_id,
+                crate::event::TransportEvent::MessageReceived(req),
+            )
+            .await;
+        let first = events.try_recv().expect("first request forwarded");
+        assert!(
+            first.token.is_some(),
+            "a registered request must carry its registration token"
+        );
+
+        // SAME id while the first is still in flight: registration is refused.
+        let dup = Packet::request(7, b"two".to_vec());
+        transport
+            .on_event(
+                session_id,
+                crate::event::TransportEvent::MessageReceived(dup),
+            )
+            .await;
+        assert!(
+            events.try_recv().is_err(),
+            "a duplicate in-flight request id must be dropped, not forwarded \
+             (forwarding it lets the respond path bypass the registry and emit \
+             a second response for the same id)"
+        );
     }
 }

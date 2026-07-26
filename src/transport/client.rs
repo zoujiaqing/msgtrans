@@ -547,7 +547,7 @@ impl TransportClient {
             ));
         }
 
-        let message_id = self.inner.next_message_id();
+        let message_id = self.inner.next_oneway_id();
         let packet = crate::packet::Packet::one_way(message_id, data.to_vec());
 
         tracing::debug!(
@@ -577,7 +577,7 @@ impl TransportClient {
             ));
         }
 
-        let message_id = self.inner.next_message_id();
+        let message_id = self.inner.next_oneway_id();
         let packet = crate::packet::Packet::one_way(message_id, data.to_vec());
         self.inner.send(packet).await?;
         Ok(crate::event::SendReceipt::new(None, message_id))
@@ -597,7 +597,15 @@ impl TransportClient {
             ));
         }
 
-        let message_id = self.inner.next_message_id();
+        // Per-session, strictly monotonic, never wraps: an id is never reused
+        // within a session, so a late response cannot complete a newer request.
+        let Some(message_id) = self.inner.next_request_id().await else {
+            return Err(TransportError::resource_error(
+                "request_id_space",
+                u32::MAX as usize,
+                u32::MAX as usize,
+            ));
+        };
         let packet = crate::packet::Packet::request(message_id, data.to_vec());
 
         tracing::debug!(
@@ -680,9 +688,24 @@ impl TransportClient {
                             let transport = transport_for_response.clone();
                             let message_id = packet.header.message_id;
                             let biz_type = packet.header.biz_type;
-                            let registry = transport_for_response
-                                .upgrade()
-                                .map(|t| t.request_registry().clone());
+                            // A request is only deliverable if it is backed by a
+                            // live registry AND its registration token: those are
+                            // what guarantee exactly one response. The transport
+                            // already drops unregistrable requests, so this is the
+                            // belt-and-braces check — never hand the consumer a
+                            // request whose respond path could bypass the registry.
+                            let (Some(registry), Some(request_token)) = (
+                                transport_for_response
+                                    .upgrade()
+                                    .map(|t| t.request_registry().clone()),
+                                request_token,
+                            ) else {
+                                tracing::warn!(
+                                    "[RECV] Dropping inbound request without registry/token: ID={}",
+                                    message_id
+                                );
+                                continue;
+                            };
 
                             let context = crate::event::ClientRequest::new(
                                 Some(source_session),

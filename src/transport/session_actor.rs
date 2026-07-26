@@ -132,7 +132,7 @@ impl SessionSender {
         &self,
         data: impl Into<bytes::Bytes>,
     ) -> Result<(), crate::TransportError> {
-        let packet = Packet::one_way(self.transport.next_message_id(), data);
+        let packet = Packet::one_way(self.transport.next_oneway_id(), data);
         self.transport.send(packet).await
     }
 
