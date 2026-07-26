@@ -43,10 +43,6 @@ impl ProtocolConfig for TcpClientConfig {
     fn validate(&self) -> Result<(), ConfigError> {
         Ok(())
     }
-
-    fn default_config() -> Self {
-        Self::default()
-    }
 }
 
 #[cfg(feature = "tcp")]
@@ -239,10 +235,6 @@ impl ProtocolConfig for WebSocketClientConfig {
         }
 
         Ok(())
-    }
-
-    fn default_config() -> Self {
-        Self::default()
     }
 }
 
@@ -445,10 +437,6 @@ impl ProtocolConfig for QuicClientConfig {
         validate_quic_stream_count(self.max_concurrent_streams)?;
         Ok(())
     }
-
-    fn default_config() -> Self {
-        Self::default()
-    }
 }
 
 #[cfg(feature = "quic")]
@@ -605,7 +593,10 @@ impl crate::protocol::adapter::DynClientConfig for WebSocketClientConfig {
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
-                    Output = Result<Box<dyn crate::Connection>, crate::error::TransportError>,
+                    Output = Result<
+                        Box<dyn crate::connection::Connection>,
+                        crate::error::TransportError,
+                    >,
                 > + Send
                 + '_,
         >,
@@ -613,7 +604,7 @@ impl crate::protocol::adapter::DynClientConfig for WebSocketClientConfig {
         Box::pin(async move {
             let connection =
                 crate::protocol::adapter::ClientConfig::build_connection(self, limits).await?;
-            Ok(Box::new(connection) as Box<dyn crate::Connection>)
+            Ok(Box::new(connection) as Box<dyn crate::connection::Connection>)
         })
     }
 
@@ -631,7 +622,10 @@ impl crate::protocol::adapter::DynClientConfig for TcpClientConfig {
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
-                    Output = Result<Box<dyn crate::Connection>, crate::error::TransportError>,
+                    Output = Result<
+                        Box<dyn crate::connection::Connection>,
+                        crate::error::TransportError,
+                    >,
                 > + Send
                 + '_,
         >,
@@ -639,7 +633,7 @@ impl crate::protocol::adapter::DynClientConfig for TcpClientConfig {
         Box::pin(async move {
             let connection =
                 crate::protocol::adapter::ClientConfig::build_connection(self, limits).await?;
-            Ok(Box::new(connection) as Box<dyn crate::Connection>)
+            Ok(Box::new(connection) as Box<dyn crate::connection::Connection>)
         })
     }
 
@@ -657,7 +651,10 @@ impl crate::protocol::adapter::DynClientConfig for QuicClientConfig {
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
-                    Output = Result<Box<dyn crate::Connection>, crate::error::TransportError>,
+                    Output = Result<
+                        Box<dyn crate::connection::Connection>,
+                        crate::error::TransportError,
+                    >,
                 > + Send
                 + '_,
         >,
@@ -665,7 +662,7 @@ impl crate::protocol::adapter::DynClientConfig for QuicClientConfig {
         Box::pin(async move {
             let connection =
                 crate::protocol::adapter::ClientConfig::build_connection(self, limits).await?;
-            Ok(Box::new(connection) as Box<dyn crate::Connection>)
+            Ok(Box::new(connection) as Box<dyn crate::connection::Connection>)
         })
     }
 

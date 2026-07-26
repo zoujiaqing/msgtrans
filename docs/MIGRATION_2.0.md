@@ -248,8 +248,13 @@ backpressured), `message_sent(id)` (droppable diagnostic), `close(reason)`
 `TransportOptions::message_id` is removed. A caller-chosen id could be reused
 while a previous request's response was still in flight, and the peer echoes the
 id with no generation, so a late old response could be handed to the new caller.
-Ids are now always unique and monotonic. (`SessionSender::send_data` likewise
-stopped stamping every one-way message with the fixed id 0.)
+Request ids are allocated **per session**, are strictly monotonic, and **refuse
+to wrap**: the counter saturates and the request fails with a resource error
+rather than restarting the id space under still-live requests (a reconnect gets
+a fresh session with a fresh counter). One-way messages use a separate counter
+that may wrap harmlessly, since nothing matches on their ids.
+(`SessionSender::send_data` likewise stopped stamping every one-way message with
+the fixed id 0.)
 
 ## 15. Extensible enums are `#[non_exhaustive]`
 
@@ -257,3 +262,57 @@ stopped stamping every one-way message with the fixed id 0.)
 `ConnectionState` and the output-only `ShutdownReport`/`ConnectionInfo` are
 `#[non_exhaustive]`, so future variants and fields are additive. Add a `_ => {}`
 arm to exhaustive matches.
+
+## 16. `send*` is confirmed everywhere; `broadcast` reports
+
+Every public `send*` is now write-confirmed, including `SessionSender::send` /
+`send_data` and `send_with_options`. The fire-and-forget tier is explicitly
+named: `TransportClient::send_detached`, `SessionSender::send_detached` /
+`send_data_detached`.
+
+`TransportServer::broadcast` returned `Ok(())` even when every send failed. It
+now returns a `BroadcastReport`:
+
+```rust
+let report = server.broadcast(packet).await;
+if !report.is_complete() {
+    warn!("broadcast reached {} sessions, {} failed", report.delivered, report.failed_count());
+}
+```
+
+## 17. `TransportOptions::compression` is removed
+
+It set the compressed flag on the header and then compressed; a compression
+failure only logged a warning and sent the RAW payload under a "compressed"
+header. On a default build (no `flate2`/`zstd` feature) that failure was
+guaranteed. Compression is now explicit and packet-local:
+
+```rust
+let mut packet = Packet::one_way(id, payload);
+packet.set_compression(CompressionType::Zstd);
+packet.compress_payload()?;   // the error is yours to handle
+```
+
+## 18. Dead events removed; `Connected` actually fires
+
+`TransportEvent::{ServerStarted, ServerStopped, ClientConnected,
+ClientDisconnected}` are deleted — nothing ever produced them.
+
+`ClientEvent::Connected` had the same problem (nothing produced
+`ConnectionEstablished`), so code waiting for it waited forever. It is now
+**emitted on every connection**, including reconnects, carrying the real
+`ConnectionInfo`.
+
+## 19. Double `connect()` is rejected
+
+Calling `connect()` on an already-connected client returns an error instead of
+silently replacing the live connection (which orphaned the old socket's session
+while the caller believed it still had one). Call `disconnect()` first.
+
+## 20. The SPI lives only in `msgtrans::spi`
+
+`Connection`, `ConnectionWriter`, `Server`, `WriteCompletion` and the `Dyn*`
+config traits are no longer re-exported from the crate root — one type, one
+public path. Application code uses the crate root; protocol implementors use
+`msgtrans::spi`. The generic `ProtocolConfig` is crate-private too, so the
+object-safe set is the only trait set to implement.

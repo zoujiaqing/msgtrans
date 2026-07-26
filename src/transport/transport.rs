@@ -362,7 +362,7 @@ impl Transport {
         // out-of-order install would make the newest generation judge itself
         // stale). pub(crate): the supervisor/protocol layer is the only
         // legitimate installer.
-        let (session_id, event_pipe_opt) = {
+        let (session_id, event_pipe_opt, info) = {
             let mut guard = self.slot.lock().await;
             let epoch = self
                 .connection_epoch
@@ -372,18 +372,29 @@ impl Transport {
             connection.set_session_id(session_id);
             let event_pipe_opt = connection.take_event_pipe();
             let writer = connection.writer();
+            let info = connection.connection_info();
             *guard = Some(ConnectionSlot {
                 session_id,
                 connection,
                 writer,
             });
-            (session_id, event_pipe_opt)
+            (session_id, event_pipe_opt, info)
         };
         self.state_manager.add_connection(session_id);
         // Open request tracking for this session; the registry refuses
         // registrations for sessions that were never opened or already closed.
         self.request_registry.open_session(session_id);
         tracing::debug!("[SUCCESS] Transport connection set: {}", session_id);
+        // Announce the connection. Until 2.0.0-alpha.3 NOTHING produced this
+        // event, so `ClientEvent::Connected` never fired and the README/examples
+        // waited for a message that could not arrive. It is emitted here, where
+        // the connection (and its real ConnectionInfo) is installed, and it is
+        // emitted on reconnects too — every generation announces itself.
+        self.forward_client_event(
+            session_id,
+            crate::event::TransportEvent::ConnectionEstablished { info },
+        )
+        .await;
         if let Some(mut pipe) = event_pipe_opt {
             // Bounded backbone: single-consumer queue with backpressure; the
             // pipe ends with exactly one ConnectionClosed.
@@ -747,20 +758,8 @@ impl Transport {
         // Create request packet
         let mut packet = crate::packet::Packet::request(message_id, data.clone());
         packet.set_biz_type(options.biz_type.unwrap_or(0));
-        if let Some(compression) = options.compression {
-            packet.set_compression(compression);
-        }
         if let Some(ext) = options.ext_header.as_ref() {
             packet.set_ext_header(ext.clone());
-        }
-
-        // [FIX] If compression is needed, compress the packet
-        if options.compression.is_some()
-            && options.compression != Some(crate::packet::CompressionType::None)
-        {
-            if let Err(e) = packet.compress_payload() {
-                tracing::warn!("[WARN] Failed to compress packet: {}, using raw data", e);
-            }
         }
 
         // Register request tracking
@@ -852,7 +851,8 @@ impl Transport {
         self.request_registry.next_request_id(session_id)
     }
 
-    /// Send one-way message (with options)
+    /// Send a one-way message with options, **write-confirmed** (every public
+    /// `send*` is confirmed; the detached tier is explicitly named).
     pub async fn send_with_options(
         &self,
         data: Bytes,
@@ -864,25 +864,14 @@ impl Transport {
         // Create one-way message packet
         let mut packet = crate::packet::Packet::one_way(message_id, data.clone());
         packet.set_biz_type(options.biz_type.unwrap_or(0));
-        if let Some(compression) = options.compression {
-            packet.set_compression(compression);
-        }
         if let Some(ext) = options.ext_header.as_ref() {
             packet.set_ext_header(ext.clone());
         }
 
-        // [FIX] If compression is needed, compress the packet
-        if options.compression.is_some()
-            && options.compression != Some(crate::packet::CompressionType::None)
-        {
-            if let Err(e) = packet.compress_payload() {
-                tracing::warn!("[WARN] Failed to compress packet: {}, using raw data", e);
-            }
-        }
-
-        // Send packet
-        self.send(packet).await?;
-        Ok(())
+        // Write-confirmed, like every other public `send*` (the detached tier
+        // is explicitly named `send_detached`).
+        let session_id = self.current_session_id().await;
+        self.send_confirmed_with(packet, session_id, None).await
     }
 }
 
@@ -1231,6 +1220,16 @@ mod generation_tests {
             .get_event_stream()
             .await
             .expect("client events taken once");
+
+        // set_connection announces the connection first; drain it.
+        let established = events.try_recv().expect("ConnectionEstablished forwarded");
+        assert!(
+            matches!(
+                established.event,
+                crate::event::TransportEvent::ConnectionEstablished { .. }
+            ),
+            "a new connection must announce itself (ClientEvent::Connected)"
+        );
 
         // First inbound request with id 7: registers and is forwarded WITH a token.
         let req = Packet::request(7, b"one".to_vec());

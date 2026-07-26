@@ -190,16 +190,16 @@ impl DynProtocolConfig for PipeConfig {
 impl DynServerConfig for PipeConfig {
     fn build_server_dyn(
         &self,
-        _limits: msgtrans::ConnectionLimits,
+        _limits: msgtrans::spi::ConnectionLimits,
     ) -> std::pin::Pin<
         Box<
-            dyn std::future::Future<Output = Result<Box<dyn msgtrans::Server>, TransportError>>
+            dyn std::future::Future<Output = Result<Box<dyn msgtrans::spi::Server>, TransportError>>
                 + Send
                 + '_,
         >,
     > {
         Box::pin(async move {
-            Ok(Box::new(PipeServer { handed_out: false }) as Box<dyn msgtrans::Server>)
+            Ok(Box::new(PipeServer { handed_out: false }) as Box<dyn msgtrans::spi::Server>)
         })
     }
     fn get_bind_address(&self) -> std::net::SocketAddr {
@@ -213,7 +213,7 @@ impl DynServerConfig for PipeConfig {
 impl DynClientConfig for PipeConfig {
     fn build_connection_dyn(
         &self,
-        _limits: msgtrans::ConnectionLimits,
+        _limits: msgtrans::spi::ConnectionLimits,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<Output = Result<Box<dyn Connection>, TransportError>>

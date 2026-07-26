@@ -91,18 +91,33 @@ Everything above is reachable **only** through the crate root
 The whole surface an out-of-crate protocol needs, and nothing that leaks an
 internal type. This is a *separate module* (`msgtrans::spi`), not the crate root.
 
-- `Connection` (single send method: `send_with_completion(Packet,
-  WriteCompletion)`), `WriteCompletion`, `Server`
-- `EventSink` / `ConnectionEvents` (public wrappers over the internal bounded
-  event backbone) + `event_channel(capacity)`; the adapter keeps the `EventSink`
-  and returns the `ConnectionEvents` from `Connection::take_event_pipe`
-- `ServerConfig` / `ClientConfig` (+ object-safe `DynServerConfig` /
-  `DynClientConfig` and their shared supertrait `DynProtocolConfig`),
-  `ProtocolConfig`, `ConfigError`, taking `ConnectionLimits`
+- `Connection` — hands out its write half via `writer() -> Arc<dyn
+  ConnectionWriter>`; also `close`, `session_id`/`set_session_id`,
+  `connection_info`, `is_connected`, `flush`, `take_event_pipe`, and the
+  **required** `set_frame_policy`
+- `ConnectionWriter` — the single send method,
+  `send_with_completion(&self, Packet, WriteCompletion)`. It is separate from
+  `Connection` so the transport can clone it under its connection lock and
+  release the lock BEFORE awaiting the enqueue
+- `WriteCompletion`, `Server`
+- `EventSink` — typed by plane, so data can't be routed onto the droppable
+  channel and a close can't queue behind data: `message(Packet)` /
+  `error(TransportError)` (data, backpressured), `message_sent(id)`
+  (droppable diagnostic), `close(reason)` (control). Paired with
+  `ConnectionEvents` via `event_channel(NonZeroUsize)`
+- ONE object-safe config trait set: `DynProtocolConfig` +
+  `DynServerConfig`/`DynClientConfig`, taking `ConnectionLimits`, plus
+  `ConfigError`. There is no public generic variant — the generic
+  `ProtocolConfig`/`ServerConfig`/`ClientConfig` are crate-private so no
+  internal adapter type appears in the frozen contract
 - Re-exported building blocks: `Packet`, `TransportEvent`, `SessionId`,
   `ConnectionInfo`, `CloseReason`, `TransportError`, `ConnectionLimits`
 
 ## Cargo features
 
 `default = ["tcp", "websocket", "quic"]`; each protocol gates its adapter,
-config, events and dependencies. `flate2`/`zstd` gate payload compression.
+config, events and dependencies. `flate2`/`zstd` gate `Packet`-level payload
+compression, which is explicit: `set_compression` + `compress_payload` on the
+packet. (`TransportOptions::compression` is gone — it stamped the header before
+compressing and, on a build without the codec feature, shipped a raw payload
+under a "compressed" header.)

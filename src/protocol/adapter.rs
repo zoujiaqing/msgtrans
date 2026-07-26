@@ -6,13 +6,15 @@ use crate::protocol::{TcpClientConfig, TcpServerConfig};
 #[cfg(feature = "websocket")]
 use crate::protocol::{WebSocketClientConfig, WebSocketServerConfig};
 
-/// Protocol configuration trait
-pub trait ProtocolConfig: Send + Sync + Clone + std::fmt::Debug + 'static {
+/// Protocol configuration trait — the typed validation hook each built-in
+/// config implements, consumed by its own `DynProtocolConfig::validate_dyn`.
+///
+/// Crate-private: external protocols implement the object-safe
+/// [`DynProtocolConfig`] instead, so there is exactly ONE trait set to
+/// implement and no generic variant in the frozen contract.
+pub(crate) trait ProtocolConfig: Send + Sync + Clone + std::fmt::Debug + 'static {
     /// Validate if configuration is valid
     fn validate(&self) -> Result<(), ConfigError>;
-
-    /// Get default configuration
-    fn default_config() -> Self;
 }
 
 /// Object-safe protocol configuration trait for unified Builder interface
@@ -34,7 +36,10 @@ pub trait DynServerConfig: DynProtocolConfig {
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
-                    Output = Result<Box<dyn crate::Server>, crate::error::TransportError>,
+                    Output = Result<
+                        Box<dyn crate::connection::Server>,
+                        crate::error::TransportError,
+                    >,
                 > + Send
                 + '_,
         >,
@@ -57,7 +62,10 @@ pub trait DynClientConfig: DynProtocolConfig {
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
-                    Output = Result<Box<dyn crate::Connection>, crate::error::TransportError>,
+                    Output = Result<
+                        Box<dyn crate::connection::Connection>,
+                        crate::error::TransportError,
+                    >,
                 > + Send
                 + '_,
         >,
@@ -266,7 +274,7 @@ impl ClientConfig for QuicClientConfig {
 /// adapter refactor a breaking change. External protocols implement the
 /// object-safe [`DynServerConfig`] instead.
 pub(crate) trait ServerConfig: Send + Sync + 'static {
-    type Server: crate::Server;
+    type Server: crate::connection::Server;
 
     /// Build server instance with the per-connection resource limits.
     fn build_server(
@@ -279,7 +287,7 @@ pub(crate) trait ServerConfig: Send + Sync + 'static {
 /// protocol's `DynClientConfig` impl. Crate-private for the same reason as
 /// [`ServerConfig`]: `type Connection` names the private adapter.
 pub(crate) trait ClientConfig: Send + Sync + 'static {
-    type Connection: crate::Connection;
+    type Connection: crate::connection::Connection;
 
     /// Build connection instance with the per-connection resource limits.
     fn build_connection(

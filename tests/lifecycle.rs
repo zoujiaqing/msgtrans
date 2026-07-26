@@ -779,11 +779,11 @@ impl DynProtocolConfig for GatedBuildConfig {
 impl DynServerConfig for GatedBuildConfig {
     fn build_server_dyn(
         &self,
-        _limits: msgtrans::ConnectionLimits,
+        _limits: msgtrans::spi::ConnectionLimits,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
-                    Output = Result<Box<dyn msgtrans::Server>, msgtrans::TransportError>,
+                    Output = Result<Box<dyn msgtrans::spi::Server>, msgtrans::TransportError>,
                 > + Send
                 + '_,
         >,
@@ -859,11 +859,11 @@ impl DynProtocolConfig for PanicBuildConfig {
 impl DynServerConfig for PanicBuildConfig {
     fn build_server_dyn(
         &self,
-        _limits: msgtrans::ConnectionLimits,
+        _limits: msgtrans::spi::ConnectionLimits,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
-                    Output = Result<Box<dyn msgtrans::Server>, msgtrans::TransportError>,
+                    Output = Result<Box<dyn msgtrans::spi::Server>, msgtrans::TransportError>,
                 > + Send
                 + '_,
         >,
@@ -892,4 +892,166 @@ async fn startup_panic_is_reported_as_serve_error() {
     let report = server.shutdown_with_timeout(Duration::from_secs(5)).await;
     assert!(report.infra_stopped, "{:?}", report);
     assert!(report.clean, "{:?}", report);
+}
+
+/// `shutdown()` promises no background task outlives it. The fallback
+/// request-timeout scanner is one such task: alpha.3 only stored its
+/// `AbortHandle` and never cancelled it in teardown, so it kept ticking until
+/// the client object was dropped. Assert the task count returns to its
+/// pre-connect level after shutdown.
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_stops_the_request_scanner() {
+    let addr = "127.0.0.1:28955";
+    let server = TransportServerBuilder::new()
+        .protocol(TcpServerConfig::new(addr).expect("cfg"))
+        .build(Arc::new(Echo))
+        .await
+        .expect("server");
+    let serving = {
+        let s = server.clone();
+        tokio::spawn(async move {
+            let _ = s.serve().await;
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let before = tokio::runtime::Handle::current()
+        .metrics()
+        .num_alive_tasks();
+
+    let mut client = TransportClientBuilder::new()
+        .protocol(TcpClientConfig::new(addr).expect("cfg"))
+        .build()
+        .await
+        .expect("client");
+    client.connect().await.expect("connect");
+    // Connected: forwarding task + scanner are alive.
+    assert!(
+        tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks()
+            > before,
+        "connect must have spawned background tasks"
+    );
+
+    client.shutdown().await.expect("shutdown");
+
+    // The client's own tasks are joined by shutdown(); the SERVER's session
+    // tasks end asynchronously as the closed socket is reaped, so poll for
+    // convergence back to the pre-connect baseline. A leaked scanner never
+    // converges: it keeps ticking for as long as the client object lives, and
+    // the client is deliberately still alive here (so nothing can be
+    // attributed to Drop).
+    let mut after = usize::MAX;
+    for _ in 0..40 {
+        after = tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks();
+        if after <= before {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        after <= before,
+        "background task(s) still running ~2s after shutdown() (before={}, after={}) — \
+         the request scanner must be aborted AND joined by teardown, not left to Drop",
+        before,
+        after
+    );
+
+    drop(client);
+    let _ = server.shutdown_with_timeout(Duration::from_secs(5)).await;
+    serving.abort();
+}
+
+/// `ClientEvent::Connected` must ACTUALLY be delivered.
+///
+/// Through 2.0.0-alpha.3 nothing in the crate ever produced
+/// `TransportEvent::ConnectionEstablished`, so this event never fired and the
+/// README/examples waited for a message that could not arrive.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_receives_connected_event() {
+    let addr = "127.0.0.1:28957";
+    let server = TransportServerBuilder::new()
+        .protocol(TcpServerConfig::new(addr).expect("cfg"))
+        .build(Arc::new(Echo))
+        .await
+        .expect("server");
+    let serving = {
+        let s = server.clone();
+        tokio::spawn(async move {
+            let _ = s.serve().await;
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut client = TransportClientBuilder::new()
+        .protocol(TcpClientConfig::new(addr).expect("cfg"))
+        .build()
+        .await
+        .expect("client");
+    let mut events = client.events().await.expect("events");
+    client.connect().await.expect("connect");
+
+    let event = tokio::time::timeout(Duration::from_secs(5), events.next())
+        .await
+        .expect("Connected must arrive")
+        .expect("stream open");
+    match event {
+        msgtrans::ClientEvent::Connected { info } => {
+            assert_eq!(info.protocol, "tcp");
+            assert!(
+                !info.peer_addr.ip().is_unspecified(),
+                "Connected must carry the real peer address, got {}",
+                info.peer_addr
+            );
+        }
+        other => panic!("expected ClientEvent::Connected, got {other:?}"),
+    }
+
+    let _ = client.shutdown().await;
+    let _ = server.shutdown_with_timeout(Duration::from_secs(5)).await;
+    serving.abort();
+}
+
+/// Connecting an already-connected client must be REFUSED, not silently
+/// replace the live connection (which orphaned the old socket's session while
+/// the caller believed it still had one connection).
+#[tokio::test(flavor = "multi_thread")]
+async fn double_connect_is_rejected() {
+    let addr = "127.0.0.1:28958";
+    let server = TransportServerBuilder::new()
+        .protocol(TcpServerConfig::new(addr).expect("cfg"))
+        .build(Arc::new(Echo))
+        .await
+        .expect("server");
+    let serving = {
+        let s = server.clone();
+        tokio::spawn(async move {
+            let _ = s.serve().await;
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut client = TransportClientBuilder::new()
+        .protocol(TcpClientConfig::new(addr).expect("cfg"))
+        .build()
+        .await
+        .expect("client");
+    client.connect().await.expect("first connect succeeds");
+
+    let second = client.connect().await;
+    assert!(
+        second.is_err(),
+        "a second connect() on a live client must be rejected"
+    );
+
+    // After an explicit disconnect it is allowed again.
+    client.disconnect().await.expect("disconnect");
+    client.connect().await.expect("reconnect after disconnect");
+
+    let _ = client.shutdown().await;
+    let _ = server.shutdown_with_timeout(Duration::from_secs(5)).await;
+    serving.abort();
 }

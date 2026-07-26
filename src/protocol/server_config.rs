@@ -43,10 +43,6 @@ impl ProtocolConfig for TcpServerConfig {
     fn validate(&self) -> Result<(), ConfigError> {
         Ok(())
     }
-
-    fn default_config() -> Self {
-        Self::default()
-    }
 }
 
 #[cfg(feature = "tcp")]
@@ -69,14 +65,17 @@ impl crate::protocol::adapter::DynServerConfig for TcpServerConfig {
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
-                    Output = Result<Box<dyn crate::Server>, crate::error::TransportError>,
+                    Output = Result<
+                        Box<dyn crate::connection::Server>,
+                        crate::error::TransportError,
+                    >,
                 > + Send
                 + '_,
         >,
     > {
         Box::pin(async move {
             let server = crate::protocol::adapter::ServerConfig::build_server(self, limits).await?;
-            Ok(Box::new(server) as Box<dyn crate::Server>)
+            Ok(Box::new(server) as Box<dyn crate::connection::Server>)
         })
     }
 
@@ -192,10 +191,6 @@ impl ProtocolConfig for WebSocketServerConfig {
     fn validate(&self) -> Result<(), ConfigError> {
         Ok(())
     }
-
-    fn default_config() -> Self {
-        Self::default()
-    }
 }
 
 #[cfg(feature = "websocket")]
@@ -218,14 +213,17 @@ impl crate::protocol::adapter::DynServerConfig for WebSocketServerConfig {
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
-                    Output = Result<Box<dyn crate::Server>, crate::error::TransportError>,
+                    Output = Result<
+                        Box<dyn crate::connection::Server>,
+                        crate::error::TransportError,
+                    >,
                 > + Send
                 + '_,
         >,
     > {
         Box::pin(async move {
             let server = crate::protocol::adapter::ServerConfig::build_server(self, limits).await?;
-            Ok(Box::new(server) as Box<dyn crate::Server>)
+            Ok(Box::new(server) as Box<dyn crate::connection::Server>)
         })
     }
 
@@ -393,10 +391,6 @@ impl ProtocolConfig for QuicServerConfig {
         }
         Ok(())
     }
-
-    fn default_config() -> Self {
-        Self::default()
-    }
 }
 
 #[cfg(feature = "quic")]
@@ -419,14 +413,17 @@ impl crate::protocol::adapter::DynServerConfig for QuicServerConfig {
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
-                    Output = Result<Box<dyn crate::Server>, crate::error::TransportError>,
+                    Output = Result<
+                        Box<dyn crate::connection::Server>,
+                        crate::error::TransportError,
+                    >,
                 > + Send
                 + '_,
         >,
     > {
         Box::pin(async move {
             let server = crate::protocol::adapter::ServerConfig::build_server(self, limits).await?;
-            Ok(Box::new(server) as Box<dyn crate::Server>)
+            Ok(Box::new(server) as Box<dyn crate::connection::Server>)
         })
     }
 

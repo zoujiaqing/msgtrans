@@ -94,8 +94,8 @@ pub use packet::{
 pub use stream::ClientEvents;
 
 pub use transport::{
-    Responder, RetryConfig, SessionHandler, SessionSender, ShutdownReport, TransportClient,
-    TransportClientBuilder, TransportConfig, TransportOptions, TransportServer,
+    BroadcastReport, Responder, RetryConfig, SessionHandler, SessionSender, ShutdownReport,
+    TransportClient, TransportClientBuilder, TransportConfig, TransportOptions, TransportServer,
     TransportServerBuilder,
 };
 
@@ -107,8 +107,11 @@ pub use protocol::{
 pub use protocol::{QuicClientConfig, QuicServerConfig};
 #[cfg(feature = "tcp")]
 pub use protocol::{TcpClientConfig, TcpServerConfig};
-// Re-export new abstractions
-pub use connection::{Connection, ConnectionWriter, Server, WriteCompletion};
+// The extension SPI (Connection / ConnectionWriter / Server / WriteCompletion
+// and the Dyn* config traits) is reachable ONLY through `msgtrans::spi`.
+// Exporting it from the crate root too gave every type two public paths and
+// blurred the line between "API for applications" and "SPI for protocol
+// implementors".
 pub use transport::limits::{ClientLimits, ConnectionLimits, ServerLimits};
 
 // Convenient type aliases

@@ -28,4 +28,6 @@ pub use server_config::WebSocketServerConfig;
 // and their configs, all of which are feature-gated; a no-protocol build uses
 // neither. (The SPI re-exports them from `adapter` directly.)
 #[cfg(any(feature = "tcp", feature = "websocket", feature = "quic"))]
-pub use adapter::{ConfigError, ProtocolConfig};
+pub use adapter::ConfigError;
+#[cfg(any(feature = "tcp", feature = "websocket", feature = "quic"))]
+pub(crate) use adapter::ProtocolConfig;

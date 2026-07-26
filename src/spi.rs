@@ -1,18 +1,21 @@
 //! Stable extension SPI for implementing a custom transport protocol.
 //!
 //! Everything an out-of-crate adapter needs — and nothing that leaks an
-//! internal type. Implement [`Connection`] (and [`Server`]
-//! for accept/connect), drive the read loop by pushing [`TransportEvent`]s into
-//! an `EventSink`, and hand the paired `ConnectionEvents` back from
-//! [`Connection::take_event_pipe`]. To advertise the config to the builder,
-//! implement the object-safe `DynProtocolConfig` plus `DynServerConfig`
-//! and/or `DynClientConfig` — one trait set, no generic variant, so no
-//! internal adapter type is written into the frozen contract.
+//! internal type. Implement `Connection` (and `Server` for accept/connect),
+//! hand out the write half via `Connection::writer`, drive the read loop by
+//! pushing into an `EventSink`, and return the paired `ConnectionEvents` from
+//! `Connection::take_event_pipe`. To advertise the config to the builder,
+//! implement the object-safe `DynProtocolConfig` plus `DynServerConfig` and/or
+//! `DynClientConfig` — one trait set, no generic variant, so no internal
+//! adapter type is written into the frozen contract.
+//!
+//! These types are reachable ONLY here: the crate root is the application API,
+//! this module is the protocol-implementor API.
 
 pub use crate::connection::{Connection, ConnectionWriter, Server, WriteCompletion};
 pub use crate::packet::Packet;
 pub use crate::protocol::adapter::{
-    ConfigError, DynClientConfig, DynProtocolConfig, DynServerConfig, ProtocolConfig,
+    ConfigError, DynClientConfig, DynProtocolConfig, DynServerConfig,
 };
 pub use crate::transport::limits::ConnectionLimits;
 pub use crate::{CloseReason, ConnectionInfo, SessionId, TransportError, TransportEvent};

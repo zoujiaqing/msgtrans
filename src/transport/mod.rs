@@ -47,7 +47,7 @@ pub(crate) mod session_actor;
 // [EXPORTS] Re-export core APIs with unified architecture
 pub use client::{RetryConfig, TransportClient, TransportClientBuilder};
 pub use server::TransportServerBuilder;
-pub use transport_server::{ShutdownReport, TransportServer};
+pub use transport_server::{BroadcastReport, ShutdownReport, TransportServer};
 // Extension SPI (used by custom protocol adapters) reachable via the crate root.
 
 // [CONFIG] Configuration exports
@@ -61,7 +61,6 @@ pub use config::TransportConfig;
 // [STATE] Connection state management exports
 // Request lifecycle state machine is internal (crate::transport::request_registry).
 
-use crate::packet::CompressionType;
 use bytes::Bytes;
 use std::time::Duration;
 
@@ -70,8 +69,6 @@ use std::time::Duration;
 pub struct TransportOptions {
     /// Timeout duration (only effective for requests)
     pub(crate) timeout: Option<Duration>,
-    /// Compression algorithm
-    pub(crate) compression: Option<CompressionType>,
     /// Application-layer business type ID
     pub(crate) biz_type: Option<u8>,
     /// Extended header content (business layer encoded)
@@ -87,12 +84,6 @@ impl TransportOptions {
     /// Set timeout duration
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
-        self
-    }
-
-    /// Set compression algorithm
-    pub fn compression(mut self, compression: CompressionType) -> Self {
-        self.compression = Some(compression);
         self
     }
 

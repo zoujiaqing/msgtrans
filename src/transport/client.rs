@@ -182,7 +182,11 @@ pub struct TransportClient {
     /// requests deterministically; this scanner only reaps an inbound request
     /// that is HELD (neither answered nor dropped) past its lifecycle deadline,
     /// so a long-lived client cannot accumulate stranded `Pending` entries.
-    request_scanner_abort: Arc<std::sync::Mutex<Option<tokio::task::AbortHandle>>>,
+    ///
+    /// The JOIN HANDLE lives here (not a bare `AbortHandle`) because
+    /// `shutdown()` promises that no background task outlives it: teardown
+    /// aborts AND awaits this task. `Drop` still aborts it best-effort.
+    request_scanner: Arc<std::sync::Mutex<Option<JoinHandle<()>>>>,
     /// Client lifecycle: 0 Active, 1 ShuttingDown, 2 Stopped. Once Stopped,
     /// connect() rejects before touching the network — the take-once event
     /// receiver is gone, so a new connection could never receive events and
@@ -222,7 +226,7 @@ impl TransportClient {
             event_forwarding_running: Arc::new(AtomicBool::new(false)),
             event_forwarding_task: Arc::new(RwLock::new(None)),
             forwarding_abort: Arc::new(std::sync::Mutex::new(None)),
-            request_scanner_abort: Arc::new(std::sync::Mutex::new(None)),
+            request_scanner: Arc::new(std::sync::Mutex::new(None)),
             phase: Arc::new(AtomicU8::new(CLIENT_ACTIVE)),
             teardown_task: Arc::new(std::sync::Mutex::new(None)),
             teardown_done: Arc::new(tokio::sync::watch::channel(false).0),
@@ -238,6 +242,19 @@ impl TransportClient {
         if self.phase.load(Ordering::SeqCst) != CLIENT_ACTIVE {
             return Err(TransportError::connection_error(
                 "Client has been shut down; create a new client to reconnect",
+                false,
+            ));
+        }
+        // Reject a second connect on an already-connected client. Previously
+        // this silently REPLACED the live connection: the old socket's session
+        // was orphaned (its in-flight requests aborted by generation) while the
+        // caller believed it still had one connection. A client owns exactly one
+        // connection — disconnect() first if you mean to reconnect.
+        if let Some(session_id) = self.inner.current_session_id().await {
+            return Err(TransportError::connection_error(
+                format!(
+                    "Already connected (session {session_id}); call disconnect() before connecting again"
+                ),
                 false,
             ));
         }
@@ -283,7 +300,7 @@ impl TransportClient {
     /// is aborted on client `Drop`.
     fn start_request_scanner(&self) {
         let mut slot = self
-            .request_scanner_abort
+            .request_scanner
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if slot.is_some() {
@@ -291,13 +308,12 @@ impl TransportClient {
         }
         let registry = self.inner.request_registry().clone();
         let tick = registry.tick_duration();
-        let handle = tokio::spawn(async move {
+        *slot = Some(tokio::spawn(async move {
             loop {
                 tokio::time::sleep(tick).await;
                 registry.scan_timeout_bucket();
             }
-        });
-        *slot = Some(handle.abort_handle());
+        }));
     }
 
     /// CONFIG Internal method: Connect using stored protocol configuration
@@ -400,6 +416,7 @@ impl TransportClient {
                 let transport = self.inner.clone();
                 let forwarding = self.event_forwarding_task.clone();
                 let abort_slot = self.forwarding_abort.clone();
+                let scanner_slot = self.request_scanner.clone();
                 let running = self.event_forwarding_running.clone();
                 let phase = self.phase.clone();
                 let done = self.teardown_done.clone();
@@ -435,6 +452,16 @@ impl TransportClient {
                         let _ = handle.await; // abort guarantees completion
                     }
                     abort_slot.lock().unwrap_or_else(|p| p.into_inner()).take();
+                    // The fallback scanner is a background task too: shutdown()
+                    // documents that none survive it, so abort AND join it.
+                    let scanner = scanner_slot
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .take();
+                    if let Some(scanner) = scanner {
+                        scanner.abort();
+                        let _ = scanner.await; // abort guarantees completion
+                    }
                     running.store(false, Ordering::SeqCst);
                     phase.store(CLIENT_STOPPED, Ordering::SeqCst);
                     let _ = done.send_replace(true);
@@ -858,13 +885,13 @@ impl Drop for TransportClient {
         {
             abort.abort();
         }
-        if let Some(abort) = self
-            .request_scanner_abort
+        if let Some(scanner) = self
+            .request_scanner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
         {
-            abort.abort();
+            scanner.abort();
         }
     }
 }

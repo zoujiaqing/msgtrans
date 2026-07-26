@@ -4,7 +4,6 @@ use crate::packet::Packet;
 use crate::transport::request_registry::{MarkResult, RequestRegistry};
 use crate::{CloseReason, PacketId, SessionId};
 use bytes::Bytes;
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 /// Unified abstraction for transport layer events
@@ -28,18 +27,6 @@ pub enum TransportEvent {
     TransportError {
         error: TransportError,
     },
-
-    /// Server events
-    ServerStarted {
-        address: SocketAddr,
-    },
-    ServerStopped,
-
-    /// Client events
-    ClientConnected {
-        address: SocketAddr,
-    },
-    ClientDisconnected,
 }
 
 impl TransportEvent {
@@ -59,22 +46,6 @@ impl TransportEvent {
     /// Check if it's an error event
     pub fn is_error_event(&self) -> bool {
         matches!(self, TransportEvent::TransportError { .. })
-    }
-
-    /// Check if it's a server event
-    pub fn is_server_event(&self) -> bool {
-        matches!(
-            self,
-            TransportEvent::ServerStarted { .. } | TransportEvent::ServerStopped
-        )
-    }
-
-    /// Check if it's a client event
-    pub fn is_client_event(&self) -> bool {
-        matches!(
-            self,
-            TransportEvent::ClientConnected { .. } | TransportEvent::ClientDisconnected
-        )
     }
 }
 
@@ -137,8 +108,6 @@ impl ClientEvent {
                 message_id: packet_id,
             }),
             TransportEvent::TransportError { error } => Some(ClientEvent::Error { error }),
-
-            _ => None,
         }
     }
 

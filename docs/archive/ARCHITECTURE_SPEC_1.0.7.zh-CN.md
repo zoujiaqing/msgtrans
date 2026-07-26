@@ -1,3 +1,12 @@
+> **历史文档 — 描述的是 msgtrans v1.0.7，不适用于 2.0。**
+>
+> 保留它是为了记录 1.0.7 当时的真实设计。文中大量内容在 2.0 已被删除或重写，
+> 包括：broadcast 事件总线、`RequestTracker`、`ProtocolFactory`/`ProtocolRegistry`、
+> `LockFreeConnection`、`MemoryPoolStats` 等。**不要据此实现或评审 2.0。**
+>
+> 2.0 的架构见 [`../ARCHITECTURE_2.0.md`](../ARCHITECTURE_2.0.md)；
+> 公共 API 见 [`../API_2.0.md`](../API_2.0.md)；迁移见 [`../MIGRATION_2.0.md`](../MIGRATION_2.0.md)。
+
 # msgtrans v1.0.7 架构规范
 
 msgtrans 是一个 **Rust 异步多协议传输库**，为应用层提供统一的 TCP / WebSocket / QUIC 传输接口。

@@ -254,10 +254,17 @@ impl TransportServer {
                 return Err(TransportError::connection_error("Connection closed", false));
             }
 
-            match transport.send(packet).await {
+            // Write-CONFIRMED, like the actor path above. This fallback used to
+            // call the detached `send()` (enqueue only) while logging it as a
+            // confirmation, so `TransportServer::send` reported success for
+            // bytes that had merely been queued.
+            match transport
+                .send_confirmed_with(packet, Some(session_id), None)
+                .await
+            {
                 Ok(()) => {
                     tracing::debug!(
-                        "[SUCCESS] Session {} send successful (TransportServer layer confirmation)",
+                        "[SUCCESS] Session {} send successful (write-confirmed)",
                         session_id
                     );
                     Ok(())
@@ -448,7 +455,7 @@ impl TransportServer {
     /// would be a hole in the connection cap.
     async fn add_session_with_permit(
         &self,
-        connection: Box<dyn crate::Connection>,
+        connection: Box<dyn crate::connection::Connection>,
         permit: tokio::sync::OwnedSemaphorePermit,
     ) -> SessionId {
         // [FIX] Use existing session ID from connection instead of generating new one
@@ -913,42 +920,42 @@ impl TransportServer {
         self.state_manager.should_ignore_messages(session_id).await
     }
 
-    /// Broadcast message to all sessions
+    /// Broadcast a packet to every live session, reporting per-session outcome.
     ///
-    /// Uses fire-and-forget sends through each actor's mailbox for throughput.
-    pub async fn broadcast(&self, packet: Packet) -> Result<(), TransportError> {
-        let mut success_count = 0;
-        let mut error_count = 0;
+    /// Returns a [`BroadcastReport`] instead of a bare `Ok(())`: the previous
+    /// signature returned success even when every single send failed, so a
+    /// caller could not tell a full fan-out from a total blackout. Sends are
+    /// enqueued through each session's actor mailbox (fire-and-forget per
+    /// session, for fan-out throughput) — `delivered` therefore counts
+    /// successful ENQUEUES, not write confirmations.
+    pub async fn broadcast(&self, packet: Packet) -> BroadcastReport {
+        let mut report = BroadcastReport::default();
 
-        // Fan out through the actor mailboxes (fire-and-forget for speed)
         let session_ids: Vec<SessionId> = self.session_handles.keys().unwrap_or_default();
         for session_id in session_ids {
             if let Some(handle) = self.session_handles.get(&session_id) {
                 match handle.send_packet(packet.clone()).await {
-                    Ok(()) => success_count += 1,
+                    Ok(()) => report.delivered += 1,
                     Err(e) => {
-                        error_count += 1;
-                        tracing::warn!(
-                            "[WARN] Broadcast to session {} failed: {:?}",
-                            session_id,
-                            e
-                        );
+                        report.failed.push((session_id, e));
                     }
                 }
             }
         }
 
-        if error_count > 0 {
-            tracing::warn!(
-                "[WARN] Broadcast completed, success: {}, failed: {}",
-                success_count,
-                error_count
+        if report.failed.is_empty() {
+            tracing::info!(
+                "[SUCCESS] Broadcast enqueued to {} sessions",
+                report.delivered
             );
         } else {
-            tracing::info!("[SUCCESS] Broadcast completed, success: {}", success_count);
+            tracing::warn!(
+                "[WARN] Broadcast enqueued: {}, failed: {}",
+                report.delivered,
+                report.failed.len()
+            );
         }
-
-        Ok(())
+        report
     }
 
     /// Get active session list
@@ -1160,7 +1167,7 @@ impl TransportServer {
     /// START Start protocol listener - generic method
     async fn start_protocol_listener(
         &self,
-        mut server: Box<dyn crate::Server>,
+        mut server: Box<dyn crate::connection::Server>,
         protocol_name: String,
     ) -> Result<tokio::task::JoinHandle<()>, TransportError> {
         let server_clone = self.clone();
@@ -1540,6 +1547,33 @@ impl TransportServer {
     #[doc(hidden)]
     pub fn live_session_tasks(&self) -> usize {
         self.session_tracker.len()
+    }
+}
+
+/// What a [`TransportServer::broadcast`] actually achieved.
+///
+/// 2.0 replaced `broadcast`'s `Result<(), _>` — which returned `Ok(())` even
+/// when every send failed — with this report, so a caller can distinguish a
+/// full fan-out from a partial one from a total blackout.
+#[derive(Debug, Default)]
+#[non_exhaustive]
+pub struct BroadcastReport {
+    /// Sessions the packet was successfully ENQUEUED for. Broadcast is
+    /// fire-and-forget per session, so this is not a write confirmation.
+    pub delivered: usize,
+    /// Sessions the packet could not even be enqueued for, with the reason.
+    pub failed: Vec<(SessionId, TransportError)>,
+}
+
+impl BroadcastReport {
+    /// Every live session accepted the packet.
+    pub fn is_complete(&self) -> bool {
+        self.failed.is_empty()
+    }
+
+    /// Number of sessions that could not be reached.
+    pub fn failed_count(&self) -> usize {
+        self.failed.len()
     }
 }
 

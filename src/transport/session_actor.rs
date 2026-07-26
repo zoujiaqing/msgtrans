@@ -120,20 +120,45 @@ impl SessionSender {
         }
     }
 
-    /// Send a packet to this session
+    /// Send a packet to this session, **write-confirmed**: it returns only once
+    /// the bytes reached the socket. Use [`Self::send_detached`] for the
+    /// fire-and-forget throughput tier.
+    ///
+    /// Bound to this session's connection generation: after a reconnect the
+    /// send fails rather than being written onto the replacement connection.
     pub async fn send(&self, packet: Packet) -> Result<(), crate::TransportError> {
-        self.transport.send(packet).await
+        self.transport
+            .send_confirmed_with(packet, Some(self.session_id), None)
+            .await
     }
 
-    /// Send raw data to this session (one-way message). Each message gets a
-    /// unique, monotonically increasing id (the fixed id 0 collided across
-    /// every one-way message and could alias an in-flight request id).
+    /// Send raw data to this session (one-way message), **write-confirmed**.
+    /// Each message gets a unique, monotonically increasing id (the fixed id 0
+    /// collided across every one-way message and could alias an in-flight
+    /// request id).
     pub async fn send_data(
         &self,
         data: impl Into<bytes::Bytes>,
     ) -> Result<(), crate::TransportError> {
         let packet = Packet::one_way(self.transport.next_oneway_id(), data);
+        self.send(packet).await
+    }
+
+    /// Enqueue a packet without waiting for the write: `Ok` means QUEUED, not
+    /// written. The explicit throughput tier — a failure after enqueue is only
+    /// visible through the connection's error/close events.
+    pub async fn send_detached(&self, packet: Packet) -> Result<(), crate::TransportError> {
         self.transport.send(packet).await
+    }
+
+    /// Enqueue raw data without waiting for the write (see
+    /// [`Self::send_detached`]).
+    pub async fn send_data_detached(
+        &self,
+        data: impl Into<bytes::Bytes>,
+    ) -> Result<(), crate::TransportError> {
+        let packet = Packet::one_way(self.transport.next_oneway_id(), data);
+        self.send_detached(packet).await
     }
 
     /// Get the session ID
