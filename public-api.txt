@@ -1281,6 +1281,7 @@ pub async fn msgtrans::TransportServer::force_close_session(&self, msgtrans::Ses
 pub async fn msgtrans::TransportServer::new(msgtrans::TransportConfig, std::collections::hash::map::HashMap<alloc::string::String, alloc::boxed::Box<dyn msgtrans::spi::DynServerConfig>>, alloc::sync::Arc<dyn msgtrans::SessionHandler>, core::option::Option<usize>) -> core::result::Result<Self, msgtrans::TransportError>
 pub async fn msgtrans::TransportServer::remove_session(&self, msgtrans::SessionId) -> core::result::Result<(), msgtrans::TransportError>
 pub async fn msgtrans::TransportServer::request(&self, msgtrans::SessionId, &[u8]) -> core::result::Result<bytes::bytes::Bytes, msgtrans::TransportError>
+pub async fn msgtrans::TransportServer::request_with_options(&self, msgtrans::SessionId, bytes::bytes::Bytes, msgtrans::TransportOptions) -> core::result::Result<bytes::bytes::Bytes, msgtrans::TransportError>
 pub async fn msgtrans::TransportServer::send(&self, msgtrans::SessionId, &[u8]) -> core::result::Result<msgtrans::SendReceipt, msgtrans::TransportError>
 pub async fn msgtrans::TransportServer::send_to_session(&self, msgtrans::SessionId, msgtrans::Packet) -> core::result::Result<(), msgtrans::TransportError>
 pub async fn msgtrans::TransportServer::serve(&self) -> core::result::Result<(), msgtrans::TransportError>

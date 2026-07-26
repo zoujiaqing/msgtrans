@@ -408,6 +408,34 @@ impl TransportServer {
         Ok(crate::event::SendReceipt::new(Some(session_id), message_id))
     }
 
+    /// Send a request to a session with options (biz_type / timeout /
+    /// ext_header) and await the response payload.
+    ///
+    /// The transport still allocates the message id — that is the point:
+    /// callers get to shape the request without being able to choose an id
+    /// that could collide with a live one.
+    pub async fn request_with_options(
+        &self,
+        session_id: SessionId,
+        data: Bytes,
+        options: crate::transport::TransportOptions,
+    ) -> Result<Bytes, TransportError> {
+        let Some(message_id) = self.request_registry.next_request_id(Some(session_id)) else {
+            return Err(TransportError::resource_error(
+                "request_id_space",
+                u32::MAX as usize,
+                u32::MAX as usize,
+            ));
+        };
+        let mut packet = crate::packet::Packet::request(message_id, data);
+        packet.set_biz_type(options.biz_type.unwrap_or(0));
+        if let Some(ext) = options.ext_header.as_ref() {
+            packet.set_ext_header(ext.clone());
+        }
+        let response = self.request_to_session(session_id, packet).await?;
+        Ok(response.payload)
+    }
+
     /// Send a request to a session and await the response payload.
     ///
     /// `Ok` carries the response bytes; every failure — including a **timeout**
