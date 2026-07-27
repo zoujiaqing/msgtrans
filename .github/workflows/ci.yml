@@ -65,7 +65,7 @@ jobs:
         env:
           RUSTFLAGS: -D warnings
 
-  # Style gates are BLOCKING as of the 2.0 freeze.
+  # Style gates are BLOCKING for the 2.0 line.
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
@@ -89,7 +89,7 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-features --all-targets -- -D warnings
 
-  # Documentation is part of the frozen 2.0 contract: broken intra-doc links,
+  # Documentation is part of the 2.0 contract: broken intra-doc links,
   # links from public items into private ones, and unescaped HTML in doc
   # comments all fail the build. Without this gate the rendered docs silently
   # rot (34 such errors existed before it was added).
@@ -105,7 +105,8 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
-  # The 2.0 public API is frozen. `public-api.txt` is the committed snapshot of
+  # `public-api.txt` is the committed snapshot of the CANDIDATE 2.0 surface
+  # (the API is not frozen yet). It is
   # the crate-root surface plus `msgtrans::spi`; this job diffs the live surface
   # against it and fails on any unrecorded add/remove/change. Widening or
   # breaking the API therefore requires regenerating the baseline

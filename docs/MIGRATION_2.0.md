@@ -1,6 +1,7 @@
 # Migrating from msgtrans 1.x to 2.0
 
-2.0 is a deliberate breaking release: it freezes a small, honest public API.
+2.0 is a deliberate breaking release, aiming at a small, honest public API.
+**The surface is not frozen yet** — it is still being revised between alphas.
 Every change below is a compile error you fix once, not a silent behavior
 drift. The wire format is **unchanged** (byte-identical fixtures), so 1.x and
 2.0 peers interoperate.
@@ -153,7 +154,7 @@ is `msgtrans::spi` (the protocol-extension SPI). The internal `Transport`
 per-connection type, `TaggedClientEvent`, and `GlobalConfig` are no longer
 reachable at all.
 
-The frozen surface is captured in `public-api.txt` and enforced by the CI
+The candidate surface is captured in `public-api.txt` and enforced by the CI
 `public-api` job, so it can no longer drift silently.
 
 ## 9. Removed public machinery
@@ -235,7 +236,7 @@ default let an adapter silently ignore `Strict`).
 
 The generic `ServerConfig`/`ClientConfig` traits are crate-private: their
 associated types named the concrete private adapters, which wrote internal
-types into the frozen public API. Implement the object-safe set only —
+types into the public API. Implement the object-safe set only —
 `DynProtocolConfig` + `DynServerConfig`/`DynClientConfig`. The dead
 `as_any`, `clone_dyn` and `get_target_info` methods are gone.
 

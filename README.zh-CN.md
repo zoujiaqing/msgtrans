@@ -1,7 +1,7 @@
 # 🚀 MsgTrans - 现代化多协议通信框架
 
 [![Rust](https://img.shields.io/badge/rust-1.80+-orange.svg)](https://www.rust-lang.org)
-[![License](https://img.shields.io/badge/license-Apache-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-Apache-blue.svg)](https://github.com/zoujiaqing/msgtrans/blob/main/LICENSE)
 [![Crates.io](https://img.shields.io/crates/v/msgtrans.svg)](https://crates.io/crates/msgtrans)
 [![Docs.rs](https://img.shields.io/docsrs/msgtrans)](https://docs.rs/msgtrans)
 
@@ -52,9 +52,9 @@ msgtrans = "1.0"
 ```rust,no_run
 use async_trait::async_trait;
 use msgtrans::{
-    transport::{SessionHandler, SessionSender, TransportServerBuilder},
-    protocol::{TcpServerConfig, WebSocketServerConfig, QuicServerConfig},
-    packet::Packet,
+    SessionHandler, SessionSender, TransportServerBuilder,
+    TcpServerConfig, WebSocketServerConfig, QuicServerConfig,
+    Packet,
     SessionId,
 };
 use std::sync::Arc;
@@ -65,9 +65,15 @@ struct Echo;
 
 #[async_trait]
 impl SessionHandler for Echo {
+    // `on_request` 是必需方法：请求带着「必须应答一次」的义务，
+    // 只能通过消费式 `Responder` 应答。
+    async fn on_request(&self, _s: SessionId, req: Packet, responder: msgtrans::Responder) {
+        let _ = responder.respond(req.into_payload()).await;
+    }
+
     async fn on_message(&self, _session: SessionId, packet: Packet, sender: SessionSender) {
         // 原样回显 —— 协议无关。
-        let response = format!("Echo: {}", String::from_utf8_lossy(&packet.payload));
+        let response = format!("Echo: {}", String::from_utf8_lossy(packet.payload()));
         let _ = sender.send_data(response.into_bytes()).await;
     }
 }
@@ -97,9 +103,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```rust,no_run
 use msgtrans::{
-    transport::TransportClientBuilder,
-    protocol::TcpClientConfig,
-    event::ClientEvent,
+    TransportClientBuilder,
+    TcpClientConfig,
+    ClientEvent,
 };
 use std::time::Duration;
 
@@ -120,20 +126,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("消息已发送");
 
     // 发送请求并等待响应
-    let result = client.request("What time is it?".as_bytes()).await?;
-    if let Some(data) = result.data {
-        println!("收到响应: {}", String::from_utf8_lossy(&data));
-    } else {
-        println!("请求超时");
-    }
+    // `Ok` 即响应字节；任何失败（含超时）都是 `Err`。
+    let response = client.request("What time is it?".as_bytes()).await?;
+    println!("收到响应: {}", String::from_utf8_lossy(&response));
 
     // 消费事件
     let mut events = client.events().await?;
     tokio::spawn(async move {
         while let Some(event) = events.next().await {
             match event {
-                ClientEvent::MessageReceived(context) => {
-                    println!("收到: {}", String::from_utf8_lossy(&context.data));
+                ClientEvent::Message(msg) => {
+                    println!("收到: {}", msg.as_text_lossy());
                 }
                 ClientEvent::Disconnected { .. } => break,
                 _ => {}
@@ -172,11 +175,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 **配置驱动** —— 同一套服务端代码可跑在任意协议上，只需改传给 `.protocol(..)` 的配置：
 
 ```rust,no_run
-# use msgtrans::{transport::{TransportServerBuilder, SessionHandler, SessionSender}, protocol::{TcpServerConfig, QuicServerConfig}, packet::Packet, SessionId};
+# use msgtrans::{TransportServerBuilder, SessionHandler, SessionSender, TcpServerConfig, QuicServerConfig, Packet, SessionId};
 # use std::sync::Arc;
 # struct H;
 # #[async_trait::async_trait]
 # impl SessionHandler for H {
+    // `on_request` 是必需方法：请求带着「必须应答一次」的义务，
+    // 只能通过消费式 `Responder` 应答。
+    async fn on_request(&self, _s: SessionId, req: Packet, responder: msgtrans::Responder) {
+        let _ = responder.respond(req.into_payload()).await;
+    }
+
 #     async fn on_message(&self, _s: SessionId, _p: Packet, _tx: SessionSender) {}
 # }
 # async fn f() -> Result<(), Box<dyn std::error::Error>> {
@@ -200,11 +209,11 @@ let server = TransportServerBuilder::new()
 
 ```rust
 use msgtrans::{
-    event::ClientEvent,
-    command::ConnectionInfo,
-    error::{TransportError, CloseReason},
-    packet::Packet,
-    transport::{SessionHandler, SessionSender},
+    ClientEvent,
+    ConnectionInfo,
+    TransportError, CloseReason,
+    Packet,
+    SessionHandler, SessionSender,
     SessionId,
 };
 
@@ -213,6 +222,12 @@ struct MyHandler;
 
 #[async_trait::async_trait]
 impl SessionHandler for MyHandler {
+    // `on_request` 是必需方法：请求带着「必须应答一次」的义务，
+    // 只能通过消费式 `Responder` 应答。
+    async fn on_request(&self, _s: SessionId, req: Packet, responder: msgtrans::Responder) {
+        let _ = responder.respond(req.into_payload()).await;
+    }
+
     async fn on_message(&self, session_id: SessionId, packet: Packet, sender: SessionSender) { /* ... */ }
     async fn on_connected(&self, session_id: SessionId, info: ConnectionInfo) { /* ... */ }
     async fn on_disconnected(&self, session_id: SessionId, reason: CloseReason) { /* ... */ }
@@ -222,7 +237,8 @@ impl SessionHandler for MyHandler {
 // 客户端：事件
 # fn _client_events(ev: ClientEvent) { match ev {
 ClientEvent::Connected { info } => { /* ... */ }
-ClientEvent::MessageReceived(context) => { /* ... */ }
+ClientEvent::Message(msg) => { /* 单向消息 */ }
+ClientEvent::Request(req) => { /* 请求：必须且只能应答一次 */ }
 ClientEvent::MessageSent { message_id } => { /* ... */ }
 ClientEvent::Disconnected { reason } => { /* ... */ }
 ClientEvent::Error { error } => { /* ... */ }
@@ -237,17 +253,23 @@ ClientEvent::Error { error } => { /* ... */ }
 出的任务里做并发、无锁的会话访问：
 
 ```rust,no_run
-# use msgtrans::{transport::{TransportServer, SessionHandler, SessionSender}, packet::Packet, SessionId};
+# use msgtrans::{TransportServer, SessionHandler, SessionSender, Packet, SessionId};
 # use std::sync::Arc;
 struct Echo { server: TransportServer }
 
 #[async_trait::async_trait]
 impl SessionHandler for Echo {
+    // `on_request` 是必需方法：请求带着「必须应答一次」的义务，
+    // 只能通过消费式 `Responder` 应答。
+    async fn on_request(&self, _s: SessionId, req: Packet, responder: msgtrans::Responder) {
+        let _ = responder.respond(req.into_payload()).await;
+    }
+
     async fn on_message(&self, session_id: SessionId, packet: Packet, _tx: SessionSender) {
         // 丢给 spawn 出去的任务处理，让这个会话的 actor 能立刻去取下一条消息。
         let server = self.server.clone();
         tokio::spawn(async move {
-            let response = format!("Echo: {}", String::from_utf8_lossy(&packet.payload));
+            let response = format!("Echo: {}", String::from_utf8_lossy(packet.payload()));
             let _ = server.send(session_id, response.as_bytes()).await;
         });
     }
@@ -257,14 +279,11 @@ impl SessionHandler for Echo {
 ### 请求 / 响应
 
 ```rust,no_run
-# use msgtrans::transport::TransportClient;
+# use msgtrans::TransportClient;
 # async fn f(client: &TransportClient) -> Result<(), Box<dyn std::error::Error>> {
+// `Ok` 即响应字节；任何失败（含超时）都是 `Err`。
 let response = client.request(b"Get user data").await?;
-if let Some(data) = response.data {
-    println!("收到 {} 字节", data.len());
-} else {
-    println!("请求超时");
-}
+println!("收到 {} 字节", response.len());
 # Ok(()) }
 ```
 
@@ -274,7 +293,7 @@ if let Some(data) = response.data {
 完整可用的参考见内置的 `adapters::{tcp, websocket, quic}`；下面是骨架示意：
 
 ```rust,ignore
-use msgtrans::{connection::Connection, packet::Packet, error::TransportError};
+use msgtrans::{Connection, Packet, TransportError};
 
 pub struct MyAdapter { /* 协议特有状态 */ }
 
@@ -292,9 +311,9 @@ impl Connection for MyAdapter {
 ```rust,no_run
 use async_trait::async_trait;
 use msgtrans::{
-    transport::{SessionHandler, SessionSender, TransportServerBuilder},
-    protocol::WebSocketServerConfig,
-    packet::Packet,
+    SessionHandler, SessionSender, TransportServerBuilder,
+    WebSocketServerConfig,
+    Packet,
     SessionId,
 };
 use std::sync::Arc;
@@ -303,8 +322,14 @@ struct Chat;
 
 #[async_trait]
 impl SessionHandler for Chat {
+    // `on_request` 是必需方法：请求带着「必须应答一次」的义务，
+    // 只能通过消费式 `Responder` 应答。
+    async fn on_request(&self, _s: SessionId, req: Packet, responder: msgtrans::Responder) {
+        let _ = responder.respond(req.into_payload()).await;
+    }
+
     async fn on_message(&self, _session: SessionId, packet: Packet, sender: SessionSender) {
-        let msg = String::from_utf8_lossy(&packet.payload);
+        let msg = String::from_utf8_lossy(packet.payload());
         let _ = sender.send_data(format!("You said: {msg}").into_bytes()).await;
     }
 }
@@ -328,8 +353,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```rust,no_run
 use msgtrans::{
-    transport::TransportClientBuilder,
-    protocol::QuicClientConfig,
+    TransportClientBuilder,
+    QuicClientConfig,
 };
 
 #[tokio::main]
@@ -361,7 +386,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### 服务端配置
 
 ```rust,no_run
-use msgtrans::protocol::{TcpServerConfig, WebSocketServerConfig, QuicServerConfig};
+use msgtrans::{TcpServerConfig, WebSocketServerConfig, QuicServerConfig};
 use std::time::Duration;
 
 # fn f() -> Result<(), Box<dyn std::error::Error>> {
@@ -386,7 +411,7 @@ let quic_config = QuicServerConfig::new("0.0.0.0:8003")?
 ### 统计信息
 
 ```rust,no_run
-# use msgtrans::transport::TransportServer;
+# use msgtrans::TransportServer;
 # async fn f(server: &TransportServer) {
 let active = server.session_count().await;
 println!("活跃会话: {active}");
@@ -396,7 +421,7 @@ println!("活跃会话: {active}");
 ### 错误处理
 
 ```rust,no_run
-# use msgtrans::{transport::TransportClient, error::TransportError};
+# use msgtrans::{TransportClient, TransportError};
 # async fn f(client: &mut TransportClient) -> Result<(), Box<dyn std::error::Error>> {
 match client.send("Hello, World!".as_bytes()).await {
     Ok(result) => println!("已发送 (ID: {})", result.message_id),
@@ -415,12 +440,18 @@ match client.send("Hello, World!".as_bytes()).await {
 ### 优雅关闭
 
 ```rust,no_run
-use msgtrans::{transport::{TransportServerBuilder, SessionHandler, SessionSender}, protocol::TcpServerConfig, packet::Packet, SessionId};
+use msgtrans::{TransportServerBuilder, SessionHandler, SessionSender, TcpServerConfig, Packet, SessionId};
 use std::sync::Arc;
 
 # struct H;
 # #[async_trait::async_trait]
 # impl SessionHandler for H {
+    // `on_request` 是必需方法：请求带着「必须应答一次」的义务，
+    // 只能通过消费式 `Responder` 应答。
+    async fn on_request(&self, _s: SessionId, req: Packet, responder: msgtrans::Responder) {
+        let _ = responder.respond(req.into_payload()).await;
+    }
+
 #     async fn on_message(&self, _s: SessionId, _p: Packet, _tx: SessionSender) {}
 # }
 # async fn f() -> Result<(), Box<dyn std::error::Error>> {
@@ -463,7 +494,7 @@ cargo run --example echo_client_tcp
 
 ## 📝 许可
 
-基于 [Apache License 2.0](LICENSE) 授权。
+基于 [Apache License 2.0](https://github.com/zoujiaqing/msgtrans/blob/main/LICENSE) 授权。
 
 Copyright © 2024 [zoujiaqing](mailto:zoujiaqing@gmail.com)
 

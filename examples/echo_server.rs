@@ -87,9 +87,14 @@ impl SessionHandler for EchoHandler {
             if biz_type == BIZ_DROP {
                 return;
             }
-            let mut echo = Packet::one_way(0, packet.into_payload());
-            echo.set_biz_type(biz_type);
-            let _ = sender.send(echo).await;
+            // One-way reply: the transport allocates the id, so a handler
+            // cannot hand back a packet numbered into the request id space.
+            let _ = sender
+                .send_data_with_options(
+                    packet.into_payload(),
+                    msgtrans::TransportOptions::new().biz_type(biz_type),
+                )
+                .await;
             return;
         }
 

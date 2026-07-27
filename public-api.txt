@@ -16,7 +16,7 @@ impl core::marker::Unpin for msgtrans::CloseReason
 impl core::marker::UnsafeUnpin for msgtrans::CloseReason
 impl core::panic::unwind_safe::RefUnwindSafe for msgtrans::CloseReason
 impl core::panic::unwind_safe::UnwindSafe for msgtrans::CloseReason
-pub enum msgtrans::spi::ConfigError
+#[non_exhaustive] pub enum msgtrans::spi::ConfigError
 pub msgtrans::spi::ConfigError::FileNotFound
 pub msgtrans::spi::ConfigError::FileNotFound::path: alloc::string::String
 pub msgtrans::spi::ConfigError::FileNotFound::suggestion: alloc::string::String
@@ -100,7 +100,7 @@ impl core::marker::Unpin for msgtrans::TransportError
 impl core::marker::UnsafeUnpin for msgtrans::TransportError
 impl core::panic::unwind_safe::RefUnwindSafe for msgtrans::TransportError
 impl core::panic::unwind_safe::UnwindSafe for msgtrans::TransportError
-pub enum msgtrans::spi::TransportEvent
+#[non_exhaustive] pub enum msgtrans::spi::TransportEvent
 pub msgtrans::spi::TransportEvent::ConnectionClosed
 pub msgtrans::spi::TransportEvent::ConnectionClosed::reason: msgtrans::CloseReason
 pub msgtrans::spi::TransportEvent::ConnectionEstablished
@@ -509,7 +509,7 @@ impl core::marker::Unpin for msgtrans::FramePolicy
 impl core::marker::UnsafeUnpin for msgtrans::FramePolicy
 impl core::panic::unwind_safe::RefUnwindSafe for msgtrans::FramePolicy
 impl core::panic::unwind_safe::UnwindSafe for msgtrans::FramePolicy
-pub enum msgtrans::PacketError
+#[non_exhaustive] pub enum msgtrans::PacketError
 pub msgtrans::PacketError::CompressionError(alloc::string::String)
 pub msgtrans::PacketError::FrameTooLarge
 pub msgtrans::PacketError::FrameTooLarge::declared: u64
@@ -626,7 +626,7 @@ impl core::marker::Unpin for msgtrans::TransportError
 impl core::marker::UnsafeUnpin for msgtrans::TransportError
 impl core::panic::unwind_safe::RefUnwindSafe for msgtrans::TransportError
 impl core::panic::unwind_safe::UnwindSafe for msgtrans::TransportError
-pub enum msgtrans::TransportEvent
+#[non_exhaustive] pub enum msgtrans::TransportEvent
 pub msgtrans::TransportEvent::ConnectionClosed
 pub msgtrans::TransportEvent::ConnectionClosed::reason: msgtrans::CloseReason
 pub msgtrans::TransportEvent::ConnectionEstablished
@@ -1093,10 +1093,9 @@ impl core::panic::unwind_safe::RefUnwindSafe for msgtrans::SessionId
 impl core::panic::unwind_safe::UnwindSafe for msgtrans::SessionId
 pub struct msgtrans::SessionSender
 impl msgtrans::SessionSender
-pub async fn msgtrans::SessionSender::send(&self, msgtrans::Packet) -> core::result::Result<(), msgtrans::TransportError>
 pub async fn msgtrans::SessionSender::send_data(&self, impl core::convert::Into<bytes::bytes::Bytes>) -> core::result::Result<(), msgtrans::TransportError>
 pub async fn msgtrans::SessionSender::send_data_detached(&self, impl core::convert::Into<bytes::bytes::Bytes>) -> core::result::Result<(), msgtrans::TransportError>
-pub async fn msgtrans::SessionSender::send_detached(&self, msgtrans::Packet) -> core::result::Result<(), msgtrans::TransportError>
+pub async fn msgtrans::SessionSender::send_data_with_options(&self, impl core::convert::Into<bytes::bytes::Bytes>, msgtrans::TransportOptions) -> core::result::Result<(), msgtrans::TransportError>
 pub fn msgtrans::SessionSender::session_id(&self) -> msgtrans::SessionId
 impl core::clone::Clone for msgtrans::SessionSender
 pub fn msgtrans::SessionSender::clone(&self) -> msgtrans::SessionSender
@@ -1274,7 +1273,7 @@ impl core::panic::unwind_safe::UnwindSafe for msgtrans::TransportOptions
 pub struct msgtrans::TransportServer
 impl msgtrans::TransportServer
 pub async fn msgtrans::TransportServer::active_sessions(&self) -> alloc::vec::Vec<msgtrans::SessionId>
-pub async fn msgtrans::TransportServer::broadcast(&self, msgtrans::Packet) -> msgtrans::BroadcastReport
+pub async fn msgtrans::TransportServer::broadcast(&self, bytes::bytes::Bytes, msgtrans::TransportOptions) -> msgtrans::BroadcastReport
 pub async fn msgtrans::TransportServer::close_all_sessions(&self) -> core::result::Result<(), msgtrans::TransportError>
 pub async fn msgtrans::TransportServer::close_session(&self, msgtrans::SessionId) -> core::result::Result<(), msgtrans::TransportError>
 pub async fn msgtrans::TransportServer::force_close_session(&self, msgtrans::SessionId) -> core::result::Result<(), msgtrans::TransportError>
@@ -1283,7 +1282,7 @@ pub async fn msgtrans::TransportServer::remove_session(&self, msgtrans::SessionI
 pub async fn msgtrans::TransportServer::request(&self, msgtrans::SessionId, &[u8]) -> core::result::Result<bytes::bytes::Bytes, msgtrans::TransportError>
 pub async fn msgtrans::TransportServer::request_with_options(&self, msgtrans::SessionId, bytes::bytes::Bytes, msgtrans::TransportOptions) -> core::result::Result<bytes::bytes::Bytes, msgtrans::TransportError>
 pub async fn msgtrans::TransportServer::send(&self, msgtrans::SessionId, &[u8]) -> core::result::Result<msgtrans::SendReceipt, msgtrans::TransportError>
-pub async fn msgtrans::TransportServer::send_to_session(&self, msgtrans::SessionId, msgtrans::Packet) -> core::result::Result<(), msgtrans::TransportError>
+pub async fn msgtrans::TransportServer::send_with_options(&self, msgtrans::SessionId, bytes::bytes::Bytes, msgtrans::TransportOptions) -> core::result::Result<msgtrans::SendReceipt, msgtrans::TransportError>
 pub async fn msgtrans::TransportServer::serve(&self) -> core::result::Result<(), msgtrans::TransportError>
 pub async fn msgtrans::TransportServer::session_count(&self) -> usize
 pub async fn msgtrans::TransportServer::should_ignore_messages(&self, msgtrans::SessionId) -> bool

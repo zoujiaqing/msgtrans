@@ -822,6 +822,7 @@ impl Packet {
 
 /// Packet error type
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum PacketError {
     #[error("Invalid header: {0}")]
     InvalidHeader(String),

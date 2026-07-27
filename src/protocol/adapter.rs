@@ -77,6 +77,7 @@ pub trait DynClientConfig: DynProtocolConfig {
 
 /// Protocol configuration error
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ConfigError {
     #[error("Invalid address '{address}': {reason}")]
     InvalidAddress {

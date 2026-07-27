@@ -26,6 +26,19 @@
 // crate root re-exports below plus `msgtrans::spi`. Reaching internal types
 // through deep paths (`msgtrans::transport::Transport`, `msgtrans::event::*`,
 // …) does not resolve.
+/// The Chinese README, attached as hidden docs purely so ITS examples are
+/// compiled as doctests too.
+///
+/// The English README was gated this way from the start; the Chinese one was
+/// not, so it silently kept 1.x APIs (private deep paths, `packet.payload`
+/// field access, `TransportResult.data`) while every other gate passed. Same
+/// feature condition as the English README, and `doc(hidden)` so it does not
+/// duplicate the rendered crate docs.
+#[cfg(all(feature = "tcp", feature = "websocket", feature = "quic"))]
+#[doc(hidden)]
+#[doc = include_str!("../README.zh-CN.md")]
+pub mod readme_zh_cn_doctests {}
+
 pub(crate) mod adapters;
 pub(crate) mod command;
 pub(crate) mod connection;

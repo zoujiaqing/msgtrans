@@ -1,6 +1,6 @@
 # msgtrans 2.0 public API surface
 
-The frozen crate-root surface (`msgtrans::*`). Types behind `#[cfg(feature)]` are noted. Everything not listed here is
+The **candidate** crate-root surface (`msgtrans::*`) for 2.0. **This API is NOT frozen yet** — it is still changing between alphas; the snapshot gate exists to make every change visible, not to declare it final. Types behind `#[cfg(feature)]` are noted. Everything not listed here is
 crate-internal: the implementation modules (transport::*, adapters::*) are
 `pub(crate)`, so paths like `msgtrans::transport::request_registry::*` do not
 resolve — the public API is exactly the crate root plus the feature-gated
@@ -109,7 +109,7 @@ internal type. This is a *separate module* (`msgtrans::spi`), not the crate root
   `DynServerConfig`/`DynClientConfig`, taking `ConnectionLimits`, plus
   `ConfigError`. There is no public generic variant — the generic
   `ProtocolConfig`/`ServerConfig`/`ClientConfig` are crate-private so no
-  internal adapter type appears in the frozen contract
+  internal adapter type appears in the public contract
 - Re-exported building blocks: `Packet`, `TransportEvent`, `SessionId`,
   `ConnectionInfo`, `CloseReason`, `TransportError`, `ConnectionLimits`
 

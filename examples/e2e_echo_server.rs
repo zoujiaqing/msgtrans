@@ -36,10 +36,14 @@ impl SessionHandler for EchoHandler {
             return;
         }
 
-        // Mirror OneWay back with same biz_type and payload.
-        let mut echo = Packet::one_way(0, packet.into_payload());
-        echo.set_biz_type(biz_type);
-        let _ = sender.send(echo).await;
+        // Mirror OneWay back with same biz_type and payload. The transport
+        // allocates the id — handlers cannot number packets themselves.
+        let _ = sender
+            .send_data_with_options(
+                packet.into_payload(),
+                msgtrans::TransportOptions::new().biz_type(biz_type),
+            )
+            .await;
     }
 
     async fn on_request(&self, _session_id: SessionId, request: Packet, responder: Responder) {

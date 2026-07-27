@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Regenerate the committed public-API baseline (public-api.txt).
 #
-# The baseline is the frozen 2.0 crate-root surface plus `msgtrans::spi`. CI
+# The baseline is the CANDIDATE 2.0 crate-root surface plus `msgtrans::spi`.
+# (2.0 is NOT frozen yet — see docs/API_2.0.md.) CI
 # diffs the live surface against it (see .github/workflows/ci.yml, job
 # `public-api`) and fails on any unrecorded change, so widening or breaking the
 # public API is impossible without updating this file in the same commit.
@@ -29,7 +30,7 @@ if ! rustup toolchain list | grep -q "^${NIGHTLY}"; then
   exit 1
 fi
 
-# All protocols enabled: the frozen surface is documented for the full build.
+# All protocols enabled: the candidate surface is captured for the full build.
 # `-s` omits blanket impls (e.g. `impl<T> Any for T`) to keep the baseline
 # stable across rustc versions while still tracking every real API item.
 cargo "+${NIGHTLY}" public-api --all-features -s > public-api.txt

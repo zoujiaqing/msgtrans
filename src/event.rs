@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 /// Unified abstraction for transport layer events
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum TransportEvent {
     /// Connection related events
     ConnectionEstablished {

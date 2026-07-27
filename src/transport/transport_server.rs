@@ -50,6 +50,23 @@ impl Drop for InfraFailFast {
 
 const LISTENER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 const DEFAULT_REQUEST_LIFECYCLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Response deadline used when the caller does not supply one.
+const DEFAULT_REQUEST_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Is this error the connection being gone (as opposed to a recoverable or
+/// protocol-level failure)?
+///
+/// ANY `Connection`-class error raised while SENDING means this socket is
+/// finished: a dead peer, a closed actor channel, a replaced generation, or a
+/// custom adapter's own connection error. `retryable` is deliberately NOT part
+/// of the test — an `ECONNRESET` is mapped to `retryable: true` (retrying the
+/// *connect* is sensible), yet this particular connection is still gone.
+///
+/// Everything else — `Resource` (queue backpressure), `Timeout`, `Protocol`,
+/// `Configuration` — leaves the session in place.
+fn is_connection_dead(error: &TransportError) -> bool {
+    matches!(error, TransportError::Connection { .. })
+}
 
 /// TransportServer - multi-protocol server
 ///
@@ -188,11 +205,17 @@ impl TransportServer {
         self
     }
 
-    /// LOCKFREE Send packet to specified session
+    /// Send a pre-built packet to a session, routed through that session's actor
+    /// mailbox (serializes sends per connection, no Transport-layer Mutex).
     ///
-    /// The packet is routed through the session actor's mailbox, which serializes
-    /// sends per-connection and avoids Mutex contention on the Transport layer.
-    pub async fn send_to_session(
+    /// **Crate-internal on purpose.** This is the only path that accepts a
+    /// caller-numbered packet, so exposing it let a `Request` be sent with an id
+    /// the registry never allocated: that id could collide with a tracked
+    /// request, and the raw request's response would then complete the WRONG
+    /// waiter. Public callers use [`Self::send`]/[`Self::send_with_options`]
+    /// (one-way, transport-allocated id), [`Self::request`]/
+    /// [`Self::request_with_options`] (requests) or `Responder` (responses).
+    pub(crate) async fn send_to_session(
         &self,
         session_id: SessionId,
         packet: Packet,
@@ -214,30 +237,22 @@ impl TransportServer {
                     );
                     return Ok(());
                 }
+                // Classify STRUCTURALLY, not by formatting the error and
+                // grepping it for "Broken pipe"/"Connection closed"/…: that
+                // missed a custom protocol's connection errors (whose wording
+                // it could not predict) and could misread a protocol error that
+                // merely mentioned the same words.
+                Err(e) if is_connection_dead(&e) => {
+                    tracing::warn!("[WARN] Session {} connection closed: {:?}", session_id, e);
+                    let _ = self.remove_session(session_id).await;
+                    return Err(TransportError::connection_error(
+                        "Connection closed during send",
+                        false,
+                    ));
+                }
                 Err(e) => {
-                    let error_msg = format!("{:?}", e);
-                    if error_msg.contains("Broken pipe")
-                        || error_msg.contains("Connection reset")
-                        || error_msg.contains("Connection closed")
-                        || error_msg.contains("ECONNRESET")
-                        || error_msg.contains("EPIPE")
-                        || error_msg.contains("Actor channel closed")
-                        || error_msg.contains("Actor dropped")
-                    {
-                        tracing::warn!(
-                            "[WARN] Session {} connection closed: {}",
-                            session_id,
-                            error_msg
-                        );
-                        let _ = self.remove_session(session_id).await;
-                        return Err(TransportError::connection_error(
-                            "Connection closed during send",
-                            false,
-                        ));
-                    } else {
-                        tracing::error!("[ERROR] Session {} send failed: {:?}", session_id, e);
-                        return Err(e);
-                    }
+                    tracing::error!("[ERROR] Session {} send failed: {:?}", session_id, e);
+                    return Err(e);
                 }
             }
         }
@@ -318,6 +333,7 @@ impl TransportServer {
         &self,
         session_id: SessionId,
         packet: Packet,
+        response_timeout: std::time::Duration,
     ) -> Result<Packet, TransportError> {
         tracing::debug!(
             "[REQUEST] TransportServer sending request to session {} (ID: {})",
@@ -369,7 +385,7 @@ impl TransportServer {
 
         self.send_to_session(session_id, packet).await?;
 
-        match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
+        match tokio::time::timeout(response_timeout, rx).await {
             Ok(Ok(response)) => {
                 guard.disarm();
                 tracing::debug!(
@@ -408,6 +424,28 @@ impl TransportServer {
         Ok(crate::event::SendReceipt::new(Some(session_id), message_id))
     }
 
+    /// Send a ONE-WAY message to a session with options (biz_type / ext_header),
+    /// **write-confirmed**.
+    ///
+    /// This is the public replacement for the old raw `send_to_session`: the
+    /// packet is built here as one-way with a transport-allocated id, so no
+    /// caller-numbered `Request` can be injected into the wire.
+    pub async fn send_with_options(
+        &self,
+        session_id: SessionId,
+        data: Bytes,
+        options: crate::transport::TransportOptions,
+    ) -> Result<crate::event::SendReceipt, TransportError> {
+        let message_id = self.request_registry.next_oneway_id();
+        let mut packet = crate::packet::Packet::one_way(message_id, data);
+        packet.set_biz_type(options.biz_type.unwrap_or(0));
+        if let Some(ext) = options.ext_header.as_ref() {
+            packet.set_ext_header(ext.clone());
+        }
+        self.send_to_session(session_id, packet).await?;
+        Ok(crate::event::SendReceipt::new(Some(session_id), message_id))
+    }
+
     /// Send a request to a session with options (biz_type / timeout /
     /// ext_header) and await the response payload.
     ///
@@ -432,7 +470,15 @@ impl TransportServer {
         if let Some(ext) = options.ext_header.as_ref() {
             packet.set_ext_header(ext.clone());
         }
-        let response = self.request_to_session(session_id, packet).await?;
+        // The caller's timeout is REAL. It used to be parsed into `options` and
+        // then dropped, so every request waited the fixed 10s default.
+        let response = self
+            .request_to_session(
+                session_id,
+                packet,
+                options.timeout.unwrap_or(DEFAULT_REQUEST_RESPONSE_TIMEOUT),
+            )
+            .await?;
         Ok(response.payload)
     }
 
@@ -464,7 +510,9 @@ impl TransportServer {
             message_id
         );
 
-        let response_packet = self.request_to_session(session_id, packet).await?;
+        let response_packet = self
+            .request_to_session(session_id, packet, DEFAULT_REQUEST_RESPONSE_TIMEOUT)
+            .await?;
         tracing::debug!(
             "TransportServer received response from session {}: {} bytes (ID: {})",
             session_id,
@@ -956,8 +1004,21 @@ impl TransportServer {
     /// enqueued through each session's actor mailbox (fire-and-forget per
     /// session, for fan-out throughput) — `delivered` therefore counts
     /// successful ENQUEUES, not write confirmations.
-    pub async fn broadcast(&self, packet: Packet) -> BroadcastReport {
+    pub async fn broadcast(
+        &self,
+        data: Bytes,
+        options: crate::transport::TransportOptions,
+    ) -> BroadcastReport {
         let mut report = BroadcastReport::default();
+
+        // Built here, as a ONE-WAY packet with a transport-allocated id: a
+        // broadcast can never smuggle a Request onto the wire.
+        let mut packet =
+            crate::packet::Packet::one_way(self.request_registry.next_oneway_id(), data);
+        packet.set_biz_type(options.biz_type.unwrap_or(0));
+        if let Some(ext) = options.ext_header.as_ref() {
+            packet.set_ext_header(ext.clone());
+        }
 
         let session_ids: Vec<SessionId> = self.session_handles.keys().unwrap_or_default();
         for session_id in session_ids {
