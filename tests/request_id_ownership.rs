@@ -306,24 +306,219 @@ async fn broadcast_reports_unavailable_compression() {
     serving.abort();
 }
 
-/// With the codec available, the same call succeeds and really compresses.
+/// With the codec available, the same call succeeds, really compresses, and the
+/// compressed packet survives the FAN-OUT to a real connected peer.
+///
+/// A report from a server with zero sessions is `is_complete()` by definition,
+/// so it proves only that preparation succeeded. This test connects a client
+/// first, so the assertions cover the whole path: prepared once → cloned per
+/// session → written → decompressed on receipt.
 #[cfg(feature = "zstd")]
 #[tokio::test(flavor = "multi_thread")]
 async fn broadcast_applies_compression_when_available() {
+    // Long and repetitive so compression actually shrinks it; a payload that
+    // grew would make the "smaller on the wire" assertion meaningless.
+    const PLAINTEXT: &[u8] =
+        b"broadcast payload, broadcast payload, broadcast payload, broadcast payload";
+
     let addr = "127.0.0.1:28976";
     let (server, serving) = start_server(addr).await;
 
+    let mut client = TransportClientBuilder::new()
+        .protocol(TcpClientConfig::new(addr).expect("client cfg"))
+        .build()
+        .await
+        .expect("client builds");
+    client.connect().await.expect("connect");
+    let mut events = client.events().await.expect("events");
+    // The session must be installed before the fan-out, otherwise this is the
+    // empty-report test again.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while server.session_count().await == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("server registered the session");
+
     let report = server
         .broadcast(
-            bytes::Bytes::from_static(b"payload"),
+            bytes::Bytes::from_static(PLAINTEXT),
             SendOptions::new()
                 .biz_type(7)
                 .compression(msgtrans::CompressionType::Zstd),
         )
         .await
         .expect("zstd is available, so preparation succeeds");
-    assert!(report.is_complete());
+    assert_eq!(report.delivered, 1, "the connected session must be reached");
+    assert!(report.is_complete(), "failures: {:?}", report.failed);
 
+    let received = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.next().await {
+                Some(msgtrans::ClientEvent::Message(msg)) => return msg,
+                Some(_) => continue,
+                None => panic!("event stream ended before the broadcast arrived"),
+            }
+        }
+    })
+    .await
+    .expect("broadcast arrived");
+
+    assert_eq!(received.biz_type(), 7);
+    // `ClientMessage` deliberately exposes no compression accessor — the
+    // consumer is only ever handed plaintext. The header's flag is checked on
+    // the `Packet` the SERVER handler sees, in
+    // `server_handler_receives_decompressed_payload`.
+    assert_eq!(
+        received.payload().as_ref(),
+        PLAINTEXT,
+        "the peer must see plaintext, so the packet really was compressed \
+         once and decompressed on receipt"
+    );
+
+    let _ = client.shutdown().await;
+    let _ = server.shutdown_with_timeout(Duration::from_secs(5)).await;
+    serving.abort();
+}
+
+/// The companion falsifier for the test below.
+///
+/// On its own, "the requester got plaintext" cannot tell a response that was
+/// compressed and then decompressed from one whose options were dropped on the
+/// floor. Here the build has no Zstd codec, so honouring the options is
+/// OBSERVABLE: `respond_with_options` must fail. An implementation that ignored
+/// them would happily report `Written`.
+#[cfg(not(feature = "zstd"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn respond_with_options_fails_when_the_codec_is_missing() {
+    use std::sync::Mutex;
+
+    type RespondResult = Arc<Mutex<Option<Result<msgtrans::RespondOutcome, String>>>>;
+
+    struct Compressing(RespondResult);
+    #[async_trait]
+    impl SessionHandler for Compressing {
+        async fn on_message(&self, _s: SessionId, _p: Packet, _tx: SessionSender) {}
+        async fn on_request(&self, _s: SessionId, _p: Packet, responder: Responder) {
+            let outcome = responder
+                .respond_with_options(
+                    bytes::Bytes::from_static(b"answer"),
+                    SendOptions::new().compression(msgtrans::CompressionType::Zstd),
+                )
+                .await
+                .map_err(|e| e.to_string());
+            *self.0.lock().unwrap() = Some(outcome);
+        }
+    }
+
+    let addr = "127.0.0.1:28978";
+    let seen: RespondResult = Arc::new(Mutex::new(None));
+    let server = TransportServerBuilder::new()
+        .protocol(TcpServerConfig::new(addr).expect("server cfg"))
+        .build(Arc::new(Compressing(seen.clone())))
+        .await
+        .expect("server builds");
+    let serving = {
+        let server = server.clone();
+        tokio::spawn(async move {
+            let _ = server.serve().await;
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut client = TransportClientBuilder::new()
+        .protocol(TcpClientConfig::new(addr).expect("client cfg"))
+        .build()
+        .await
+        .expect("client builds");
+    client.connect().await.expect("connect");
+
+    // The respond fails, so the request is never answered and this times out —
+    // which is itself the honest outcome: no half-compressed frame was sent.
+    let _ = client
+        .request_with_options(
+            bytes::Bytes::from_static(b"ask"),
+            RequestOptions::new().timeout(Duration::from_millis(800)),
+        )
+        .await;
+
+    let outcome = seen.lock().unwrap().clone().expect("handler ran");
+    assert!(
+        outcome.is_err(),
+        "asking for a codec this build lacks must fail the respond, \
+         not silently answer uncompressed: {outcome:?}"
+    );
+
+    let _ = client.shutdown().await;
+    let _ = server.shutdown_with_timeout(Duration::from_secs(5)).await;
+    serving.abort();
+}
+
+/// End-to-end cover for `Responder::respond_with_options`: a compressed
+/// RESPONSE must reach the requester as plaintext.
+///
+/// The unit tests either check that the options reach the write path or that
+/// `apply_over` compresses; neither observes the whole chain, so a response
+/// that was compressed but never decompressed (the fourth review's inbound
+/// defect, in the response direction) would still pass them.
+#[cfg(feature = "zstd")]
+#[tokio::test(flavor = "multi_thread")]
+async fn compressed_response_reaches_the_requester_as_plaintext() {
+    const ANSWER: &[u8] = b"response payload, response payload, response payload, response payload";
+
+    /// Answers every request with a Zstd-compressed body.
+    struct Compressing;
+    #[async_trait]
+    impl SessionHandler for Compressing {
+        async fn on_message(&self, _s: SessionId, _p: Packet, _tx: SessionSender) {}
+        async fn on_request(&self, _s: SessionId, _p: Packet, responder: Responder) {
+            let outcome = responder
+                .respond_with_options(
+                    bytes::Bytes::from_static(ANSWER),
+                    SendOptions::new().compression(msgtrans::CompressionType::Zstd),
+                )
+                .await
+                .expect("compressed respond");
+            assert_eq!(outcome, msgtrans::RespondOutcome::Written);
+        }
+    }
+
+    let addr = "127.0.0.1:28977";
+    let server = TransportServerBuilder::new()
+        .protocol(TcpServerConfig::new(addr).expect("server cfg"))
+        .build(Arc::new(Compressing))
+        .await
+        .expect("server builds");
+    let serving = {
+        let server = server.clone();
+        tokio::spawn(async move {
+            let _ = server.serve().await;
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut client = TransportClientBuilder::new()
+        .protocol(TcpClientConfig::new(addr).expect("client cfg"))
+        .build()
+        .await
+        .expect("client builds");
+    client.connect().await.expect("connect");
+
+    let response = client
+        .request_with_options(
+            bytes::Bytes::from_static(b"ask"),
+            RequestOptions::new().timeout(Duration::from_secs(5)),
+        )
+        .await
+        .expect("request answered");
+    assert_eq!(
+        response.as_ref(),
+        ANSWER,
+        "a compressed response must be decompressed before the requester sees it"
+    );
+
+    let _ = client.shutdown().await;
     let _ = server.shutdown_with_timeout(Duration::from_secs(5)).await;
     serving.abort();
 }

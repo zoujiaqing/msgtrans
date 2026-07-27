@@ -54,8 +54,11 @@ Everything above is reachable **only** through the crate root
   - `request(session, bytes)` / `request_with_options(session, bytes,
     RequestOptions)` — `-> response Bytes`; a timeout is an `Err` carrying the
     deadline you actually asked for
-  - `broadcast(bytes, SendOptions) -> BroadcastReport` (delivered count +
-    per-session failures)
+  - `broadcast(bytes, SendOptions) -> Result<BroadcastReport, TransportError>`
+    — the options are prepared ONCE before the fan-out, so a request the build
+    cannot satisfy (e.g. compression without the codec feature) is an `Err`
+    instead of being silently dropped per clone; `Ok` carries the delivered
+    count + per-session failures
 
   None of them take a `Packet`: the transport owns message ids and packet
   types, so a caller-numbered `Request` is unrepresentable.

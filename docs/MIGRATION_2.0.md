@@ -271,10 +271,13 @@ and `send_with_options`. The fire-and-forget tier is explicitly named:
 `TransportClient::send_detached`, `SessionSender::send_data_detached`.
 
 `TransportServer::broadcast` returned `Ok(())` even when every send failed. It
-now returns a `BroadcastReport`:
+now returns a `BroadcastReport`, wrapped in a `Result` because the send options
+are prepared once **before** the fan-out — a request this build cannot satisfy
+(compression without the codec feature) fails the whole call rather than being
+dropped silently on each clone:
 
 ```rust
-let report = server.broadcast(bytes, SendOptions::new().biz_type(7)).await;
+let report = server.broadcast(bytes, SendOptions::new().biz_type(7)).await?;
 if !report.is_complete() {
     warn!("broadcast reached {} sessions, {} failed", report.delivered, report.failed_count());
 }
@@ -326,7 +329,7 @@ waiter).
 | 1.x / early 2.0 alpha | 2.0 |
 |---|---|
 | `server.send_to_session(id, packet)` | `server.send_with_options(id, bytes, SendOptions::new().biz_type(b))` |
-| `server.broadcast(packet)` | `server.broadcast(bytes, SendOptions)` -> `BroadcastReport` |
+| `server.broadcast(packet)` | `server.broadcast(bytes, SendOptions)` -> `Result<BroadcastReport, _>` |
 | `sender.send(packet)` | `sender.send_data_with_options(bytes, SendOptions)` |
 | `sender.send_detached(packet)` | `sender.send_data_detached(bytes)` |
 

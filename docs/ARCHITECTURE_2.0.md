@@ -73,8 +73,10 @@ and dropping reports failure by construction. So:
   socket. The fire-and-forget tier is explicitly named `*_detached`.
 - `request` returns the response `Bytes`; every failure, **including a timeout**,
   is an `Err`.
-- `broadcast` returns a `BroadcastReport` (delivered count + per-session
-  failures), not a bare `Ok(())`.
+- `broadcast` returns `Result<BroadcastReport, _>` — a report with the
+  delivered count + per-session failures, not a bare `Ok(())`, and an `Err`
+  when the options themselves cannot be honoured (they are prepared once,
+  before the fan-out clone).
 
 ## 4. Request lifecycle
 
