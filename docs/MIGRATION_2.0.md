@@ -266,16 +266,15 @@ arm to exhaustive matches.
 
 ## 16. `send*` is confirmed everywhere; `broadcast` reports
 
-Every public `send*` is now write-confirmed, including `SessionSender::send` /
-`send_data` and `send_with_options`. The fire-and-forget tier is explicitly
-named: `TransportClient::send_detached`, `SessionSender::send_detached` /
-`send_data_detached`.
+Every public `send*` is now write-confirmed, including `SessionSender::send_data`
+and `send_with_options`. The fire-and-forget tier is explicitly named:
+`TransportClient::send_detached`, `SessionSender::send_data_detached`.
 
 `TransportServer::broadcast` returned `Ok(())` even when every send failed. It
 now returns a `BroadcastReport`:
 
 ```rust
-let report = server.broadcast(packet).await;
+let report = server.broadcast(bytes, SendOptions::new().biz_type(7)).await;
 if !report.is_complete() {
     warn!("broadcast reached {} sessions, {} failed", report.delivered, report.failed_count());
 }
@@ -286,12 +285,11 @@ if !report.is_complete() {
 It set the compressed flag on the header and then compressed; a compression
 failure only logged a warning and sent the RAW payload under a "compressed"
 header. On a default build (no `flate2`/`zstd` feature) that failure was
-guaranteed. Compression is now explicit and packet-local:
+guaranteed. Compression is a send OPTION again (see section 22), but performed by the
+transport so the header and body can never disagree:
 
 ```rust
-let mut packet = Packet::one_way(id, payload);
-packet.set_compression(CompressionType::Zstd);
-packet.compress_payload()?;   // the error is yours to handle
+let options = SendOptions::new().compression(CompressionType::Zstd);
 ```
 
 ## 18. Dead events removed; `Connected` actually fires
@@ -317,3 +315,40 @@ config traits are no longer re-exported from the crate root — one type, one
 public path. Application code uses the crate root; protocol implementors use
 `msgtrans::spi`. The generic `ProtocolConfig` is crate-private too, so the
 object-safe set is the only trait set to implement.
+
+## 21. Raw-packet sends are gone; options are split
+
+No public send API takes a `Packet` any more — that is what makes a
+caller-numbered `Request` unrepresentable (a raw `Request` could take an id the
+registry was about to allocate, and its response then completed the wrong
+waiter).
+
+| 1.x / early 2.0 alpha | 2.0 |
+|---|---|
+| `server.send_to_session(id, packet)` | `server.send_with_options(id, bytes, SendOptions::new().biz_type(b))` |
+| `server.broadcast(packet)` | `server.broadcast(bytes, SendOptions)` -> `BroadcastReport` |
+| `sender.send(packet)` | `sender.send_data_with_options(bytes, SendOptions)` |
+| `sender.send_detached(packet)` | `sender.send_data_detached(bytes)` |
+
+`TransportOptions` is split so a one-way send cannot carry a response deadline:
+
+```rust
+use msgtrans::{SendOptions, RequestOptions, CompressionType};
+use std::time::Duration;
+
+let send = SendOptions::new().biz_type(7).compression(CompressionType::Zstd);
+let request = RequestOptions::new().biz_type(7).timeout(Duration::from_millis(500));
+```
+
+## 22. Compression is a send option again, performed by the transport
+
+`SendOptions::compression`/`RequestOptions::compression` compress the payload
+**inside** the transport, after the body is in place. If the codec feature is
+not compiled in, the send returns an error — it never ships a raw payload under
+a "compressed" header, which is what the old `TransportOptions::compression`
+did.
+
+Inbound, decompression happens once at the shared event-pipe boundary, so the
+client's `ClientMessage`/`ClientRequest`, the server's `SessionHandler` and any
+custom adapter's consumer all receive PLAINTEXT with a self-consistent header.
+An undecodable body closes the connection with `CloseReason::Error`.

@@ -140,10 +140,15 @@ is a protocol error rather than a silent default. Encoding is the single
 fallible entry point `try_encode()`; oversized ext headers/payloads are an error
 instead of 1.x's silent truncation into a self-inconsistent frame.
 
-Compression is **explicit at the packet level** (`set_compression` +
-`compress_payload`). The old `TransportOptions::compression` stamped the header
-before compressing, so a failure — guaranteed on a build without the `flate2`/
-`zstd` feature — shipped a raw payload under a "compressed" header.
+Compression is a **send option** (`SendOptions::compression`) applied by the
+transport after the body is in place; a failure (e.g. the codec feature is not
+compiled in) fails the send instead of shipping a raw payload under a
+"compressed" header, which is what the old `TransportOptions::compression` did.
+
+Inbound decompression happens **once**, at the shared event-pipe boundary that
+every adapter pushes through, so the client, the server's `SessionHandler` and
+any custom adapter's consumer all see plaintext with a self-consistent header.
+An undecodable body closes the connection.
 
 ## 8. Resource limits
 

@@ -135,7 +135,7 @@ impl SessionSender {
         &self,
         data: impl Into<bytes::Bytes>,
     ) -> Result<(), crate::TransportError> {
-        self.send_data_with_options(data, crate::transport::TransportOptions::new())
+        self.send_data_with_options(data, crate::transport::SendOptions::new())
             .await
     }
 
@@ -143,9 +143,9 @@ impl SessionSender {
     pub async fn send_data_with_options(
         &self,
         data: impl Into<bytes::Bytes>,
-        options: crate::transport::TransportOptions,
+        options: crate::transport::SendOptions,
     ) -> Result<(), crate::TransportError> {
-        let packet = self.build_one_way(data, &options);
+        let packet = self.build_one_way(data, &options)?;
         self.transport
             .send_confirmed_with(packet, Some(self.session_id), None)
             .await
@@ -158,22 +158,21 @@ impl SessionSender {
         &self,
         data: impl Into<bytes::Bytes>,
     ) -> Result<(), crate::TransportError> {
-        let packet = self.build_one_way(data, &crate::transport::TransportOptions::new());
+        let packet = self.build_one_way(data, &crate::transport::SendOptions::new())?;
         self.transport.send(packet).await
     }
 
-    /// Build the one-way packet with a transport-allocated id.
+    /// Build the one-way packet with a transport-allocated id, applying the
+    /// caller's options. Compression happens inside `apply`, so a missing codec
+    /// is an error rather than a mislabeled frame on the wire.
     fn build_one_way(
         &self,
         data: impl Into<bytes::Bytes>,
-        options: &crate::transport::TransportOptions,
-    ) -> Packet {
+        options: &crate::transport::SendOptions,
+    ) -> Result<Packet, crate::TransportError> {
         let mut packet = Packet::one_way(self.transport.next_oneway_id(), data);
-        packet.set_biz_type(options.biz_type.unwrap_or(0));
-        if let Some(ext) = options.ext_header.as_ref() {
-            packet.set_ext_header(ext.clone());
-        }
-        packet
+        options.apply(&mut packet)?;
+        Ok(packet)
     }
 
     /// Get the session ID

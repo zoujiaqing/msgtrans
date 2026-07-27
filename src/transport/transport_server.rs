@@ -284,34 +284,26 @@ impl TransportServer {
                     );
                     Ok(())
                 }
+                // Same structural predicate as the actor path above: the two
+                // send branches of this method must not classify errors
+                // differently, and text matching missed custom adapters'
+                // connection errors while misreading protocol errors that
+                // happened to mention the same words.
+                Err(e) if is_connection_dead(&e) => {
+                    tracing::warn!("[WARN] Session {} connection closed: {:?}", session_id, e);
+                    let _ = self.remove_session(session_id).await;
+                    Err(TransportError::connection_error(
+                        "Connection closed during send",
+                        false,
+                    ))
+                }
                 Err(e) => {
-                    tracing::error!("[ERROR] Session {} send failed: {:?}", session_id, e);
-
-                    let error_msg = format!("{:?}", e);
-                    if error_msg.contains("Broken pipe")
-                        || error_msg.contains("Connection reset")
-                        || error_msg.contains("Connection closed")
-                        || error_msg.contains("ECONNRESET")
-                        || error_msg.contains("EPIPE")
-                    {
-                        tracing::warn!(
-                            "[WARN] Session {} connection closed: {}",
-                            session_id,
-                            error_msg
-                        );
-                        let _ = self.remove_session(session_id).await;
-                        Err(TransportError::connection_error(
-                            "Connection closed during send",
-                            false,
-                        ))
-                    } else {
-                        tracing::error!(
-                            "[ERROR] Session {} send failed (non-connection error): {:?}",
-                            session_id,
-                            e
-                        );
-                        Err(e)
-                    }
+                    tracing::error!(
+                        "[ERROR] Session {} send failed (non-connection error): {:?}",
+                        session_id,
+                        e
+                    );
+                    Err(e)
                 }
             }
         } else {
@@ -396,9 +388,12 @@ impl TransportServer {
                 Ok(response)
             }
             Ok(Err(_)) => Err(TransportError::connection_error("Connection closed", true)),
+            // Report the deadline we ACTUALLY waited. Hardcoding 10s here made
+            // telemetry and retry logic lie whenever a caller passed a custom
+            // timeout (the wait honored it; only the error object did not).
             Err(_) => Err(TransportError::timeout_error(
                 "server request",
-                std::time::Duration::from_secs(10),
+                response_timeout,
             )),
         }
     }
@@ -434,14 +429,11 @@ impl TransportServer {
         &self,
         session_id: SessionId,
         data: Bytes,
-        options: crate::transport::TransportOptions,
+        options: crate::transport::SendOptions,
     ) -> Result<crate::event::SendReceipt, TransportError> {
         let message_id = self.request_registry.next_oneway_id();
         let mut packet = crate::packet::Packet::one_way(message_id, data);
-        packet.set_biz_type(options.biz_type.unwrap_or(0));
-        if let Some(ext) = options.ext_header.as_ref() {
-            packet.set_ext_header(ext.clone());
-        }
+        options.apply(&mut packet)?;
         self.send_to_session(session_id, packet).await?;
         Ok(crate::event::SendReceipt::new(Some(session_id), message_id))
     }
@@ -456,7 +448,7 @@ impl TransportServer {
         &self,
         session_id: SessionId,
         data: Bytes,
-        options: crate::transport::TransportOptions,
+        options: crate::transport::RequestOptions,
     ) -> Result<Bytes, TransportError> {
         let Some(message_id) = self.request_registry.next_request_id(Some(session_id)) else {
             return Err(TransportError::resource_error(
@@ -466,10 +458,7 @@ impl TransportServer {
             ));
         };
         let mut packet = crate::packet::Packet::request(message_id, data);
-        packet.set_biz_type(options.biz_type.unwrap_or(0));
-        if let Some(ext) = options.ext_header.as_ref() {
-            packet.set_ext_header(ext.clone());
-        }
+        options.send.apply(&mut packet)?;
         // The caller's timeout is REAL. It used to be parsed into `options` and
         // then dropped, so every request waited the fixed 10s default.
         let response = self
@@ -1007,7 +996,7 @@ impl TransportServer {
     pub async fn broadcast(
         &self,
         data: Bytes,
-        options: crate::transport::TransportOptions,
+        options: crate::transport::SendOptions,
     ) -> BroadcastReport {
         let mut report = BroadcastReport::default();
 

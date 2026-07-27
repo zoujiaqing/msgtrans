@@ -538,24 +538,6 @@ impl Transport {
         }
     }
 
-    /// Normalize an inbound packet so everything downstream sees PLAINTEXT.
-    ///
-    /// Decompresses in place and clears the compression flag, so the packet is
-    /// self-consistent: a consumer reading `payload()` gets the real bytes, and
-    /// the header no longer claims a compression that has already been undone.
-    /// Applied once, at the dispatch boundary, for every packet type.
-    fn normalize_inbound(mut packet: Packet) -> Result<Packet, TransportError> {
-        if packet.header.compression == crate::packet::CompressionType::None {
-            return Ok(packet);
-        }
-        packet.decompress_payload().map_err(|e| {
-            tracing::warn!("[WARN] Failed to decompress packet: {}", e);
-            TransportError::protocol_error("packet", format!("Failed to decompress packet: {}", e))
-        })?;
-        packet.header.compression = crate::packet::CompressionType::None;
-        Ok(packet)
-    }
-
     /// TARGET Unified event handling entry point - complete unpacking and send user-friendly events at this layer
     /// Handle one event from a connection, keyed by the session (generation)
     /// that produced it — never by "whatever session is current now", which a
@@ -572,27 +554,6 @@ impl Transport {
                     packet.header.message_id,
                     packet.header.packet_type
                 );
-
-                // Decompress ONCE, here at the dispatch boundary, so every
-                // consumer below — response waiters, `ClientRequest` and
-                // `ClientMessage` — receives PLAINTEXT.
-                //
-                // This used to only *validate* that the body could be
-                // decompressed and then forward the still-compressed packet, so
-                // `ClientMessage::payload()` handed back compressed bytes with
-                // no compression metadata to recover them from.
-                let packet = match Self::normalize_inbound(packet) {
-                    Ok(packet) => packet,
-                    Err(e) => {
-                        tracing::error!("[ERROR] Failed to unpack message data: {}", e);
-                        self.forward_client_event(
-                            source_session,
-                            crate::event::TransportEvent::TransportError { error: e },
-                        )
-                        .await;
-                        return;
-                    }
-                };
 
                 match packet.header.packet_type {
                     crate::packet::PacketType::Response => {
@@ -744,7 +705,7 @@ impl Transport {
     pub async fn request_with_options(
         &self,
         data: Bytes,
-        options: super::TransportOptions,
+        options: super::RequestOptions,
     ) -> Result<Bytes, TransportError> {
         // Always allocate a unique, strictly monotonic, per-session request id.
         // A caller-chosen (or wrapped) id could be reused while a previous
@@ -761,12 +722,10 @@ impl Transport {
             ));
         };
 
-        // Create request packet
+        // Create request packet; options.apply performs any compression and
+        // fails loudly rather than shipping a mislabeled body.
         let mut packet = crate::packet::Packet::request(message_id, data.clone());
-        packet.set_biz_type(options.biz_type.unwrap_or(0));
-        if let Some(ext) = options.ext_header.as_ref() {
-            packet.set_ext_header(ext.clone());
-        }
+        options.send.apply(&mut packet)?;
 
         // Register request tracking
         let session_id = self.current_session_id().await;
@@ -863,17 +822,14 @@ impl Transport {
     pub async fn send_with_options(
         &self,
         data: Bytes,
-        options: super::TransportOptions,
+        options: super::SendOptions,
     ) -> Result<(), TransportError> {
         // One-way: nothing matches on this id, so a wrapping counter is fine.
         let message_id = self.request_registry.next_oneway_id();
 
-        // Create one-way message packet
+        // Create one-way message packet; options.apply performs any compression.
         let mut packet = crate::packet::Packet::one_way(message_id, data.clone());
-        packet.set_biz_type(options.biz_type.unwrap_or(0));
-        if let Some(ext) = options.ext_header.as_ref() {
-            packet.set_ext_header(ext.clone());
-        }
+        options.apply(&mut packet)?;
 
         // Write-confirmed, like every other public `send*` (the detached tier
         // is explicitly named `send_detached`).
@@ -1265,62 +1221,6 @@ mod generation_tests {
             "a duplicate in-flight request id must be dropped, not forwarded \
              (forwarding it lets the respond path bypass the registry and emit \
              a second response for the same id)"
-        );
-    }
-
-    /// A compressed inbound packet must be handed to the consumer as PLAINTEXT.
-    ///
-    /// The dispatch boundary used to only VALIDATE that the body decompressed
-    /// and then forward the still-compressed packet, so `ClientMessage::payload()`
-    /// returned compressed bytes — and `ClientMessage` exposes no compression
-    /// metadata, so the consumer could not recover the original either.
-    #[cfg(feature = "zstd")]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn inbound_compressed_packet_is_decompressed_before_dispatch() {
-        const PLAINTEXT: &[u8] =
-            b"the quick brown fox jumps over the lazy dog, repeatedly and compressibly";
-
-        let ctx = TransportContext::new().await.expect("ctx");
-        let transport = Arc::new(Transport::with_context(TransportConfig::default(), &ctx));
-        let closed = Arc::new(AtomicBool::new(false));
-        let session_id = transport.set_connection(mock(&closed)).await;
-        let mut events = transport
-            .get_event_stream()
-            .await
-            .expect("client events taken once");
-        // Drain the ConnectionEstablished announcement.
-        let _ = events.try_recv();
-
-        // A genuinely compressed one-way packet, as a compressing peer sends it.
-        let mut packet = Packet::one_way(1, Bytes::from_static(PLAINTEXT));
-        packet.set_compression(crate::packet::CompressionType::Zstd);
-        packet.compress_payload().expect("zstd compress");
-        assert_ne!(
-            packet.payload().as_ref(),
-            PLAINTEXT,
-            "precondition: payload really is compressed"
-        );
-
-        transport
-            .on_event(
-                session_id,
-                crate::event::TransportEvent::MessageReceived(packet),
-            )
-            .await;
-
-        let tagged = events.try_recv().expect("message forwarded");
-        let crate::event::TransportEvent::MessageReceived(delivered) = tagged.event else {
-            panic!("expected a MessageReceived event");
-        };
-        assert_eq!(
-            delivered.payload().as_ref(),
-            PLAINTEXT,
-            "consumer must receive plaintext, not compressed bytes"
-        );
-        assert_eq!(
-            delivered.compression(),
-            crate::packet::CompressionType::None,
-            "the header must not still claim a compression that was undone"
         );
     }
 }

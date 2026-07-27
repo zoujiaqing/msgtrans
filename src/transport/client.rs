@@ -850,22 +850,24 @@ impl TransportClient {
         }
     }
 
-    /// SEND Send request and wait for response (with options)
+    /// Send a request with options (biz_type / ext_header / compression /
+    /// response timeout) and await the response payload.
     pub async fn request_with_options(
         &self,
         data: Bytes,
-        options: super::TransportOptions,
+        options: super::RequestOptions,
     ) -> Result<Bytes, TransportError> {
         self.inner.request_with_options(data, options).await
     }
 
-    /// SEND Send one-way message (with options)
+    /// Send a one-way message with options (biz_type / ext_header /
+    /// compression), **write-confirmed**.
     pub async fn send_with_options(
         &self,
-        data: Bytes,
-        options: super::TransportOptions,
+        data: impl Into<Bytes>,
+        options: super::SendOptions,
     ) -> Result<(), TransportError> {
-        self.inner.send_with_options(data, options).await
+        self.inner.send_with_options(data.into(), options).await
     }
 }
 

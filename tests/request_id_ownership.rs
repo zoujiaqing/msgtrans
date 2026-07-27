@@ -20,8 +20,8 @@
 
 use async_trait::async_trait;
 use msgtrans::{
-    Packet, Responder, SessionHandler, SessionId, SessionSender, TcpClientConfig, TcpServerConfig,
-    TransportClientBuilder, TransportOptions, TransportServerBuilder,
+    Packet, RequestOptions, Responder, SendOptions, SessionHandler, SessionId, SessionSender,
+    TcpClientConfig, TcpServerConfig, TransportClientBuilder, TransportServerBuilder,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -103,7 +103,7 @@ async fn public_api_cannot_send_a_caller_numbered_request() {
         .send_with_options(
             session_id,
             bytes::Bytes::from_static(b"one-way"),
-            TransportOptions::new().biz_type(7),
+            SendOptions::new().biz_type(7),
         )
         .await
         .expect("one-way send");
@@ -116,7 +116,7 @@ async fn public_api_cannot_send_a_caller_numbered_request() {
     let report = server
         .broadcast(
             bytes::Bytes::from_static(b"broadcast"),
-            TransportOptions::new().biz_type(7),
+            SendOptions::new().biz_type(7),
         )
         .await;
     assert!(report.is_complete(), "broadcast reached every session");
@@ -160,17 +160,110 @@ async fn server_request_honors_the_caller_timeout() {
         .request_with_options(
             session_id,
             bytes::Bytes::from_static(b"no answer"),
-            TransportOptions::new()
+            RequestOptions::new()
                 .biz_type(SILENT)
                 .timeout(Duration::from_millis(30)),
         )
         .await;
     let elapsed = started.elapsed();
 
-    assert!(result.is_err(), "an unanswered request must time out");
     assert!(
         elapsed < Duration::from_secs(1),
         "timeout was ignored: waited {elapsed:?} for a 30ms deadline"
+    );
+    // Assert the exact error, not just "some error fast": the wait honored the
+    // caller's deadline while the error object still reported a hardcoded 10s,
+    // which made telemetry and retry decisions wrong.
+    let err = result.expect_err("an unanswered request must time out");
+    assert!(
+        matches!(
+            &err,
+            msgtrans::TransportError::Timeout { duration, .. }
+                if *duration == Duration::from_millis(30)
+        ),
+        "expected Timeout{{duration: 30ms}}, got {err:?}"
+    );
+
+    let _ = client.shutdown().await;
+    let _ = server.shutdown_with_timeout(Duration::from_secs(5)).await;
+    serving.abort();
+}
+
+/// The SERVER must receive plaintext too — this is the defect the fourth review
+/// reproduced over real TCP: only the client normalized, so a compressing peer
+/// left `SessionHandler` holding compressed bytes and a stale `compression`
+/// flag.
+#[cfg(feature = "zstd")]
+#[tokio::test(flavor = "multi_thread")]
+async fn server_handler_receives_decompressed_payload() {
+    use std::sync::Mutex;
+    use tokio::sync::Notify;
+
+    const PLAINTEXT: &[u8] =
+        b"the quick brown fox jumps over the lazy dog, repeatedly and compressibly";
+
+    struct Capture {
+        seen: Arc<Mutex<Option<(Vec<u8>, msgtrans::CompressionType)>>>,
+        ready: Arc<Notify>,
+    }
+    #[async_trait]
+    impl SessionHandler for Capture {
+        async fn on_message(&self, _s: SessionId, packet: Packet, _tx: SessionSender) {
+            *self.seen.lock().unwrap() = Some((packet.payload().to_vec(), packet.compression()));
+            self.ready.notify_waiters();
+        }
+        async fn on_request(&self, _s: SessionId, _p: Packet, _r: Responder) {}
+    }
+
+    let addr = "127.0.0.1:28974";
+    let seen = Arc::new(Mutex::new(None));
+    let ready = Arc::new(Notify::new());
+    let server = TransportServerBuilder::new()
+        .protocol(TcpServerConfig::new(addr).expect("server cfg"))
+        .build(Arc::new(Capture {
+            seen: seen.clone(),
+            ready: ready.clone(),
+        }))
+        .await
+        .expect("server builds");
+    let serving = {
+        let server = server.clone();
+        tokio::spawn(async move {
+            let _ = server.serve().await;
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut client = TransportClientBuilder::new()
+        .protocol(TcpClientConfig::new(addr).expect("client cfg"))
+        .build()
+        .await
+        .expect("client builds");
+    client.connect().await.expect("connect");
+
+    let notified = ready.notified();
+    client
+        .send_with_options(
+            PLAINTEXT,
+            SendOptions::new()
+                .biz_type(9)
+                .compression(msgtrans::CompressionType::Zstd),
+        )
+        .await
+        .expect("compressed send");
+    tokio::time::timeout(Duration::from_secs(5), notified)
+        .await
+        .expect("handler saw the message");
+
+    let (payload, compression) = seen.lock().unwrap().clone().expect("captured");
+    assert_eq!(
+        payload, PLAINTEXT,
+        "SessionHandler must receive plaintext, not compressed bytes"
+    );
+    assert_eq!(
+        compression,
+        msgtrans::CompressionType::None,
+        "the header must not still claim a compression that was undone"
     );
 
     let _ = client.shutdown().await;

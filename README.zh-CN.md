@@ -292,15 +292,69 @@ println!("收到 {} 字节", response.len());
 要接入新协议，为你的适配器实现 `Connection` trait，再配一个对应的 config 类型。
 完整可用的参考见内置的 `adapters::{tcp, websocket, quic}`；下面是骨架示意：
 
-```rust,ignore
-use msgtrans::{Connection, Packet, TransportError};
+```rust
+use msgtrans::spi::{
+    event_channel, CloseReason, Connection, ConnectionEvents, ConnectionInfo, ConnectionWriter,
+    EventSink, Packet, SessionId, TransportError, WriteCompletion,
+};
+use msgtrans::FramePolicy;
+use std::sync::Arc;
 
-pub struct MyAdapter { /* 协议特有状态 */ }
+/// 写半边。与连接对象分开，是为了让传输层能在连接锁内克隆它、**先释放锁**再 await
+/// 入队——队列打满时绝不能把 reconnect/close/shutdown 堵在后面。
+struct MyWriter {
+    /* your outbound queue sender */
+}
+
+#[async_trait::async_trait]
+impl ConnectionWriter for MyWriter {
+    async fn send_with_completion(
+        &self,
+        _packet: Packet,
+        completion: WriteCompletion,
+    ) -> Result<(), TransportError> {
+        // 入队，并在你的写循环里用**真实**写结果 resolve completion。
+        // 丢弃它即上报失败——绝不能凭空造一个 Ok。
+        completion.complete(Ok(()));
+        Ok(())
+    }
+}
+
+pub struct MyAdapter {
+    session_id: SessionId,
+    sink: EventSink,
+    events: Option<ConnectionEvents>,
+}
+
+impl MyAdapter {
+    pub fn new() -> Self {
+        let (sink, events) = event_channel(std::num::NonZeroUsize::new(1024).unwrap());
+        Self { session_id: SessionId::new(0), sink, events: Some(events) }
+    }
+
+    /// 你的读循环把入站包推到这里。管道会统一解压/规范化，
+    /// 所以每个消费者拿到的都是明文。
+    pub async fn on_packet(&self, packet: Packet) -> bool {
+        self.sink.message(packet).await
+    }
+}
 
 #[async_trait::async_trait]
 impl Connection for MyAdapter {
-    async fn send(&mut self, packet: Packet) -> Result<(), TransportError> { /* ... */ }
-    // ... 其余 Connection 方法
+    fn writer(&self) -> Arc<dyn ConnectionWriter> {
+        Arc::new(MyWriter {})
+    }
+    async fn close(&mut self) -> Result<(), TransportError> {
+        self.sink.close(CloseReason::Normal);
+        Ok(())
+    }
+    fn session_id(&self) -> SessionId { self.session_id }
+    fn set_session_id(&mut self, session_id: SessionId) { self.session_id = session_id; }
+    fn connection_info(&self) -> ConnectionInfo { ConnectionInfo::default() }
+    fn is_connected(&self) -> bool { true }
+    async fn flush(&mut self) -> Result<(), TransportError> { Ok(()) }
+    fn take_event_pipe(&mut self) -> Option<ConnectionEvents> { self.events.take() }
+    fn set_frame_policy(&self, _policy: FramePolicy) { /* 在这里落实 Strict */ }
 }
 ```
 

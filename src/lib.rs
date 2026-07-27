@@ -107,9 +107,9 @@ pub use packet::{
 pub use stream::ClientEvents;
 
 pub use transport::{
-    BroadcastReport, Responder, RetryConfig, SessionHandler, SessionSender, ShutdownReport,
-    TransportClient, TransportClientBuilder, TransportConfig, TransportOptions, TransportServer,
-    TransportServerBuilder,
+    BroadcastReport, RequestOptions, Responder, RetryConfig, SendOptions, SessionHandler,
+    SessionSender, ShutdownReport, TransportClient, TransportClientBuilder, TransportConfig,
+    TransportServer, TransportServerBuilder,
 };
 
 #[cfg(feature = "websocket")]

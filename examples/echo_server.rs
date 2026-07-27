@@ -92,7 +92,7 @@ impl SessionHandler for EchoHandler {
             let _ = sender
                 .send_data_with_options(
                     packet.into_payload(),
-                    msgtrans::TransportOptions::new().biz_type(biz_type),
+                    msgtrans::SendOptions::new().biz_type(biz_type),
                 )
                 .await;
             return;

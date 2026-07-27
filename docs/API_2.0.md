@@ -48,13 +48,23 @@ Everything above is reachable **only** through the crate root
   .frame_policy(..).max_connections(..).actor_buffer_size(..)
   .transport_config(..).build(Arc<dyn SessionHandler>) -> TransportServer`
 - `TransportServer`: `serve()`, `shutdown()`, `shutdown_with_timeout(Duration)
-  -> ShutdownReport`, `send(session, bytes)` (write-confirmed -> `SendReceipt`),
-  `request(session, bytes)` (-> response `Bytes`; a timeout is an `Err`),
-  `session_count()`, clone (Arc-shared)
+  -> ShutdownReport`, `session_count()`, clone (Arc-shared). Sending:
+  - `send(session, bytes)` / `send_with_options(session, bytes, SendOptions)` —
+    one-way, write-confirmed, `-> SendReceipt`
+  - `request(session, bytes)` / `request_with_options(session, bytes,
+    RequestOptions)` — `-> response Bytes`; a timeout is an `Err` carrying the
+    deadline you actually asked for
+  - `broadcast(bytes, SendOptions) -> BroadcastReport` (delivered count +
+    per-session failures)
+
+  None of them take a `Packet`: the transport owns message ids and packet
+  types, so a caller-numbered `Request` is unrepresentable.
 - `SessionHandler`: `on_message(id, Packet, SessionSender)` +
   `on_request(id, Packet, Responder)` (both required); optional `on_connected`,
   `on_disconnected`, `on_error`, `on_message_sent`
-- `SessionSender`: `send`, `send_data`, `session_id`
+- `SessionSender` (one-way only): `send_data`,
+  `send_data_with_options(data, SendOptions)` (both write-confirmed),
+  `send_data_detached`, `session_id`
 - `Responder` (consuming, not `Clone`): `respond(self, impl Into<Bytes>) ->
   Result<RespondOutcome>`, `respond_detached(self, impl Into<Bytes>)`,
   `session_id`, `message_id`

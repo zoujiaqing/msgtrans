@@ -51,10 +51,49 @@ pub fn event_pipe(capacity: usize) -> (EventPipe, EventPipeRx) {
     )
 }
 
+/// Decompress an inbound packet and clear its compression flag, so every
+/// consumer sees PLAINTEXT and a packet whose header matches its body.
+///
+/// Decompression is bounded by `Packet::decompress_payload` (16 MiB cap), so a
+/// decompression bomb is refused rather than buffered.
+fn normalize_inbound(mut packet: crate::packet::Packet) -> Result<crate::packet::Packet, String> {
+    if packet.compression() == crate::packet::CompressionType::None {
+        return Ok(packet);
+    }
+    packet
+        .decompress_payload()
+        .map_err(|e| format!("failed to decompress packet: {e}"))?;
+    packet.set_compression(crate::packet::CompressionType::None);
+    Ok(packet)
+}
+
 impl EventPipe {
     /// Deliver a data-plane event with backpressure. Returns `false` when the
-    /// consumer is gone — the adapter should stop reading.
+    /// consumer is gone, or when the packet was undecodable — either way the
+    /// adapter should stop reading.
+    ///
+    /// **This is the single inbound normalization point.** Every adapter —
+    /// built-in or custom, feeding a client Transport or a server session actor
+    /// — pushes here, so decompressing here is what makes the semantics
+    /// identical everywhere. Normalizing per-consumer instead left the server
+    /// handing COMPRESSED bytes (and a stale compression flag) to
+    /// `SessionHandler` while the client got plaintext.
+    ///
+    /// A packet that cannot be decompressed is a protocol error: the close is
+    /// published with `CloseReason::Error` and `false` is returned, so the
+    /// connection ends rather than delivering garbage.
     pub async fn deliver(&self, event: TransportEvent) -> bool {
+        let event = match event {
+            TransportEvent::MessageReceived(packet) => match normalize_inbound(packet) {
+                Ok(packet) => TransportEvent::MessageReceived(packet),
+                Err(reason) => {
+                    tracing::warn!("[PIPE] Undecodable inbound packet, closing: {reason}");
+                    self.close(CloseReason::Error(reason));
+                    return false;
+                }
+            },
+            other => other,
+        };
         self.data_tx.send(event).await.is_ok()
     }
 
@@ -290,6 +329,66 @@ mod tests {
         assert!(matches!(
             rx.next().await,
             Some(TransportEvent::ConnectionClosed { .. })
+        ));
+    }
+
+    /// Compressed packets are decompressed at the pipe, so EVERY consumer —
+    /// the client Transport, the server's session actor, a custom adapter's
+    /// reader — receives plaintext with a self-consistent header.
+    ///
+    /// Normalizing per-consumer instead left the server delivering compressed
+    /// bytes (and a stale `compression: Zstd`) straight to `SessionHandler`.
+    #[cfg(feature = "zstd")]
+    #[tokio::test]
+    async fn deliver_decompresses_before_the_consumer_sees_it() {
+        const PLAINTEXT: &[u8] =
+            b"the quick brown fox jumps over the lazy dog, repeatedly and compressibly";
+
+        let (tx, mut rx) = event_pipe(8);
+        let mut packet = crate::packet::Packet::one_way(1, bytes::Bytes::from_static(PLAINTEXT));
+        packet.set_compression(crate::packet::CompressionType::Zstd);
+        packet.compress_payload().expect("zstd compress");
+        assert_ne!(
+            packet.payload().as_ref(),
+            PLAINTEXT,
+            "precondition: the payload really is compressed"
+        );
+
+        assert!(tx.deliver(TransportEvent::MessageReceived(packet)).await);
+        let Some(TransportEvent::MessageReceived(delivered)) = rx.next().await else {
+            panic!("expected a MessageReceived event");
+        };
+        assert_eq!(
+            delivered.payload().as_ref(),
+            PLAINTEXT,
+            "consumer must receive plaintext"
+        );
+        assert_eq!(
+            delivered.compression(),
+            crate::packet::CompressionType::None,
+            "the header must not still claim a compression that was undone"
+        );
+    }
+
+    /// An undecodable body is a protocol error: the pipe closes with an error
+    /// reason instead of handing garbage to the consumer.
+    #[tokio::test]
+    async fn deliver_closes_on_undecodable_payload() {
+        let (tx, mut rx) = event_pipe(8);
+        // Claims Zstd but the body is not valid compressed data.
+        let mut packet =
+            crate::packet::Packet::one_way(1, bytes::Bytes::from_static(b"not compressed"));
+        packet.set_compression(crate::packet::CompressionType::Zstd);
+
+        assert!(
+            !tx.deliver(TransportEvent::MessageReceived(packet)).await,
+            "the adapter must be told to stop reading"
+        );
+        assert!(matches!(
+            rx.next().await,
+            Some(TransportEvent::ConnectionClosed {
+                reason: CloseReason::Error(_)
+            })
         ));
     }
 }

@@ -296,21 +296,70 @@ To add a protocol, implement the `Connection` trait for your adapter and a
 matching config type. See the built-in `adapters::{tcp, websocket, quic}` for
 complete, working references; the outline below shows the shape:
 
-```rust,ignore
-use msgtrans::{Connection, Packet, TransportError};
+```rust
+use msgtrans::spi::{
+    event_channel, CloseReason, Connection, ConnectionEvents, ConnectionInfo, ConnectionWriter,
+    EventSink, Packet, SessionId, TransportError, WriteCompletion,
+};
+use msgtrans::FramePolicy;
+use std::sync::Arc;
 
-pub struct MyAdapter { /* protocol-specific state */ }
+/// The write half. Kept separate from the connection so the transport can clone
+/// it under its connection lock and RELEASE the lock before awaiting the
+/// enqueue — a saturated queue must not park reconnect/close/shutdown.
+struct MyWriter {
+    /* your outbound queue sender */
+}
+
+#[async_trait::async_trait]
+impl ConnectionWriter for MyWriter {
+    async fn send_with_completion(
+        &self,
+        _packet: Packet,
+        completion: WriteCompletion,
+    ) -> Result<(), TransportError> {
+        // Enqueue, and resolve the completion from your write loop with the
+        // REAL result. Dropping it reports failure — never invent an Ok.
+        completion.complete(Ok(()));
+        Ok(())
+    }
+}
+
+pub struct MyAdapter {
+    session_id: SessionId,
+    sink: EventSink,
+    events: Option<ConnectionEvents>,
+}
+
+impl MyAdapter {
+    pub fn new() -> Self {
+        let (sink, events) = event_channel(std::num::NonZeroUsize::new(1024).unwrap());
+        Self { session_id: SessionId::new(0), sink, events: Some(events) }
+    }
+
+    /// Your read loop pushes inbound packets here. The pipe decompresses and
+    /// normalizes them, so every consumer sees plaintext.
+    pub async fn on_packet(&self, packet: Packet) -> bool {
+        self.sink.message(packet).await
+    }
+}
 
 #[async_trait::async_trait]
 impl Connection for MyAdapter {
-    // The single send entry point: enqueue the packet and resolve the
-    // WriteCompletion from your write loop with the REAL write result.
-    async fn send_with_completion(
-        &mut self,
-        packet: Packet,
-        completion: msgtrans::WriteCompletion,
-    ) -> Result<(), TransportError> { /* ... */ }
-    // ... remaining Connection methods
+    fn writer(&self) -> Arc<dyn ConnectionWriter> {
+        Arc::new(MyWriter {})
+    }
+    async fn close(&mut self) -> Result<(), TransportError> {
+        self.sink.close(CloseReason::Normal);
+        Ok(())
+    }
+    fn session_id(&self) -> SessionId { self.session_id }
+    fn set_session_id(&mut self, session_id: SessionId) { self.session_id = session_id; }
+    fn connection_info(&self) -> ConnectionInfo { ConnectionInfo::default() }
+    fn is_connected(&self) -> bool { true }
+    async fn flush(&mut self) -> Result<(), TransportError> { Ok(()) }
+    fn take_event_pipe(&mut self) -> Option<ConnectionEvents> { self.events.take() }
+    fn set_frame_policy(&self, _policy: FramePolicy) { /* honor Strict here */ }
 }
 ```
 

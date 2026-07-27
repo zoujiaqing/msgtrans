@@ -956,6 +956,26 @@ impl core::marker::Unpin for msgtrans::QuicServerConfig
 impl core::marker::UnsafeUnpin for msgtrans::QuicServerConfig
 impl core::panic::unwind_safe::RefUnwindSafe for msgtrans::QuicServerConfig
 impl core::panic::unwind_safe::UnwindSafe for msgtrans::QuicServerConfig
+pub struct msgtrans::RequestOptions
+impl msgtrans::RequestOptions
+pub fn msgtrans::RequestOptions::biz_type(self, u8) -> Self
+pub fn msgtrans::RequestOptions::compression(self, msgtrans::CompressionType) -> Self
+pub fn msgtrans::RequestOptions::ext_header(self, bytes::bytes::Bytes) -> Self
+pub fn msgtrans::RequestOptions::new() -> Self
+pub fn msgtrans::RequestOptions::timeout(self, core::time::Duration) -> Self
+impl core::clone::Clone for msgtrans::RequestOptions
+pub fn msgtrans::RequestOptions::clone(&self) -> msgtrans::RequestOptions
+impl core::default::Default for msgtrans::RequestOptions
+pub fn msgtrans::RequestOptions::default() -> msgtrans::RequestOptions
+impl core::fmt::Debug for msgtrans::RequestOptions
+pub fn msgtrans::RequestOptions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl !core::marker::Freeze for msgtrans::RequestOptions
+impl core::marker::Send for msgtrans::RequestOptions
+impl core::marker::Sync for msgtrans::RequestOptions
+impl core::marker::Unpin for msgtrans::RequestOptions
+impl core::marker::UnsafeUnpin for msgtrans::RequestOptions
+impl core::panic::unwind_safe::RefUnwindSafe for msgtrans::RequestOptions
+impl core::panic::unwind_safe::UnwindSafe for msgtrans::RequestOptions
 pub struct msgtrans::ReservedFlags(_)
 impl msgtrans::ReservedFlags
 pub fn msgtrans::ReservedFlags::fragmented(self, bool) -> Self
@@ -1019,6 +1039,25 @@ impl core::marker::Unpin for msgtrans::RetryConfig
 impl core::marker::UnsafeUnpin for msgtrans::RetryConfig
 impl core::panic::unwind_safe::RefUnwindSafe for msgtrans::RetryConfig
 impl core::panic::unwind_safe::UnwindSafe for msgtrans::RetryConfig
+pub struct msgtrans::SendOptions
+impl msgtrans::SendOptions
+pub fn msgtrans::SendOptions::biz_type(self, u8) -> Self
+pub fn msgtrans::SendOptions::compression(self, msgtrans::CompressionType) -> Self
+pub fn msgtrans::SendOptions::ext_header(self, bytes::bytes::Bytes) -> Self
+pub fn msgtrans::SendOptions::new() -> Self
+impl core::clone::Clone for msgtrans::SendOptions
+pub fn msgtrans::SendOptions::clone(&self) -> msgtrans::SendOptions
+impl core::default::Default for msgtrans::SendOptions
+pub fn msgtrans::SendOptions::default() -> msgtrans::SendOptions
+impl core::fmt::Debug for msgtrans::SendOptions
+pub fn msgtrans::SendOptions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl !core::marker::Freeze for msgtrans::SendOptions
+impl core::marker::Send for msgtrans::SendOptions
+impl core::marker::Sync for msgtrans::SendOptions
+impl core::marker::Unpin for msgtrans::SendOptions
+impl core::marker::UnsafeUnpin for msgtrans::SendOptions
+impl core::panic::unwind_safe::RefUnwindSafe for msgtrans::SendOptions
+impl core::panic::unwind_safe::UnwindSafe for msgtrans::SendOptions
 #[non_exhaustive] pub struct msgtrans::SendReceipt
 pub msgtrans::SendReceipt::message_id: u32
 pub msgtrans::SendReceipt::peer: core::option::Option<msgtrans::SessionId>
@@ -1095,7 +1134,7 @@ pub struct msgtrans::SessionSender
 impl msgtrans::SessionSender
 pub async fn msgtrans::SessionSender::send_data(&self, impl core::convert::Into<bytes::bytes::Bytes>) -> core::result::Result<(), msgtrans::TransportError>
 pub async fn msgtrans::SessionSender::send_data_detached(&self, impl core::convert::Into<bytes::bytes::Bytes>) -> core::result::Result<(), msgtrans::TransportError>
-pub async fn msgtrans::SessionSender::send_data_with_options(&self, impl core::convert::Into<bytes::bytes::Bytes>, msgtrans::TransportOptions) -> core::result::Result<(), msgtrans::TransportError>
+pub async fn msgtrans::SessionSender::send_data_with_options(&self, impl core::convert::Into<bytes::bytes::Bytes>, msgtrans::SendOptions) -> core::result::Result<(), msgtrans::TransportError>
 pub fn msgtrans::SessionSender::session_id(&self) -> msgtrans::SessionId
 impl core::clone::Clone for msgtrans::SessionSender
 pub fn msgtrans::SessionSender::clone(&self) -> msgtrans::SessionSender
@@ -1204,10 +1243,10 @@ pub async fn msgtrans::TransportClient::events(&self) -> core::result::Result<ms
 pub async fn msgtrans::TransportClient::force_disconnect(&self) -> core::result::Result<(), msgtrans::TransportError>
 pub async fn msgtrans::TransportClient::is_connected(&self) -> bool
 pub async fn msgtrans::TransportClient::request(&self, &[u8]) -> core::result::Result<bytes::bytes::Bytes, msgtrans::TransportError>
-pub async fn msgtrans::TransportClient::request_with_options(&self, bytes::bytes::Bytes, msgtrans::TransportOptions) -> core::result::Result<bytes::bytes::Bytes, msgtrans::TransportError>
+pub async fn msgtrans::TransportClient::request_with_options(&self, bytes::bytes::Bytes, msgtrans::RequestOptions) -> core::result::Result<bytes::bytes::Bytes, msgtrans::TransportError>
 pub async fn msgtrans::TransportClient::send(&self, &[u8]) -> core::result::Result<msgtrans::SendReceipt, msgtrans::TransportError>
 pub async fn msgtrans::TransportClient::send_detached(&self, &[u8]) -> core::result::Result<msgtrans::SendReceipt, msgtrans::TransportError>
-pub async fn msgtrans::TransportClient::send_with_options(&self, bytes::bytes::Bytes, msgtrans::TransportOptions) -> core::result::Result<(), msgtrans::TransportError>
+pub async fn msgtrans::TransportClient::send_with_options(&self, impl core::convert::Into<bytes::bytes::Bytes>, msgtrans::SendOptions) -> core::result::Result<(), msgtrans::TransportError>
 pub async fn msgtrans::TransportClient::shutdown(&mut self) -> core::result::Result<(), msgtrans::TransportError>
 impl core::ops::drop::Drop for msgtrans::TransportClient
 pub fn msgtrans::TransportClient::drop(&mut self)
@@ -1251,38 +1290,19 @@ impl core::marker::Unpin for msgtrans::TransportConfig
 impl core::marker::UnsafeUnpin for msgtrans::TransportConfig
 impl core::panic::unwind_safe::RefUnwindSafe for msgtrans::TransportConfig
 impl core::panic::unwind_safe::UnwindSafe for msgtrans::TransportConfig
-pub struct msgtrans::TransportOptions
-impl msgtrans::TransportOptions
-pub fn msgtrans::TransportOptions::biz_type(self, u8) -> Self
-pub fn msgtrans::TransportOptions::ext_header(self, bytes::bytes::Bytes) -> Self
-pub fn msgtrans::TransportOptions::new() -> Self
-pub fn msgtrans::TransportOptions::timeout(self, core::time::Duration) -> Self
-impl core::clone::Clone for msgtrans::TransportOptions
-pub fn msgtrans::TransportOptions::clone(&self) -> msgtrans::TransportOptions
-impl core::default::Default for msgtrans::TransportOptions
-pub fn msgtrans::TransportOptions::default() -> msgtrans::TransportOptions
-impl core::fmt::Debug for msgtrans::TransportOptions
-pub fn msgtrans::TransportOptions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl !core::marker::Freeze for msgtrans::TransportOptions
-impl core::marker::Send for msgtrans::TransportOptions
-impl core::marker::Sync for msgtrans::TransportOptions
-impl core::marker::Unpin for msgtrans::TransportOptions
-impl core::marker::UnsafeUnpin for msgtrans::TransportOptions
-impl core::panic::unwind_safe::RefUnwindSafe for msgtrans::TransportOptions
-impl core::panic::unwind_safe::UnwindSafe for msgtrans::TransportOptions
 pub struct msgtrans::TransportServer
 impl msgtrans::TransportServer
 pub async fn msgtrans::TransportServer::active_sessions(&self) -> alloc::vec::Vec<msgtrans::SessionId>
-pub async fn msgtrans::TransportServer::broadcast(&self, bytes::bytes::Bytes, msgtrans::TransportOptions) -> msgtrans::BroadcastReport
+pub async fn msgtrans::TransportServer::broadcast(&self, bytes::bytes::Bytes, msgtrans::SendOptions) -> msgtrans::BroadcastReport
 pub async fn msgtrans::TransportServer::close_all_sessions(&self) -> core::result::Result<(), msgtrans::TransportError>
 pub async fn msgtrans::TransportServer::close_session(&self, msgtrans::SessionId) -> core::result::Result<(), msgtrans::TransportError>
 pub async fn msgtrans::TransportServer::force_close_session(&self, msgtrans::SessionId) -> core::result::Result<(), msgtrans::TransportError>
 pub async fn msgtrans::TransportServer::new(msgtrans::TransportConfig, std::collections::hash::map::HashMap<alloc::string::String, alloc::boxed::Box<dyn msgtrans::spi::DynServerConfig>>, alloc::sync::Arc<dyn msgtrans::SessionHandler>, core::option::Option<usize>) -> core::result::Result<Self, msgtrans::TransportError>
 pub async fn msgtrans::TransportServer::remove_session(&self, msgtrans::SessionId) -> core::result::Result<(), msgtrans::TransportError>
 pub async fn msgtrans::TransportServer::request(&self, msgtrans::SessionId, &[u8]) -> core::result::Result<bytes::bytes::Bytes, msgtrans::TransportError>
-pub async fn msgtrans::TransportServer::request_with_options(&self, msgtrans::SessionId, bytes::bytes::Bytes, msgtrans::TransportOptions) -> core::result::Result<bytes::bytes::Bytes, msgtrans::TransportError>
+pub async fn msgtrans::TransportServer::request_with_options(&self, msgtrans::SessionId, bytes::bytes::Bytes, msgtrans::RequestOptions) -> core::result::Result<bytes::bytes::Bytes, msgtrans::TransportError>
 pub async fn msgtrans::TransportServer::send(&self, msgtrans::SessionId, &[u8]) -> core::result::Result<msgtrans::SendReceipt, msgtrans::TransportError>
-pub async fn msgtrans::TransportServer::send_with_options(&self, msgtrans::SessionId, bytes::bytes::Bytes, msgtrans::TransportOptions) -> core::result::Result<msgtrans::SendReceipt, msgtrans::TransportError>
+pub async fn msgtrans::TransportServer::send_with_options(&self, msgtrans::SessionId, bytes::bytes::Bytes, msgtrans::SendOptions) -> core::result::Result<msgtrans::SendReceipt, msgtrans::TransportError>
 pub async fn msgtrans::TransportServer::serve(&self) -> core::result::Result<(), msgtrans::TransportError>
 pub async fn msgtrans::TransportServer::session_count(&self) -> usize
 pub async fn msgtrans::TransportServer::should_ignore_messages(&self, msgtrans::SessionId) -> bool
