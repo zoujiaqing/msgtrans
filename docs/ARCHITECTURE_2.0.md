@@ -144,6 +144,10 @@ Compression is a **send option** (`SendOptions::compression`) applied by the
 transport after the body is in place; a failure (e.g. the codec feature is not
 compiled in) fails the send instead of shipping a raw payload under a
 "compressed" header, which is what the old `TransportOptions::compression` did.
+Every outbound direction can ask for it — one-way (`send_with_options`),
+request (`RequestOptions`), broadcast (prepared **once**, before the fan-out
+clone) and response (`respond_with_options`, which defaults `biz_type` to the
+request's rather than to 0).
 
 Inbound decompression happens **once**, at the shared event-pipe boundary that
 every adapter pushes through, so the client, the server's `SessionHandler` and

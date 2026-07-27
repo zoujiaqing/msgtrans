@@ -997,18 +997,21 @@ impl TransportServer {
         &self,
         data: Bytes,
         options: crate::transport::SendOptions,
-    ) -> BroadcastReport {
-        let mut report = BroadcastReport::default();
-
+    ) -> Result<BroadcastReport, TransportError> {
         // Built here, as a ONE-WAY packet with a transport-allocated id: a
         // broadcast can never smuggle a Request onto the wire.
         let mut packet =
             crate::packet::Packet::one_way(self.request_registry.next_oneway_id(), data);
-        packet.set_biz_type(options.biz_type.unwrap_or(0));
-        if let Some(ext) = options.ext_header.as_ref() {
-            packet.set_ext_header(ext.clone());
-        }
+        // Prepare ONCE, before the fan-out clone, and surface a preparation
+        // failure as an `Err`. This path used to copy `biz_type`/`ext_header` by
+        // hand and never call `apply`, so a requested compression was silently
+        // dropped: asking for Zstd on a build without the codec reported a
+        // successful delivery and put PLAINTEXT on the wire. `BroadcastReport`
+        // can only describe per-session send failures, so a failure to even
+        // build the packet has to be the return type's error arm.
+        options.apply(&mut packet)?;
 
+        let mut report = BroadcastReport::default();
         let session_ids: Vec<SessionId> = self.session_handles.keys().unwrap_or_default();
         for session_id in session_ids {
             if let Some(handle) = self.session_handles.get(&session_id) {
@@ -1033,7 +1036,7 @@ impl TransportServer {
                 report.failed.len()
             );
         }
-        report
+        Ok(report)
     }
 
     /// Get active session list

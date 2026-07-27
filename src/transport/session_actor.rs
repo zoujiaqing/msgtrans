@@ -229,6 +229,25 @@ impl Responder {
         self,
         data: impl Into<bytes::Bytes>,
     ) -> Result<crate::event::RespondOutcome, crate::TransportError> {
+        self.respond_with_options(data, crate::transport::SendOptions::new())
+            .await
+    }
+
+    /// Respond with explicit [`crate::SendOptions`] — same guarantees as
+    /// [`Self::respond`], plus response-side compression / ext header /
+    /// `biz_type` override.
+    ///
+    /// Defaults preserve `respond`'s behaviour: `biz_type: None` inherits the
+    /// request's `biz_type` (a response is an answer to that request, not a
+    /// message of business type 0). A compression failure — including "the
+    /// codec feature is not compiled in" — fails the respond instead of
+    /// shipping a raw payload under a compressed header, and the claim is
+    /// resolved as a send failure.
+    pub async fn respond_with_options(
+        self,
+        data: impl Into<bytes::Bytes>,
+        options: crate::transport::SendOptions,
+    ) -> Result<crate::event::RespondOutcome, crate::TransportError> {
         let data: bytes::Bytes = data.into();
         if self.registry.begin_respond(&self.token) != MarkResult::Updated {
             return Ok(crate::event::RespondOutcome::AlreadyHandled);
@@ -239,8 +258,14 @@ impl Responder {
             self.registry.clone(),
             self.token,
         );
-        let response_packet =
+        let mut response_packet =
             Packet::response_with_biz(self.token.request_id(), self.biz_type, data);
+        if let Err(e) = options.apply_over(&mut response_packet, self.biz_type) {
+            // The claim is alive; dropping it here records the send failure,
+            // so the request never lingers as Responding.
+            drop(claim);
+            return Err(e);
+        }
         self.transport
             .send_confirmed_with(response_packet, Some(self.session_id), Some(claim))
             .await

@@ -11,7 +11,7 @@ use crate::protocol::{WebSocketClientConfig, WebSocketServerConfig};
 ///
 /// Crate-private: external protocols implement the object-safe
 /// [`DynProtocolConfig`] instead, so there is exactly ONE trait set to
-/// implement and no generic variant in the frozen contract.
+/// implement and no generic variant in the public contract.
 pub(crate) trait ProtocolConfig: Send + Sync + Clone + std::fmt::Debug + 'static {
     /// Validate if configuration is valid
     fn validate(&self) -> Result<(), ConfigError>;

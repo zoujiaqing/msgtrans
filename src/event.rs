@@ -213,6 +213,7 @@ impl ClientMessage {
 type ResponderFn = Arc<
     dyn Fn(
             Bytes,
+            crate::transport::SendOptions,
             Option<crate::transport::request_registry::RespondClaim>,
         ) -> futures::future::BoxFuture<'static, Result<(), crate::error::TransportError>>
         + Send
@@ -308,6 +309,22 @@ impl ClientRequest {
         self,
         response: impl Into<Bytes>,
     ) -> Result<RespondOutcome, crate::error::TransportError> {
+        self.respond_with_options(response, crate::transport::SendOptions::new())
+            .await
+    }
+
+    /// Respond with explicit [`crate::SendOptions`] — same guarantees as
+    /// [`Self::respond`], plus response-side compression / ext header /
+    /// `biz_type` override.
+    ///
+    /// `biz_type: None` inherits the request's `biz_type`. A compression
+    /// failure fails the respond rather than shipping a raw payload under a
+    /// compressed header.
+    pub async fn respond_with_options(
+        self,
+        response: impl Into<Bytes>,
+        options: crate::transport::SendOptions,
+    ) -> Result<RespondOutcome, crate::error::TransportError> {
         let response: Bytes = response.into();
         // The registry decides whether this response may be written at all;
         // there is no bypass path. A duplicate/late/reused-id respond loses the
@@ -319,7 +336,7 @@ impl ClientRequest {
             )),
             _ => return Ok(RespondOutcome::AlreadyHandled),
         };
-        (self.responder)(response, claim)
+        (self.responder)(response, options, claim)
             .await
             .map(|()| RespondOutcome::Written)
     }
@@ -406,7 +423,7 @@ mod respond_tests {
     fn responder_with(fut_claim_hold: bool) -> ResponderFn {
         // fut_claim_hold=true: hold the claim inside a never-completing future,
         // modelling a send stuck in the outbound path.
-        Arc::new(move |_data, claim| {
+        Arc::new(move |_data, _options, claim| {
             if fut_claim_hold {
                 Box::pin(async move {
                     let _hold = claim;
@@ -451,9 +468,42 @@ mod respond_tests {
         );
     }
 
+    /// `respond_with_options` must hand the options to the write path — the
+    /// whole point of the method. If they were dropped, a caller asking for
+    /// compression would silently get an uncompressed response.
+    #[tokio::test]
+    async fn respond_with_options_forwards_the_options() {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let sink = seen.clone();
+        let capture: ResponderFn = Arc::new(move |_data, options, claim| {
+            *sink.lock().unwrap() = Some(options);
+            if let Some(claim) = claim {
+                claim.resolve(true);
+            }
+            Box::pin(async { Ok(()) })
+        });
+        let (registry, token) = tracked(7, 1);
+        let ctx = tracked_ctx(&registry, token, capture);
+        let options = crate::transport::SendOptions::new()
+            .biz_type(9)
+            .compression(crate::packet::CompressionType::Zstd);
+        assert_eq!(
+            ctx.respond_with_options(b"resp".to_vec(), options)
+                .await
+                .unwrap(),
+            RespondOutcome::Written
+        );
+        let observed = seen.lock().unwrap().clone().expect("responder was called");
+        assert_eq!(observed.biz_type, Some(9));
+        assert_eq!(
+            observed.compression,
+            Some(crate::packet::CompressionType::Zstd)
+        );
+    }
+
     #[tokio::test]
     async fn respond_propagates_send_error() {
-        let err: ResponderFn = Arc::new(|_data, _claim| {
+        let err: ResponderFn = Arc::new(|_data, _options, _claim| {
             Box::pin(async {
                 // _claim drops here: a failed send resolves the registry
                 // entry as SendFailed by construction.

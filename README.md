@@ -308,33 +308,61 @@ use std::sync::Arc;
 /// it under its connection lock and RELEASE the lock before awaiting the
 /// enqueue — a saturated queue must not park reconnect/close/shutdown.
 struct MyWriter {
-    /* your outbound queue sender */
+    queue: tokio::sync::mpsc::Sender<(Packet, WriteCompletion)>,
 }
 
 #[async_trait::async_trait]
 impl ConnectionWriter for MyWriter {
     async fn send_with_completion(
         &self,
-        _packet: Packet,
+        packet: Packet,
         completion: WriteCompletion,
     ) -> Result<(), TransportError> {
-        // Enqueue, and resolve the completion from your write loop with the
-        // REAL result. Dropping it reports failure — never invent an Ok.
-        completion.complete(Ok(()));
-        Ok(())
+        // Hand BOTH the packet and its completion to the write loop. The
+        // completion must only be resolved once the bytes have actually reached
+        // the socket — resolving it here would be a false write confirmation,
+        // and the whole point of `WriteCompletion` is that `Ok` is provable.
+        //
+        // If the queue is gone, DROP the completion: dropping reports failure
+        // by construction, so there is no path that invents an `Ok`.
+        self.queue
+            .send((packet, completion))
+            .await
+            .map_err(|_| TransportError::connection_error("connection closed", false))
     }
 }
+
+/// The write loop that owns the socket. It is the only thing allowed to say a
+/// write succeeded.
+async fn write_loop(mut queue: tokio::sync::mpsc::Receiver<(Packet, WriteCompletion)>) {
+    while let Some((packet, completion)) = queue.recv().await {
+        let bytes = match packet.try_encode() {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                completion.complete(Err(TransportError::protocol_error("encode", e.to_string())));
+                continue;
+            }
+        };
+        // Replace with your real socket write; report exactly what it returned.
+        let written: Result<(), TransportError> = my_socket_write(&bytes).await;
+        completion.complete(written);
+    }
+}
+# async fn my_socket_write(_bytes: &[u8]) -> Result<(), TransportError> { Ok(()) }
 
 pub struct MyAdapter {
     session_id: SessionId,
     sink: EventSink,
     events: Option<ConnectionEvents>,
+    queue: tokio::sync::mpsc::Sender<(Packet, WriteCompletion)>,
 }
 
 impl MyAdapter {
     pub fn new() -> Self {
         let (sink, events) = event_channel(std::num::NonZeroUsize::new(1024).unwrap());
-        Self { session_id: SessionId::new(0), sink, events: Some(events) }
+        let (queue, rx) = tokio::sync::mpsc::channel(1024);
+        tokio::spawn(write_loop(rx));
+        Self { session_id: SessionId::new(0), sink, events: Some(events), queue }
     }
 
     /// Your read loop pushes inbound packets here. The pipe decompresses and
@@ -347,7 +375,7 @@ impl MyAdapter {
 #[async_trait::async_trait]
 impl Connection for MyAdapter {
     fn writer(&self) -> Arc<dyn ConnectionWriter> {
-        Arc::new(MyWriter {})
+        Arc::new(MyWriter { queue: self.queue.clone() })
     }
     async fn close(&mut self) -> Result<(), TransportError> {
         self.sink.close(CloseReason::Normal);

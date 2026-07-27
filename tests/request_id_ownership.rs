@@ -118,7 +118,8 @@ async fn public_api_cannot_send_a_caller_numbered_request() {
             bytes::Bytes::from_static(b"broadcast"),
             SendOptions::new().biz_type(7),
         )
-        .await;
+        .await
+        .expect("broadcast prepares");
     assert!(report.is_complete(), "broadcast reached every session");
 
     // And a real tracked request still round-trips correctly alongside them.
@@ -202,8 +203,13 @@ async fn server_handler_receives_decompressed_payload() {
     const PLAINTEXT: &[u8] =
         b"the quick brown fox jumps over the lazy dog, repeatedly and compressibly";
 
+    /// What the handler observed: the payload bytes and the packet's declared
+    /// compression. (Named so the strict `clippy::type_complexity` gate in the
+    /// all-features CI job stays clean without an `allow`.)
+    type Observed = Arc<Mutex<Option<(Vec<u8>, msgtrans::CompressionType)>>>;
+
     struct Capture {
-        seen: Arc<Mutex<Option<(Vec<u8>, msgtrans::CompressionType)>>>,
+        seen: Observed,
         ready: Arc<Notify>,
     }
     #[async_trait]
@@ -267,6 +273,57 @@ async fn server_handler_receives_decompressed_payload() {
     );
 
     let _ = client.shutdown().await;
+    let _ = server.shutdown_with_timeout(Duration::from_secs(5)).await;
+    serving.abort();
+}
+
+/// `broadcast` must not silently ignore a requested compression.
+///
+/// It used to copy `biz_type`/`ext_header` by hand and never call
+/// `SendOptions::apply`, so asking for Zstd on a build without the codec
+/// reported a successful delivery and put PLAINTEXT on the wire.
+#[cfg(not(feature = "zstd"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn broadcast_reports_unavailable_compression() {
+    let addr = "127.0.0.1:28975";
+    let (server, serving) = start_server(addr).await;
+
+    let result = server
+        .broadcast(
+            bytes::Bytes::from_static(b"payload"),
+            SendOptions::new()
+                .biz_type(7)
+                .compression(msgtrans::CompressionType::Zstd),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "requesting a compression the build cannot perform must fail, \
+         not silently broadcast plaintext"
+    );
+
+    let _ = server.shutdown_with_timeout(Duration::from_secs(5)).await;
+    serving.abort();
+}
+
+/// With the codec available, the same call succeeds and really compresses.
+#[cfg(feature = "zstd")]
+#[tokio::test(flavor = "multi_thread")]
+async fn broadcast_applies_compression_when_available() {
+    let addr = "127.0.0.1:28976";
+    let (server, serving) = start_server(addr).await;
+
+    let report = server
+        .broadcast(
+            bytes::Bytes::from_static(b"payload"),
+            SendOptions::new()
+                .biz_type(7)
+                .compression(msgtrans::CompressionType::Zstd),
+        )
+        .await
+        .expect("zstd is available, so preparation succeeds");
+    assert!(report.is_complete());
+
     let _ = server.shutdown_with_timeout(Duration::from_secs(5)).await;
     serving.abort();
 }

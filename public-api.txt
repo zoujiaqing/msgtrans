@@ -736,6 +736,7 @@ pub fn msgtrans::ClientRequest::payload(&self) -> &bytes::bytes::Bytes
 pub fn msgtrans::ClientRequest::peer(&self) -> core::option::Option<msgtrans::SessionId>
 pub async fn msgtrans::ClientRequest::respond(self, impl core::convert::Into<bytes::bytes::Bytes>) -> core::result::Result<msgtrans::RespondOutcome, msgtrans::TransportError>
 pub fn msgtrans::ClientRequest::respond_detached(self, impl core::convert::Into<bytes::bytes::Bytes>)
+pub async fn msgtrans::ClientRequest::respond_with_options(self, impl core::convert::Into<bytes::bytes::Bytes>, msgtrans::SendOptions) -> core::result::Result<msgtrans::RespondOutcome, msgtrans::TransportError>
 impl core::fmt::Debug for msgtrans::ClientRequest
 pub fn msgtrans::ClientRequest::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::ops::drop::Drop for msgtrans::ClientRequest
@@ -1010,6 +1011,7 @@ impl msgtrans::Responder
 pub fn msgtrans::Responder::message_id(&self) -> u32
 pub async fn msgtrans::Responder::respond(self, impl core::convert::Into<bytes::bytes::Bytes>) -> core::result::Result<msgtrans::RespondOutcome, msgtrans::TransportError>
 pub fn msgtrans::Responder::respond_detached(self, impl core::convert::Into<bytes::bytes::Bytes>)
+pub async fn msgtrans::Responder::respond_with_options(self, impl core::convert::Into<bytes::bytes::Bytes>, msgtrans::SendOptions) -> core::result::Result<msgtrans::RespondOutcome, msgtrans::TransportError>
 pub fn msgtrans::Responder::session_id(&self) -> msgtrans::SessionId
 impl core::ops::drop::Drop for msgtrans::Responder
 pub fn msgtrans::Responder::drop(&mut self)
@@ -1293,7 +1295,7 @@ impl core::panic::unwind_safe::UnwindSafe for msgtrans::TransportConfig
 pub struct msgtrans::TransportServer
 impl msgtrans::TransportServer
 pub async fn msgtrans::TransportServer::active_sessions(&self) -> alloc::vec::Vec<msgtrans::SessionId>
-pub async fn msgtrans::TransportServer::broadcast(&self, bytes::bytes::Bytes, msgtrans::SendOptions) -> msgtrans::BroadcastReport
+pub async fn msgtrans::TransportServer::broadcast(&self, bytes::bytes::Bytes, msgtrans::SendOptions) -> core::result::Result<msgtrans::BroadcastReport, msgtrans::TransportError>
 pub async fn msgtrans::TransportServer::close_all_sessions(&self) -> core::result::Result<(), msgtrans::TransportError>
 pub async fn msgtrans::TransportServer::close_session(&self, msgtrans::SessionId) -> core::result::Result<(), msgtrans::TransportError>
 pub async fn msgtrans::TransportServer::force_close_session(&self, msgtrans::SessionId) -> core::result::Result<(), msgtrans::TransportError>

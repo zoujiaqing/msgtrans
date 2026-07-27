@@ -165,7 +165,18 @@ impl SendOptions {
         &self,
         packet: &mut crate::packet::Packet,
     ) -> Result<(), crate::error::TransportError> {
-        packet.set_biz_type(self.biz_type.unwrap_or(0));
+        self.apply_over(packet, 0)
+    }
+
+    /// Same, but for a packet that already carries a meaningful `biz_type`
+    /// (a response inherits the request's): `biz_type: None` keeps
+    /// `default_biz` instead of resetting the field to 0.
+    pub(crate) fn apply_over(
+        &self,
+        packet: &mut crate::packet::Packet,
+        default_biz: u8,
+    ) -> Result<(), crate::error::TransportError> {
+        packet.set_biz_type(self.biz_type.unwrap_or(default_biz));
         if let Some(ext) = self.ext_header.as_ref() {
             packet.set_ext_header(ext.clone());
         }
@@ -181,5 +192,57 @@ impl SendOptions {
                 })
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod send_options_tests {
+    use super::SendOptions;
+    use crate::packet::{CompressionType, Packet};
+
+    /// A response inherits the request's `biz_type`; options must only
+    /// override it when the caller actually asked. Resetting it to 0 (what a
+    /// plain `apply` does for a transport-built packet) would silently
+    /// retype every response that used `respond_with_options`.
+    #[test]
+    fn apply_over_keeps_the_default_biz_type_unless_overridden() {
+        let mut packet = Packet::response_with_biz(1, 42, bytes::Bytes::from_static(b"x"));
+        SendOptions::new().apply_over(&mut packet, 42).unwrap();
+        assert_eq!(packet.header.biz_type, 42);
+
+        let mut packet = Packet::response_with_biz(1, 42, bytes::Bytes::from_static(b"x"));
+        SendOptions::new()
+            .biz_type(7)
+            .apply_over(&mut packet, 42)
+            .unwrap();
+        assert_eq!(packet.header.biz_type, 7);
+    }
+
+    /// Asking for a codec that is not compiled in must fail the send, not
+    /// stamp the compressed flag onto a raw payload.
+    #[test]
+    #[cfg(not(feature = "zstd"))]
+    fn apply_over_fails_when_the_codec_is_missing() {
+        let mut packet = Packet::response_with_biz(1, 42, bytes::Bytes::from_static(b"payload"));
+        let err = SendOptions::new()
+            .compression(CompressionType::Zstd)
+            .apply_over(&mut packet, 42)
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::error::TransportError::Configuration { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "zstd")]
+    fn apply_over_compresses_when_available() {
+        let mut packet = Packet::response_with_biz(1, 42, bytes::Bytes::from(vec![b'a'; 4096]));
+        SendOptions::new()
+            .compression(CompressionType::Zstd)
+            .apply_over(&mut packet, 42)
+            .unwrap();
+        assert_eq!(packet.compression(), CompressionType::Zstd);
+        assert!(packet.payload.len() < 4096);
     }
 }

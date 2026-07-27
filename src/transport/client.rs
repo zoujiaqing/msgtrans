@@ -746,6 +746,7 @@ impl TransportClient {
                                 packet.payload.clone(),
                                 Arc::new(
                                     move |response_data: bytes::Bytes,
+                                          options: crate::transport::SendOptions,
                                           claim: Option<
                                         crate::transport::request_registry::RespondClaim,
                                     >|
@@ -768,12 +769,15 @@ impl TransportClient {
                                                     ),
                                                 );
                                             };
-                                            let response_packet =
+                                            let mut response_packet =
                                                 crate::packet::Packet::response_with_biz(
                                                     message_id,
                                                     biz_type,
                                                     response_data,
                                                 );
+                                            // Dropping `claim` on the error
+                                            // path records the send failure.
+                                            options.apply_over(&mut response_packet, biz_type)?;
                                             // Generation-bound: if the client
                                             // reconnected since this request
                                             // arrived, the stale response is

@@ -126,8 +126,13 @@ internal type. This is a *separate module* (`msgtrans::spi`), not the crate root
 ## Cargo features
 
 `default = ["tcp", "websocket", "quic"]`; each protocol gates its adapter,
-config, events and dependencies. `flate2`/`zstd` gate `Packet`-level payload
-compression, which is explicit: `set_compression` + `compress_payload` on the
-packet. (`TransportOptions::compression` is gone — it stamped the header before
-compressing and, on a build without the codec feature, shipped a raw payload
-under a "compressed" header.)
+config, events and dependencies. `flate2`/`zstd` gate payload compression, which is
+requested per send through `SendOptions::compression` (and its request /
+response counterparts `RequestOptions::compression` and
+`Responder::respond_with_options` / `ClientRequest::respond_with_options`). The
+transport applies it once, after the body is in place, and a failure — including
+"the codec feature is not compiled in" — **fails the send**. Inbound
+decompression happens once at the shared event-pipe boundary, so every consumer
+sees plaintext with a self-consistent header. (`TransportOptions::compression`
+is gone: it stamped the header before compressing and, on a build without the
+codec feature, shipped a raw payload under a "compressed" header.)

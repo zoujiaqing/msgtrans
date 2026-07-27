@@ -303,33 +303,59 @@ use std::sync::Arc;
 /// 写半边。与连接对象分开，是为了让传输层能在连接锁内克隆它、**先释放锁**再 await
 /// 入队——队列打满时绝不能把 reconnect/close/shutdown 堵在后面。
 struct MyWriter {
-    /* your outbound queue sender */
+    queue: tokio::sync::mpsc::Sender<(Packet, WriteCompletion)>,
 }
 
 #[async_trait::async_trait]
 impl ConnectionWriter for MyWriter {
     async fn send_with_completion(
         &self,
-        _packet: Packet,
+        packet: Packet,
         completion: WriteCompletion,
     ) -> Result<(), TransportError> {
-        // 入队，并在你的写循环里用**真实**写结果 resolve completion。
-        // 丢弃它即上报失败——绝不能凭空造一个 Ok。
-        completion.complete(Ok(()));
-        Ok(())
+        // 把**包和它的 completion 一起**交给写循环。completion 只能在字节
+        // 真正写入 socket 之后才被 resolve——在这里 resolve 就是**伪造写入确认**，
+        // 而 `WriteCompletion` 存在的全部意义就是让 `Ok` 可被证明。
+        //
+        // 队列没了就**丢弃** completion：丢弃本身即上报失败，
+        // 所以不存在任何凭空造 `Ok` 的路径。
+        self.queue
+            .send((packet, completion))
+            .await
+            .map_err(|_| TransportError::connection_error("connection closed", false))
     }
 }
+
+/// 持有 socket 的写循环。只有它有资格声称一次写入成功。
+async fn write_loop(mut queue: tokio::sync::mpsc::Receiver<(Packet, WriteCompletion)>) {
+    while let Some((packet, completion)) = queue.recv().await {
+        let bytes = match packet.try_encode() {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                completion.complete(Err(TransportError::protocol_error("encode", e.to_string())));
+                continue;
+            }
+        };
+        // 换成你真实的 socket 写；如实上报它返回了什么。
+        let written: Result<(), TransportError> = my_socket_write(&bytes).await;
+        completion.complete(written);
+    }
+}
+# async fn my_socket_write(_bytes: &[u8]) -> Result<(), TransportError> { Ok(()) }
 
 pub struct MyAdapter {
     session_id: SessionId,
     sink: EventSink,
     events: Option<ConnectionEvents>,
+    queue: tokio::sync::mpsc::Sender<(Packet, WriteCompletion)>,
 }
 
 impl MyAdapter {
     pub fn new() -> Self {
         let (sink, events) = event_channel(std::num::NonZeroUsize::new(1024).unwrap());
-        Self { session_id: SessionId::new(0), sink, events: Some(events) }
+        let (queue, rx) = tokio::sync::mpsc::channel(1024);
+        tokio::spawn(write_loop(rx));
+        Self { session_id: SessionId::new(0), sink, events: Some(events), queue }
     }
 
     /// 你的读循环把入站包推到这里。管道会统一解压/规范化，
@@ -342,7 +368,7 @@ impl MyAdapter {
 #[async_trait::async_trait]
 impl Connection for MyAdapter {
     fn writer(&self) -> Arc<dyn ConnectionWriter> {
-        Arc::new(MyWriter {})
+        Arc::new(MyWriter { queue: self.queue.clone() })
     }
     async fn close(&mut self) -> Result<(), TransportError> {
         self.sink.close(CloseReason::Normal);

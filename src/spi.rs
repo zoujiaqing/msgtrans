@@ -7,7 +7,7 @@
 //! `Connection::take_event_pipe`. To advertise the config to the builder,
 //! implement the object-safe `DynProtocolConfig` plus `DynServerConfig` and/or
 //! `DynClientConfig` — one trait set, no generic variant, so no internal
-//! adapter type is written into the frozen contract.
+//! adapter type is written into the public contract.
 //!
 //! These types are reachable ONLY here: the crate root is the application API,
 //! this module is the protocol-implementor API.
@@ -40,7 +40,15 @@ pub struct EventSink(pub(crate) crate::adapters::events::EventPipe);
 
 impl EventSink {
     /// Deliver a received packet on the data plane, with backpressure. Returns
-    /// `false` when the consumer is gone — the adapter should stop reading.
+    /// `false` when the adapter should stop reading — either the consumer is
+    /// gone, or the packet could not be normalized.
+    ///
+    /// Normalization happens here, once, for every adapter: a compressed body
+    /// is decompressed and the header's compression flag cleared, so the
+    /// consumer always sees plaintext with a self-consistent header. An
+    /// undecodable body is fatal — a [`CloseReason::Error`] is published on the
+    /// control plane before this returns `false`, so the adapter must not
+    /// publish its own close for that case.
     pub async fn message(&self, packet: Packet) -> bool {
         self.0
             .deliver(TransportEvent::MessageReceived(packet))
