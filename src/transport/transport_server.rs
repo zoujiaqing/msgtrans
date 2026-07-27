@@ -49,7 +49,7 @@ impl Drop for InfraFailFast {
 }
 
 const LISTENER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
-const DEFAULT_REQUEST_LIFECYCLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+use crate::transport::request_registry::REQUEST_LIFECYCLE_TIMEOUT as DEFAULT_REQUEST_LIFECYCLE_TIMEOUT;
 /// Response deadline used when the caller does not supply one.
 const DEFAULT_REQUEST_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 

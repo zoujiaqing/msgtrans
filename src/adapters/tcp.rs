@@ -71,14 +71,10 @@ impl From<TcpError> for TransportError {
     }
 }
 
-/// Maximum payload size (1 MB)
-const MAX_PAYLOAD_SIZE: usize = 1024 * 1024;
-/// Maximum extended header size (64 KB)
-const MAX_EXT_HEADER_SIZE: usize = 64 * 1024;
 /// Maximum scan distance for frame resync (4 KB)
 const MAX_RESYNC_SCAN_DISTANCE: usize = 4096;
 /// Fixed header size
-const FIXED_HEADER_SIZE: usize = 16;
+use crate::packet::FIXED_HEADER_SIZE;
 
 /// Optimized TCP read buffer with frame resync and memory-pool recycling.
 struct OptimizedReadBuffer {
@@ -87,6 +83,10 @@ struct OptimizedReadBuffer {
     progress: ReadProgress,
     pool: Arc<OptimizedMemoryPool>,
     buffer_tier: BufferSize,
+    /// The caps this connection was configured with. TCP used to hardcode its
+    /// own (1 MiB payload, 64 KiB ext header) with no way to change them, so a
+    /// message that WebSocket and QUIC accepted was rejected here.
+    decode: crate::packet::DecodeLimits,
 }
 
 /// The only read-loop state that drives a DECISION.
@@ -116,7 +116,11 @@ impl Drop for OptimizedReadBuffer {
 }
 
 impl OptimizedReadBuffer {
-    fn new_with_pool(initial_capacity: usize, pool: Arc<OptimizedMemoryPool>) -> Self {
+    fn new_with_pool(
+        initial_capacity: usize,
+        pool: Arc<OptimizedMemoryPool>,
+        decode: crate::packet::DecodeLimits,
+    ) -> Self {
         let buffer_tier = if initial_capacity <= 1024 {
             BufferSize::Small
         } else if initial_capacity <= 8192 {
@@ -131,6 +135,7 @@ impl OptimizedReadBuffer {
             progress: ReadProgress::default(),
             pool,
             buffer_tier,
+            decode,
         }
     }
 
@@ -140,8 +145,8 @@ impl OptimizedReadBuffer {
     /// - version must be 1
     /// - compression must be 0-2
     /// - packet_type must be 0-2
-    /// - payload_len must be <= MAX_PAYLOAD_SIZE
-    /// - ext_header_len must be <= MAX_EXT_HEADER_SIZE
+    /// - payload_len / ext_header_len must be within this connection's
+    ///   configured [`crate::packet::DecodeLimits`]
     fn is_valid_header_at(&self, offset: usize) -> bool {
         if self.buffer.len() < offset + FIXED_HEADER_SIZE {
             return false;
@@ -171,14 +176,14 @@ impl OptimizedReadBuffer {
 
         // Validate ext_header_len
         let ext_header_len = u16::from_be_bytes([header[8], header[9]]) as usize;
-        if ext_header_len > MAX_EXT_HEADER_SIZE {
+        if ext_header_len > self.decode.max_ext_header_size {
             return false;
         }
 
         // Validate payload_len
         let payload_len =
             u32::from_be_bytes([header[10], header[11], header[12], header[13]]) as usize;
-        if payload_len > MAX_PAYLOAD_SIZE {
+        if payload_len > self.decode.max_payload_size {
             return false;
         }
 
@@ -222,17 +227,6 @@ impl OptimizedReadBuffer {
         false
     }
 
-    /// The stream decode limits: TCP enforces its own (tighter) caps, shared
-    /// with `is_valid_header_at` so the resync scanner and the codec agree on
-    /// what a valid frame is.
-    fn decode_limits() -> crate::packet::DecodeLimits {
-        crate::packet::DecodeLimits {
-            max_frame_size: FIXED_HEADER_SIZE + MAX_EXT_HEADER_SIZE + MAX_PAYLOAD_SIZE,
-            max_payload_size: MAX_PAYLOAD_SIZE,
-            max_ext_header_size: MAX_EXT_HEADER_SIZE,
-        }
-    }
-
     /// Try to parse next complete packet from buffer.
     ///
     /// Framing is delegated to the shared codec ([`Packet::decode_one_with`]),
@@ -250,7 +244,7 @@ impl OptimizedReadBuffer {
     /// - Ok(None) - No complete packet in buffer (need more data)
     /// - Err(error) - Unrecoverable parse error
     fn try_parse_next_packet(&mut self, strict: bool) -> Result<Option<Packet>, TcpError> {
-        let limits = Self::decode_limits();
+        let limits = self.decode;
         loop {
             // Zero-copy: peek the header for the frame length, split that many
             // bytes off the read buffer as an owned Bytes, and slice the body
@@ -402,6 +396,7 @@ impl<C> TcpAdapter<C> {
             frame_policy.clone(),
             idle_timeout,
             limits.write_deadline,
+            limits.decode_limits(),
         )
         .await;
 
@@ -428,6 +423,7 @@ impl<C> TcpAdapter<C> {
         frame_policy: Arc<std::sync::atomic::AtomicU8>,
         idle_timeout: Option<std::time::Duration>,
         write_deadline: std::time::Duration,
+        decode_limits: crate::packet::DecodeLimits,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let current_session_id = state.session_id();
@@ -437,7 +433,8 @@ impl<C> TcpAdapter<C> {
             );
 
             let (mut read_half, mut write_half) = stream.into_split();
-            let mut read_buffer = OptimizedReadBuffer::new_with_pool(8192, memory_pool);
+            let mut read_buffer =
+                OptimizedReadBuffer::new_with_pool(8192, memory_pool, decode_limits);
             // Any traffic in either direction counts as activity.
             let mut last_activity = tokio::time::Instant::now();
 
@@ -857,7 +854,11 @@ mod strict_stream_tests {
     use super::*;
 
     fn framer() -> OptimizedReadBuffer {
-        OptimizedReadBuffer::new_with_pool(8192, shared_memory_pool())
+        OptimizedReadBuffer::new_with_pool(
+            8192,
+            shared_memory_pool(),
+            crate::transport::limits::ConnectionLimits::default().decode_limits(),
+        )
     }
 
     fn feed(f: &mut OptimizedReadBuffer, bytes: &[u8]) {
@@ -955,7 +956,8 @@ mod strict_stream_tests {
                 .try_encode()
                 .unwrap()
                 .to_vec();
-            header[10..14].copy_from_slice(&((MAX_PAYLOAD_SIZE as u32) + 1).to_be_bytes());
+            let cap = f.decode.max_payload_size;
+            header[10..14].copy_from_slice(&((cap as u32) + 1).to_be_bytes());
             assert_eq!(header.len(), FIXED_HEADER_SIZE, "header only, no payload");
             feed(&mut f, &header);
             assert!(

@@ -164,6 +164,7 @@ impl core::panic::unwind_safe::RefUnwindSafe for msgtrans::ConnectionInfo
 impl core::panic::unwind_safe::UnwindSafe for msgtrans::ConnectionInfo
 pub struct msgtrans::spi::ConnectionLimits
 impl msgtrans::ConnectionLimits
+pub fn msgtrans::ConnectionLimits::decode_limits(&self) -> msgtrans::DecodeLimits
 pub fn msgtrans::ConnectionLimits::outbound_capacity(&self) -> usize
 pub fn msgtrans::ConnectionLimits::pipe_capacity(&self) -> usize
 pub fn msgtrans::ConnectionLimits::write_deadline(&self) -> core::time::Duration
@@ -683,6 +684,9 @@ impl core::panic::unwind_safe::RefUnwindSafe for msgtrans::ClientEvents
 impl core::panic::unwind_safe::UnwindSafe for msgtrans::ClientEvents
 pub struct msgtrans::ClientLimits
 impl msgtrans::ClientLimits
+pub fn msgtrans::ClientLimits::connection_limits(&self) -> msgtrans::ConnectionLimits
+pub fn msgtrans::ClientLimits::max_ext_header_size(self, usize) -> Self
+pub fn msgtrans::ClientLimits::max_payload_size(self, usize) -> Self
 pub fn msgtrans::ClientLimits::new() -> Self
 pub fn msgtrans::ClientLimits::outbound_queue_capacity(self, usize) -> Self
 pub fn msgtrans::ClientLimits::pipe_capacity(self, usize) -> Self
@@ -773,6 +777,7 @@ impl core::panic::unwind_safe::RefUnwindSafe for msgtrans::ConnectionInfo
 impl core::panic::unwind_safe::UnwindSafe for msgtrans::ConnectionInfo
 pub struct msgtrans::ConnectionLimits
 impl msgtrans::ConnectionLimits
+pub fn msgtrans::ConnectionLimits::decode_limits(&self) -> msgtrans::DecodeLimits
 pub fn msgtrans::ConnectionLimits::outbound_capacity(&self) -> usize
 pub fn msgtrans::ConnectionLimits::pipe_capacity(&self) -> usize
 pub fn msgtrans::ConnectionLimits::write_deadline(&self) -> core::time::Duration
@@ -1076,7 +1081,11 @@ impl core::panic::unwind_safe::RefUnwindSafe for msgtrans::SendReceipt
 impl core::panic::unwind_safe::UnwindSafe for msgtrans::SendReceipt
 pub struct msgtrans::ServerLimits
 impl msgtrans::ServerLimits
+pub fn msgtrans::ServerLimits::connection_limits(&self) -> msgtrans::ConnectionLimits
+pub fn msgtrans::ServerLimits::mailbox(&self) -> usize
 pub fn msgtrans::ServerLimits::mailbox_capacity(self, usize) -> Self
+pub fn msgtrans::ServerLimits::max_ext_header_size(self, usize) -> Self
+pub fn msgtrans::ServerLimits::max_payload_size(self, usize) -> Self
 pub fn msgtrans::ServerLimits::new() -> Self
 pub fn msgtrans::ServerLimits::outbound_queue_capacity(self, usize) -> Self
 pub fn msgtrans::ServerLimits::pipe_capacity(self, usize) -> Self
@@ -1420,7 +1429,13 @@ impl core::marker::Unpin for msgtrans::WebSocketServerConfig
 impl core::marker::UnsafeUnpin for msgtrans::WebSocketServerConfig
 impl core::panic::unwind_safe::RefUnwindSafe for msgtrans::WebSocketServerConfig
 impl core::panic::unwind_safe::UnwindSafe for msgtrans::WebSocketServerConfig
+pub const msgtrans::DEFAULT_MAILBOX_CAPACITY: usize
+pub const msgtrans::DEFAULT_MAX_EXT_HEADER_SIZE: usize
 pub const msgtrans::DEFAULT_MAX_FRAME_SIZE: usize
+pub const msgtrans::DEFAULT_MAX_PAYLOAD_SIZE: usize
+pub const msgtrans::DEFAULT_OUTBOUND_CAPACITY: usize
+pub const msgtrans::DEFAULT_PIPE_CAPACITY: usize
+pub const msgtrans::DEFAULT_WRITE_DEADLINE: core::time::Duration
 pub const msgtrans::WS_SUBPROTOCOL_MSGTRANS: &str
 pub trait msgtrans::SessionHandler: core::marker::Send + core::marker::Sync + 'static
 pub fn msgtrans::SessionHandler::on_connected<'life0, 'async_trait>(&'life0 self, msgtrans::SessionId, msgtrans::ConnectionInfo) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = ()> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait

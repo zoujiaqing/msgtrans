@@ -87,9 +87,16 @@ Everything above is reachable **only** through the crate root
 ## Limits
 
 - `ServerLimits::new().write_deadline(Duration).pipe_capacity(usize)
-  .outbound_queue_capacity(usize).mailbox_capacity(usize)`
+  .outbound_queue_capacity(usize).mailbox_capacity(usize)
+  .max_payload_size(usize).max_ext_header_size(usize)`
 - `ClientLimits::new().write_deadline(Duration).pipe_capacity(usize)
-  .outbound_queue_capacity(usize)`
+  .outbound_queue_capacity(usize).max_payload_size(usize)
+  .max_ext_header_size(usize)`
+- Both are readable back (`connection_limits()`, `ServerLimits::mailbox()`), so
+  a caller can assert that what it configured is what the connection enforces
+- Frame caps apply to EVERY protocol: `max_frame_size` is derived from the
+  payload and ext-header caps, and TCP / WebSocket / QUIC all enforce the same
+  values instead of their own constants
 - `ConnectionLimits` (SPI parameter; accessor-only)
 
 ## Protocol configs (feature-gated)

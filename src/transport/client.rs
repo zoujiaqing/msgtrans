@@ -204,9 +204,6 @@ const CLIENT_ACTIVE: u8 = 0;
 const CLIENT_SHUTTING_DOWN: u8 = 1;
 const CLIENT_STOPPED: u8 = 2;
 
-/// Capacity of the client event queue.
-const CLIENT_EVENT_QUEUE: usize = 8192;
-
 impl TransportClient {
     pub(crate) fn new(
         transport: Transport,
@@ -214,7 +211,12 @@ impl TransportClient {
         protocol_config: Option<Box<dyn DynClientConfig>>,
         frame_policy: crate::packet::FramePolicy,
     ) -> Self {
-        let (event_sender, event_receiver) = tokio::sync::mpsc::channel(CLIENT_EVENT_QUEUE);
+        // This hop mirrors the adapter's data-plane pipe, so it takes the
+        // SAME configured capacity. It used to be an independent, untunable
+        // 8192: a client given a small pipe still allocated 8192 slots here,
+        // and one given a large pipe was still throttled to 8192.
+        let (event_sender, event_receiver) =
+            tokio::sync::mpsc::channel(transport.config().connection_limits.pipe_capacity());
         Self {
             inner: Arc::new(transport),
             retry_config,

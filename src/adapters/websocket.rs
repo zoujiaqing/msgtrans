@@ -295,6 +295,7 @@ impl<C> WebSocketAdapter<C> {
             frame_policy.clone(),
             keepalive,
             limits.write_deadline,
+            limits.decode_limits(),
         )
         .await;
 
@@ -321,6 +322,7 @@ impl<C> WebSocketAdapter<C> {
         frame_policy: Arc<std::sync::atomic::AtomicU8>,
         keepalive: WsKeepalive,
         write_deadline: std::time::Duration,
+        decode_limits: crate::packet::DecodeLimits,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let current_session_id = state.session_id();
@@ -388,7 +390,7 @@ impl<C> WebSocketAdapter<C> {
                                 let policy = crate::packet::FramePolicy::from_u8(
                                     frame_policy.load(std::sync::atomic::Ordering::Relaxed),
                                 );
-                                match Self::process_websocket_message(message, policy) {
+                                match Self::process_websocket_message(message, policy, &decode_limits) {
                                     MessageProcessResult::Packet(packet) => {
                                         tracing::debug!("[RECV] WebSocket received packet: {} bytes (session: {})", packet.payload.len(), current_session_id);
 
@@ -550,6 +552,7 @@ impl<C> WebSocketAdapter<C> {
     fn process_websocket_message(
         message: Message,
         frame_policy: crate::packet::FramePolicy,
+        decode_limits: &crate::packet::DecodeLimits,
     ) -> MessageProcessResult {
         let strict = frame_policy == crate::packet::FramePolicy::Strict;
         match message {
@@ -565,7 +568,7 @@ impl<C> WebSocketAdapter<C> {
 
                 // Zero-copy: `data` is an owned Bytes (tungstenite), so
                 // decode_exact_from slices the body out without a payload copy.
-                match Packet::decode_exact_from(&data, &crate::packet::DecodeLimits::default()) {
+                match Packet::decode_exact_from(&data, decode_limits) {
                     Ok(packet) => {
                         tracing::debug!(
                             "[RECV] WebSocket packet parsing successful: {} bytes",
@@ -963,7 +966,11 @@ mod frame_policy_tests {
         message: Message,
         policy: FramePolicy,
     ) -> MessageProcessResult {
-        WebSocketAdapter::<C>::process_websocket_message(message, policy)
+        WebSocketAdapter::<C>::process_websocket_message(
+            message,
+            policy,
+            &crate::transport::limits::ConnectionLimits::default().decode_limits(),
+        )
     }
 
     /// msgtrans is a binary protocol: under the (default) strict policy a

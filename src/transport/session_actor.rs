@@ -14,7 +14,7 @@ use crate::adapters::outbound::SEND_QUEUE_WAIT;
 
 /// Lifecycle deadline for inbound requests: bounds how long an unanswered
 /// request stays tracked (the timeout scanner reaps Pending entries).
-const REQUEST_LIFECYCLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+use crate::transport::request_registry::REQUEST_LIFECYCLE_TIMEOUT;
 use crate::transport::request_registry::{MarkResult, RequestRegistry, RequestToken};
 use crate::{
     command::ConnectionInfo, event::TransportEvent, packet::Packet,
@@ -632,13 +632,12 @@ impl SessionActor {
     }
 }
 
-/// Default buffer size for session actor channels
-//
-// The mailbox is a fast-draining hop in front of the adapter's outbound queue,
-// not the main buffer. Under load testing it never became the bottleneck (all
-// queue-full errors came from the adapter queue), so it stays smaller than
-// `outbound::SEND_QUEUE_CAPACITY`.
-pub const DEFAULT_ACTOR_BUFFER_SIZE: usize = 512;
+/// Default buffer size for session actor channels.
+///
+/// Re-exported from [`crate::transport::limits::DEFAULT_MAILBOX_CAPACITY`] so
+/// there is exactly ONE value: the builder's fallback and `ServerLimits`'
+/// default used to be two different numbers.
+pub use crate::transport::limits::DEFAULT_MAILBOX_CAPACITY as DEFAULT_ACTOR_BUFFER_SIZE;
 
 /// Create a new session actor pair (handle + actor)
 ///

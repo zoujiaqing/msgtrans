@@ -129,6 +129,11 @@ pub struct DecodeLimits {
 /// Default frame cap: matches the decompression bomb cap.
 pub const DEFAULT_MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
+/// The fixed header is 16 bytes (see `WIRE_FORMAT.md`). Named here so the
+/// framing caps can be derived from payload/ext-header caps instead of being
+/// three independent numbers that can disagree.
+pub(crate) const FIXED_HEADER_SIZE: usize = 16;
+
 impl Default for DecodeLimits {
     fn default() -> Self {
         Self {

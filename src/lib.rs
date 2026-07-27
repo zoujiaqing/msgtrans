@@ -125,7 +125,11 @@ pub use protocol::{TcpClientConfig, TcpServerConfig};
 // Exporting it from the crate root too gave every type two public paths and
 // blurred the line between "API for applications" and "SPI for protocol
 // implementors".
-pub use transport::limits::{ClientLimits, ConnectionLimits, ServerLimits};
+pub use transport::limits::{
+    ClientLimits, ConnectionLimits, ServerLimits, DEFAULT_MAILBOX_CAPACITY,
+    DEFAULT_MAX_EXT_HEADER_SIZE, DEFAULT_MAX_PAYLOAD_SIZE, DEFAULT_OUTBOUND_CAPACITY,
+    DEFAULT_PIPE_CAPACITY, DEFAULT_WRITE_DEADLINE,
+};
 
 // Convenient type aliases
 pub type Result<T> = std::result::Result<T, TransportError>;

@@ -9,6 +9,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
+/// How long an unanswered request stays TRACKED, in every direction and on
+/// both sides. Not a response deadline (that is
+/// `RequestOptions::timeout`) — this only bounds registry residency so a peer
+/// that never answers cannot pin an entry forever.
+///
+/// It lived as four separate 30s literals in four files, each with its own
+/// comment; they are one policy and now have one definition, so they cannot
+/// drift apart.
+pub(crate) const REQUEST_LIFECYCLE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
 const DEFAULT_TIMEOUT_BUCKET_COUNT: usize = 256;
 const DEFAULT_TIMEOUT_TICK: Duration = Duration::from_millis(100);
 

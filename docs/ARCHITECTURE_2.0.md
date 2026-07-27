@@ -160,10 +160,31 @@ An undecodable body closes the connection.
 
 Per-connection limits are immutable and set on the builder
 (`ServerLimits`/`ClientLimits` → `ConnectionLimits`): write deadline, event-pipe
-capacity, outbound-queue capacity, actor mailbox size. The process-global
-setters of 1.x are gone. `max_connections` is enforced by a semaphore whose
-permit lives in the session's actor, so capacity is released exactly when the
-actor ends.
+capacity, outbound-queue capacity, actor mailbox size, and the frame-decoding
+caps. The process-global setters of 1.x are gone. `max_connections` is enforced
+by a semaphore whose permit lives in the session's actor, so capacity is
+released exactly when the actor ends.
+
+Every number is defined ONCE and means the same thing on every path — the
+failure mode this replaced was a parameter that differed by protocol or by
+construction path:
+
+- **Frame caps** (`max_payload_size` / `max_ext_header_size`, `max_frame_size`
+  derived from them) are enforced identically by TCP, WebSocket and QUIC. TCP
+  used to hardcode 1 MiB with no way to change it while the other two allowed
+  16 MiB, so the same message succeeded on one protocol and closed the
+  connection on another. The default is the decompression-bomb cap, so a frame
+  that decodes can never exceed what decompression accepts.
+- **Mailbox capacity** has one default, used whether or not `ServerLimits` is
+  passed (the builder's fallback and the documented default were different
+  numbers). It stays deliberately smaller than the outbound-queue capacity: the
+  mailbox is a fast-draining hop in front of that queue, which is where
+  backpressure belongs.
+- **The client's event queue** takes the configured pipe capacity instead of an
+  independent, untunable constant.
+- **Request lifecycle residency** (how long an unanswered request stays
+  tracked, distinct from `RequestOptions::timeout`) has one definition instead
+  of four copies in four files.
 
 ## 9. Wire format
 

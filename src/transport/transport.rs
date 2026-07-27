@@ -62,12 +62,12 @@ pub struct Transport {
 /// Fallback lifecycle deadline for waiter-based requests. The real timeout is
 /// enforced by the caller (tokio::time::timeout); this only bounds the entry if
 /// the caller forgets to remove it.
-const REQUEST_WAITER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+use crate::transport::request_registry::REQUEST_LIFECYCLE_TIMEOUT as REQUEST_WAITER_TIMEOUT;
 /// Lifecycle deadline for inbound (peer-initiated) requests on the client
 /// side. Client transports run no timeout scanner, so this only labels the
 /// entry; actual cleanup is the respond itself or the session-close drain,
 /// which caps entry lifetime at the connection's lifetime.
-const INBOUND_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+use crate::transport::request_registry::REQUEST_LIFECYCLE_TIMEOUT as INBOUND_REQUEST_TIMEOUT;
 impl Transport {
     /// Create Transport from a shared context (synchronous — no global singletons).
     pub(crate) fn with_context(config: TransportConfig, ctx: &TransportContext) -> Self {

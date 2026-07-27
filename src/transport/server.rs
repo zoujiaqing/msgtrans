@@ -64,7 +64,8 @@ impl TransportServerBuilder {
         self
     }
 
-    /// Set buffer size for actor channels (default: 2048).
+    /// Set buffer size for actor channels (default:
+    /// [`crate::transport::limits::DEFAULT_MAILBOX_CAPACITY`]).
     ///
     /// Prefer [`Self::limits`] with `ServerLimits::mailbox_capacity`; this
     /// remains as a focused shortcut.

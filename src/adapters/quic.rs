@@ -423,6 +423,7 @@ impl<C> QuicAdapter<C> {
             is_server,
             frame_policy.clone(),
             limits.write_deadline,
+            limits.decode_limits(),
         )
         .await;
 
@@ -463,6 +464,7 @@ impl<C> QuicAdapter<C> {
         is_server: bool,
         frame_policy: Arc<std::sync::atomic::AtomicU8>,
         write_deadline: std::time::Duration,
+        decode_limits: crate::packet::DecodeLimits,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let current_session_id = state.session_id();
@@ -525,6 +527,7 @@ impl<C> QuicAdapter<C> {
             let read_event_pipe = event_pipe.clone();
             let read_shutdown_flag = shutdown_flag.clone();
             let read_frame_policy = frame_policy.clone();
+            let read_decode_limits = decode_limits;
             let mut read_task = tokio::spawn(async move {
                 let mut recv_stream = recv_stream;
                 let mut header_buf = [0u8; 4];
@@ -541,8 +544,10 @@ impl<C> QuicAdapter<C> {
                         Ok(_) => {
                             let frame_len = u32::from_be_bytes(header_buf) as usize;
 
-                            // Sanity check
-                            if frame_len > 16 * 1024 * 1024 {
+                            // Sanity check against the CONFIGURED cap. This was
+                            // a hardcoded 16 MiB while TCP hardcoded 1 MiB, so
+                            // the same payload lived or died by protocol.
+                            if frame_len > read_decode_limits.max_frame_size {
                                 tracing::error!(
                                     "[ERROR] Frame too large: {} bytes (session: {})",
                                     frame_len,
@@ -591,10 +596,8 @@ impl<C> QuicAdapter<C> {
                                         }
                                         Packet::one_way(0, frame)
                                     } else {
-                                        match Packet::decode_exact_from(
-                                            &frame,
-                                            &crate::packet::DecodeLimits::default(),
-                                        ) {
+                                        match Packet::decode_exact_from(&frame, &read_decode_limits)
+                                        {
                                             Ok(packet) => packet,
                                             Err(_) if strict => {
                                                 read_event_pipe.close(
