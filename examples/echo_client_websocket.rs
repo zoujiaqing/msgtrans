@@ -17,13 +17,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .connect_timeout(Duration::from_secs(10))
         .ping_interval(Some(Duration::from_secs(30)))
         .pong_timeout(Duration::from_secs(10))
-        .max_frame_size(8192)
-        .max_message_size(65536)
         .tls(msgtrans::ClientTls::Insecure); // Test environment
 
     // [TARGET] Build TransportClient
+    //
+    // Frame sizing is a per-connection resource limit, not a WebSocket-specific
+    // one: it lives on `ClientLimits` and is enforced identically by every
+    // protocol (and by the tungstenite layer underneath this one).
     let mut transport = TransportClientBuilder::new()
         .protocol(websocket_config)
+        .limits(msgtrans::ClientLimits::new().max_payload_size(8192))
         .build()
         .await?;
 

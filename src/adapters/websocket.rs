@@ -60,11 +60,23 @@ fn ws_keepalive_of<C: std::any::Any>(config: &C) -> WsKeepalive {
     WsKeepalive::default()
 }
 
-/// Frame/message caps for the tungstenite protocol layer, from the config.
-fn ws_protocol_config(max_message_size: usize, max_frame_size: usize) -> WebSocketConfig {
+/// Frame/message caps for the tungstenite protocol layer, DERIVED from this
+/// connection's [`crate::packet::DecodeLimits`].
+///
+/// tungstenite used to carry its own `max_frame_size`/`max_message_size` on the
+/// WebSocket config — a second source of truth that disagreed with the one
+/// msgtrans enforces. Both directions were wrong: the default msgtrans frame
+/// (16 B header + 64 KiB ext + 16 MiB payload) exceeded tungstenite's 16 MiB
+/// frame cap, so a legal boundary frame was rejected before msgtrans ever saw
+/// it; and a caller who set a small `ServerLimits` still let tungstenite
+/// buffer up to 64 MiB, so the resource limit was not the real one.
+///
+/// msgtrans puts exactly one packet in one binary WebSocket message, so the
+/// message cap and the frame cap are the same number: our maximum frame.
+fn ws_protocol_config(limits: &crate::packet::DecodeLimits) -> WebSocketConfig {
     WebSocketConfig::default()
-        .max_message_size(Some(max_message_size))
-        .max_frame_size(Some(max_frame_size))
+        .max_message_size(Some(limits.max_frame_size))
+        .max_frame_size(Some(limits.max_frame_size))
 }
 
 /// Build the TLS connector for wss:// per the configured [`ClientTls`]
@@ -774,7 +786,9 @@ impl<C: 'static> WebSocketServer<C> {
             // - request path must match config.path (404 otherwise)
             // - a client-offered subprotocol is negotiated and echoed when it
             //   matches; peers that offer none are accepted (not required)
-            // - tungstenite enforces the configured message/frame caps
+            // - tungstenite enforces THIS CONNECTION's frame caps, derived
+            //   from ConnectionLimits (not a second set on the ws config)
+            let accept_limits = self.limits;
             let ws_cfg = (&self.config as &dyn std::any::Any)
                 .downcast_ref::<crate::protocol::WebSocketServerConfig>()
                 .cloned()
@@ -813,10 +827,7 @@ impl<C: 'static> WebSocketServer<C> {
             let ws_stream = accept_hdr_async_with_config(
                 maybe_tls_stream,
                 callback,
-                Some(ws_protocol_config(
-                    ws_cfg.max_message_size,
-                    ws_cfg.max_frame_size,
-                )),
+                Some(ws_protocol_config(&accept_limits.decode_limits())),
             )
             .await?;
 
@@ -934,10 +945,7 @@ impl<C> WebSocketClientBuilder<C> {
 
         let connect = connect_async_tls_with_config(
             request,
-            Some(ws_protocol_config(
-                ws_cfg.max_message_size,
-                ws_cfg.max_frame_size,
-            )),
+            Some(ws_protocol_config(&self.limits.decode_limits())),
             false,
             connector,
         );

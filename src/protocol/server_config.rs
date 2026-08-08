@@ -158,10 +158,6 @@ pub struct WebSocketServerConfig {
     pub(crate) path: String,
     /// Supported sub-protocols
     pub(crate) subprotocols: Vec<String>,
-    /// Maximum frame size
-    pub(crate) max_frame_size: usize,
-    /// Maximum message size
-    pub(crate) max_message_size: usize,
     /// Ping interval
     pub(crate) ping_interval: Option<Duration>,
     /// Pong timeout
@@ -177,8 +173,6 @@ impl Default for WebSocketServerConfig {
             bind_address: "127.0.0.1:8080".parse().unwrap(),
             path: "/".to_string(),
             subprotocols: vec![crate::protocol::client_config::WS_SUBPROTOCOL_MSGTRANS.to_string()],
-            max_frame_size: 16 * 1024 * 1024,   // 16MB
-            max_message_size: 64 * 1024 * 1024, // 64MB
             ping_interval: Some(Duration::from_secs(30)),
             pong_timeout: Duration::from_secs(10),
             idle_timeout: Some(Duration::from_secs(300)),
@@ -280,18 +274,6 @@ impl WebSocketServerConfig {
     /// Add sub-protocol
     pub fn add_subprotocol<S: Into<String>>(mut self, protocol: S) -> Self {
         self.subprotocols.push(protocol.into());
-        self
-    }
-
-    /// Set maximum frame size
-    pub fn max_frame_size(mut self, size: usize) -> Self {
-        self.max_frame_size = size;
-        self
-    }
-
-    /// Set maximum message size
-    pub fn max_message_size(mut self, size: usize) -> Self {
-        self.max_message_size = size;
         self
     }
 

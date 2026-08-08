@@ -382,6 +382,79 @@ async fn broadcast_applies_compression_when_available() {
     serving.abort();
 }
 
+/// The SERVER-initiated direction: `ClientRequest::respond_with_options`.
+///
+/// The server-side `Responder` had an end-to-end test; the client side had only
+/// a unit test proving the options reach the write path. That left the two
+/// directions asymmetrically covered right before a freeze — a client whose
+/// response was compressed but never decompressed on the server would have
+/// passed everything.
+#[cfg(feature = "zstd")]
+#[tokio::test(flavor = "multi_thread")]
+async fn compressed_client_response_reaches_the_server_as_plaintext() {
+    const ANSWER: &[u8] =
+        b"client answer, client answer, client answer, client answer, client answer";
+
+    let addr = "127.0.0.1:28979";
+    let (server, serving) = start_server(addr).await;
+
+    let mut client = TransportClientBuilder::new()
+        .protocol(TcpClientConfig::new(addr).expect("client cfg"))
+        .build()
+        .await
+        .expect("client builds");
+    client.connect().await.expect("connect");
+    let mut events = client.events().await.expect("events");
+
+    // The client answers whatever the server asks, with a compressed body.
+    let responder = tokio::spawn(async move {
+        while let Some(event) = events.next().await {
+            if let msgtrans::ClientEvent::Request(request) = event {
+                let outcome = request
+                    .respond_with_options(
+                        bytes::Bytes::from_static(ANSWER),
+                        SendOptions::new().compression(msgtrans::CompressionType::Zstd),
+                    )
+                    .await
+                    .expect("compressed respond");
+                assert_eq!(outcome, msgtrans::RespondOutcome::Written);
+                return;
+            }
+        }
+        panic!("the client never saw the server's request");
+    });
+
+    let session = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(id) = server.active_sessions().await.first().copied() {
+                return id;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("server registered the session");
+
+    let response = server
+        .request_with_options(
+            session,
+            bytes::Bytes::from_static(b"ask the client"),
+            RequestOptions::new().timeout(Duration::from_secs(5)),
+        )
+        .await
+        .expect("client answered");
+    assert_eq!(
+        response.as_ref(),
+        ANSWER,
+        "a compressed client response must be decompressed before the server sees it"
+    );
+
+    responder.await.expect("responder task");
+    let _ = client.shutdown().await;
+    let _ = server.shutdown_with_timeout(Duration::from_secs(5)).await;
+    serving.abort();
+}
+
 /// The companion falsifier for the test below.
 ///
 /// On its own, "the requester got plaintext" cannot tell a response that was

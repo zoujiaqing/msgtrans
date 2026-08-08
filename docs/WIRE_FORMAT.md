@@ -313,10 +313,13 @@ msgtrans 传输层**不**定义心跳 Packet。心跳由应用层实现，约定
 | `payload_len` | 4 GB (`u32::MAX`) | 由 transport 限制 |
 | 单 Packet 总长度 | ~4 GB | 取决于 transport |
 
-**transport 实现限制**（仅供参考，实际以配置为准）：
+**transport 实现限制**：由 `ServerLimits`/`ClientLimits` 的
+`max_payload_size` / `max_ext_header_size` 决定，`max_frame_size` 从二者派生。
 
-- WebSocket：默认 `max_message_size = 64 KB`，可配置
-- TCP：理论无限，受内存约束
+- **三种协议执行同一套上限**，不再各有各的常量；WebSocket 下层的
+  tungstenite 也由同一份 `DecodeLimits` 配置，不会出现"msgtrans 认为合法、
+  下层先拒掉"的边界帧
+- 默认 payload 上限等于解压上限（16 MiB），所以能解码的帧不会超过解压能接受的量
 - 浏览器 `WebSocket` 无显式限制，但巨型消息会触发缓冲区压力
 
 ---

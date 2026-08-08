@@ -476,8 +476,7 @@ let tcp_config = TcpServerConfig::new("0.0.0.0:8001")?
     .reuse_addr(true);
 
 let ws_config = WebSocketServerConfig::new("0.0.0.0:8002")?
-    .path("/api/ws")
-    .max_frame_size(1024 * 1024);
+    .path("/api/ws");
 
 let quic_config = QuicServerConfig::new("0.0.0.0:8003")?
     .cert_pem(std::fs::read_to_string("cert.pem")?)

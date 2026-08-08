@@ -93,10 +93,15 @@ Everything above is reachable **only** through the crate root
   .outbound_queue_capacity(usize).max_payload_size(usize)
   .max_ext_header_size(usize)`
 - Both are readable back (`connection_limits()`, `ServerLimits::mailbox()`), so
-  a caller can assert that what it configured is what the connection enforces
+  a caller can assert that what it configured is what the connection enforces.
+  The tuning DEFAULTS are not re-exported: `Default` plus these getters already
+  show the values in effect, so the constants stay crate-internal rather than
+  widening the frozen surface
 - Frame caps apply to EVERY protocol: `max_frame_size` is derived from the
   payload and ext-header caps, and TCP / WebSocket / QUIC all enforce the same
-  values instead of their own constants
+  values instead of their own constants. On WebSocket this reaches the
+  tungstenite layer too — `WebSocketServerConfig`/`WebSocketClientConfig` no
+  longer carry their own `max_frame_size`/`max_message_size`
 - `ConnectionLimits` (SPI parameter; accessor-only)
 
 ## Protocol configs (feature-gated)

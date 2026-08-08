@@ -149,10 +149,6 @@ pub struct WebSocketClientConfig {
     pub(crate) headers: std::collections::HashMap<String, String>,
     /// 子协议
     pub(crate) subprotocols: Vec<String>,
-    /// 最大帧大小
-    pub(crate) max_frame_size: usize,
-    /// 最大消息大小
-    pub(crate) max_message_size: usize,
     /// ping间隔
     pub(crate) ping_interval: Option<Duration>,
     /// pong超时
@@ -195,8 +191,6 @@ impl Default for WebSocketClientConfig {
             // Match the limits that were actually in effect before these
             // knobs were wired (tungstenite's defaults) — wiring must make
             // the options real, not silently tighten them.
-            max_frame_size: 16 * 1024 * 1024,
-            max_message_size: 64 * 1024 * 1024,
             ping_interval: Some(Duration::from_secs(30)),
             pong_timeout: Duration::from_secs(10),
             tls: ClientTls::default(),
@@ -213,24 +207,6 @@ impl ProtocolConfig for WebSocketClientConfig {
                 value: self.target_url.clone(),
                 reason: "must start with 'ws://' or 'wss://'".to_string(),
                 suggestion: "use a valid WebSocket URL".to_string(),
-            });
-        }
-
-        if self.max_frame_size == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "max_frame_size".to_string(),
-                value: "0".to_string(),
-                reason: "must be > 0".to_string(),
-                suggestion: "set a positive value".to_string(),
-            });
-        }
-
-        if self.max_message_size == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "max_message_size".to_string(),
-                value: "0".to_string(),
-                reason: "must be > 0".to_string(),
-                suggestion: "set a positive value".to_string(),
             });
         }
 
@@ -292,18 +268,6 @@ impl WebSocketClientConfig {
         self
     }
 
-    /// 设置最大帧大小
-    pub fn max_frame_size(mut self, size: usize) -> Self {
-        self.max_frame_size = size;
-        self
-    }
-
-    /// 设置最大消息大小
-    pub fn max_message_size(mut self, size: usize) -> Self {
-        self.max_message_size = size;
-        self
-    }
-
     /// 设置ping间隔
     pub fn ping_interval(mut self, interval: Option<Duration>) -> Self {
         self.ping_interval = interval;
@@ -335,9 +299,7 @@ impl WebSocketClientConfig {
 
         Ok(Self::new(target_url)?
             .headers(headers)
-            .subprotocols(vec!["json".to_string()])
-            .max_frame_size(16 * 1024)
-            .max_message_size(512 * 1024))
+            .subprotocols(vec!["json".to_string()]))
     }
 
     /// 实时通信客户端预设
@@ -345,15 +307,12 @@ impl WebSocketClientConfig {
         Ok(Self::new(target_url)?
             .ping_interval(Some(Duration::from_secs(10)))
             .pong_timeout(Duration::from_secs(5))
-            .max_frame_size(8 * 1024)
             .connect_timeout(Duration::from_secs(5)))
     }
 
     /// 文件传输客户端预设
     pub fn file_transfer(target_url: &str) -> Result<Self, ConfigError> {
         Ok(Self::new(target_url)?
-            .max_frame_size(1024 * 1024) // 1MB
-            .max_message_size(100 * 1024 * 1024) // 100MB
             .ping_interval(None) // 禁用ping以减少干扰
             .connect_timeout(Duration::from_secs(30)))
     }

@@ -125,11 +125,10 @@ pub use protocol::{TcpClientConfig, TcpServerConfig};
 // Exporting it from the crate root too gave every type two public paths and
 // blurred the line between "API for applications" and "SPI for protocol
 // implementors".
-pub use transport::limits::{
-    ClientLimits, ConnectionLimits, ServerLimits, DEFAULT_MAILBOX_CAPACITY,
-    DEFAULT_MAX_EXT_HEADER_SIZE, DEFAULT_MAX_PAYLOAD_SIZE, DEFAULT_OUTBOUND_CAPACITY,
-    DEFAULT_PIPE_CAPACITY, DEFAULT_WRITE_DEADLINE,
-};
+// The tuning defaults stay CRATE-INTERNAL: `Default` plus the getters already
+// show a caller the values in effect, so re-exporting the constants would
+// widen the frozen surface for nothing.
+pub use transport::limits::{ClientLimits, ConnectionLimits, ServerLimits};
 
 // Convenient type aliases
 pub type Result<T> = std::result::Result<T, TransportError>;

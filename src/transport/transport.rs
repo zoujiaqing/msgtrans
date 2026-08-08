@@ -62,7 +62,13 @@ pub struct Transport {
 /// Fallback lifecycle deadline for waiter-based requests. The real timeout is
 /// enforced by the caller (tokio::time::timeout); this only bounds the entry if
 /// the caller forgets to remove it.
-use crate::transport::request_registry::REQUEST_LIFECYCLE_TIMEOUT as REQUEST_WAITER_TIMEOUT;
+/// Fallback deadline recorded for a waiter-based request whose caller did not
+/// name one. Waiters are NOT scheduled into the timeout wheel — the caller's
+/// own `tokio::time::timeout` is the real deadline — so this only labels the
+/// entry for diagnostics. It is deliberately NOT the inbound lifecycle
+/// constant: those are different policies, and merging them made every
+/// outbound entry claim a 30s deadline no matter what the caller asked for.
+const DEFAULT_WAITER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 /// Lifecycle deadline for inbound (peer-initiated) requests on the client
 /// side. Client transports run no timeout scanner, so this only labels the
 /// entry; actual cleanup is the respond itself or the session-close drain,
@@ -71,7 +77,12 @@ use crate::transport::request_registry::REQUEST_LIFECYCLE_TIMEOUT as INBOUND_REQ
 impl Transport {
     /// Create Transport from a shared context (synchronous — no global singletons).
     pub(crate) fn with_context(config: TransportConfig, ctx: &TransportContext) -> Self {
-        let (client_events_tx, client_events_rx) = mpsc::channel(8192);
+        // Both event hops take the SAME configured capacity. This one was a
+        // fixed 8192 while the outer TransportClient queue read the config, so
+        // `ClientLimits::pipe_capacity(1)` still let 8192 events pile up here
+        // and backpressure never reached the adapter.
+        let (client_events_tx, client_events_rx) =
+            mpsc::channel(config.connection_limits.pipe_capacity());
         let _ = ctx;
         Self {
             config,
@@ -496,7 +507,7 @@ impl Transport {
             client_message_id,
             session_id,
             packet.header.biz_type,
-            REQUEST_WAITER_TIMEOUT,
+            DEFAULT_WAITER_DEADLINE,
         ) {
             Ok(pair) => pair,
             Err(_) => {
@@ -733,7 +744,9 @@ impl Transport {
             message_id,
             session_id,
             packet.header.biz_type,
-            REQUEST_WAITER_TIMEOUT,
+            // The caller's REAL deadline, so the registry entry does not claim
+            // one the caller never asked for.
+            options.timeout.unwrap_or(DEFAULT_WAITER_DEADLINE),
         ) {
             Ok(pair) => pair,
             Err(_) => {
@@ -939,6 +952,27 @@ mod generation_tests {
 
     /// The generation invariants the ConnectionSlot exists for: distinct ids
     /// per generation, a stale close cannot touch the replacement connection
+    /// BOTH client-event hops must take the configured capacity.
+    ///
+    /// This inner queue was a fixed 8192 while the outer `TransportClient`
+    /// queue read the config, so `ClientLimits::pipe_capacity(1)` still let
+    /// 8192 events accumulate here and backpressure never reached the adapter.
+    #[tokio::test]
+    async fn the_inner_event_queue_takes_the_configured_capacity() {
+        let ctx = TransportContext::new().await.expect("ctx");
+        let mut config = TransportConfig::default();
+        config.connection_limits = crate::transport::limits::ClientLimits::new()
+            .pipe_capacity(7)
+            .connection_limits();
+
+        let transport = Transport::with_context(config, &ctx);
+        assert_eq!(
+            transport.client_events_tx.max_capacity(),
+            7,
+            "a small pipe must actually be small on this hop too"
+        );
+    }
+
     /// (validate-and-take is one atomic slot operation), and a current close
     /// closes exactly its own connection.
     #[tokio::test]

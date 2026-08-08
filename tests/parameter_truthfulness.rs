@@ -40,7 +40,13 @@ fn frame_caps_are_clamped_to_something_representable() {
         .max_payload_size(usize::MAX)
         .max_ext_header_size(usize::MAX);
     let decode = huge.connection_limits().decode_limits();
-    assert_eq!(decode.max_payload_size, msgtrans::DEFAULT_MAX_PAYLOAD_SIZE);
+    assert_eq!(
+        decode.max_payload_size,
+        ServerLimits::new()
+            .connection_limits()
+            .decode_limits()
+            .max_payload_size
+    );
     assert_eq!(
         decode.max_ext_header_size,
         u16::MAX as usize,
@@ -64,23 +70,24 @@ fn every_protocol_starts_from_the_same_caps() {
         server, client,
         "a client and server built from defaults must agree on what fits"
     );
-    assert_eq!(server.max_payload_size, msgtrans::DEFAULT_MAX_PAYLOAD_SIZE);
-}
-
-/// The documented default and the builder's fallback are the same value.
-#[test]
-fn the_documented_mailbox_default_is_the_real_default() {
-    assert_eq!(
-        ServerLimits::new().mailbox(),
-        msgtrans::DEFAULT_MAILBOX_CAPACITY
-    );
 }
 
 /// The mailbox is a fast-draining hop in FRONT of the outbound queue, so it
 /// must stay the smaller of the two: making it larger moves the backpressure
-/// point off the queue that was sized for it. This is knowable at compile
-/// time, so it fails the build rather than a test run.
-const _: () = assert!(msgtrans::DEFAULT_MAILBOX_CAPACITY < msgtrans::DEFAULT_OUTBOUND_CAPACITY);
+/// point off the queue that was sized for it. `ServerLimits::default()` is the
+/// value the builder actually uses, so reading it here also pins the defect
+/// where the documented default and the builder's fallback were two different
+/// numbers.
+#[test]
+fn the_mailbox_default_stays_in_front_of_the_outbound_queue() {
+    let limits = ServerLimits::new();
+    assert!(
+        limits.mailbox() < limits.connection_limits().outbound_capacity(),
+        "mailbox {} must stay smaller than the outbound queue {}",
+        limits.mailbox(),
+        limits.connection_limits().outbound_capacity()
+    );
+}
 
 /// The defect, over a real socket: a 2 MiB message.
 ///
@@ -151,6 +158,95 @@ async fn a_payload_over_the_old_tcp_cap_survives_a_real_tcp_connection() {
         .expect("the server must receive it instead of closing the connection");
 
     assert_eq!(*seen.lock().unwrap(), Some(SIZE));
+
+    let _ = client.shutdown().await;
+    let _ = server.shutdown_with_timeout(Duration::from_secs(5)).await;
+    serving.abort();
+}
+
+/// The WebSocket defect, over a real socket: a frame at msgtrans's own limit.
+///
+/// tungstenite carried its own `max_frame_size` (16 MiB) on the WebSocket
+/// config, independent of what msgtrans enforced. The default msgtrans frame is
+/// `16 B header + ext + 16 MiB payload`, i.e. LARGER than that cap, so a frame
+/// msgtrans considered legal was rejected by the layer underneath before
+/// msgtrans ever saw it. tungstenite's caps are now derived from the same
+/// `DecodeLimits`, so the two cannot disagree.
+///
+/// This uses the DEFAULT caps deliberately. Lowering them first would prove
+/// nothing: a 4 MiB frame passed under the old code too, because tungstenite's
+/// independent 16 MiB cap was above it. The two layers only disagree at the
+/// default boundary — a payload at msgtrans's own `max_payload_size` makes a
+/// frame 16 bytes LARGER than tungstenite's old cap, which is exactly the
+/// frame the old code dropped.
+#[cfg(feature = "websocket")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_frame_at_the_configured_cap_survives_a_real_websocket_connection() {
+    use async_trait::async_trait;
+    use msgtrans::{
+        Packet, Responder, SessionHandler, SessionId, SessionSender, TransportClientBuilder,
+        TransportServerBuilder, WebSocketClientConfig, WebSocketServerConfig,
+    };
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::sync::Notify;
+
+    // msgtrans's default max payload. The resulting frame is header + this,
+    // i.e. strictly larger than the 16 MiB tungstenite used to allow.
+    let cap = ServerLimits::new()
+        .connection_limits()
+        .decode_limits()
+        .max_payload_size;
+
+    struct Capture {
+        seen: Arc<Mutex<Option<usize>>>,
+        ready: Arc<Notify>,
+    }
+    #[async_trait]
+    impl SessionHandler for Capture {
+        async fn on_message(&self, _s: SessionId, packet: Packet, _tx: SessionSender) {
+            *self.seen.lock().unwrap() = Some(packet.payload().len());
+            self.ready.notify_waiters();
+        }
+        async fn on_request(&self, _s: SessionId, _p: Packet, _r: Responder) {}
+    }
+
+    let addr = "127.0.0.1:28991";
+    let seen = Arc::new(Mutex::new(None));
+    let ready = Arc::new(Notify::new());
+    let server = TransportServerBuilder::new()
+        .protocol(WebSocketServerConfig::new(addr).expect("server cfg"))
+        .build(Arc::new(Capture {
+            seen: seen.clone(),
+            ready: ready.clone(),
+        }))
+        .await
+        .expect("server builds");
+    let serving = {
+        let server = server.clone();
+        tokio::spawn(async move {
+            let _ = server.serve().await;
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut client = TransportClientBuilder::new()
+        .protocol(WebSocketClientConfig::new(&format!("ws://{addr}/")).expect("client cfg"))
+        .build()
+        .await
+        .expect("client builds");
+    client.connect().await.expect("connect");
+
+    let notified = ready.notified();
+    client
+        .send(&vec![b'w'; cap][..])
+        .await
+        .expect("a payload at the configured cap must be writable");
+    tokio::time::timeout(Duration::from_secs(20), notified)
+        .await
+        .expect("tungstenite must not reject a frame msgtrans considers legal");
+
+    assert_eq!(*seen.lock().unwrap(), Some(cap));
 
     let _ = client.shutdown().await;
     let _ = server.shutdown_with_timeout(Duration::from_secs(5)).await;

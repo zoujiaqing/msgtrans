@@ -180,11 +180,15 @@ construction path:
   numbers). It stays deliberately smaller than the outbound-queue capacity: the
   mailbox is a fast-draining hop in front of that queue, which is where
   backpressure belongs.
-- **The client's event queue** takes the configured pipe capacity instead of an
-  independent, untunable constant.
-- **Request lifecycle residency** (how long an unanswered request stays
-  tracked, distinct from `RequestOptions::timeout`) has one definition instead
-  of four copies in four files.
+- **Both client event hops** take the configured pipe capacity instead of an
+  independent, untunable constant. The inner one was still a fixed 8192 after
+  the outer one was wired, so a small pipe did not actually backpressure the
+  adapter.
+- **Request lifecycle residency** — how long an unanswered INBOUND request
+  stays tracked — has one definition instead of copies in several files.
+  Outbound waiters are a different policy: they are not in the timeout wheel
+  (the caller's own timeout is the deadline), so they record the caller's real
+  `RequestOptions::timeout` rather than claiming the inbound constant.
 
 ## 9. Wire format
 

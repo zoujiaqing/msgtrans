@@ -149,17 +149,23 @@ async fn ws_path_is_validated_and_subprotocol_is_negotiated() {
     let _ = server.shutdown_with_timeout(Duration::from_secs(5)).await;
 }
 
-/// The server's max_message_size is enforced by the protocol layer: a message
-/// over the cap kills the connection instead of being delivered.
+/// The configured size cap is enforced by the protocol layer: a message over
+/// the cap kills the connection instead of being delivered.
+///
+/// The cap now comes from `ServerLimits` — WebSocket no longer carries its own
+/// `max_frame_size`/`max_message_size`. Both caps are set here so the resulting
+/// frame limit (header + ext + payload) is tiny, which puts the rejection in
+/// tungstenite itself rather than in msgtrans's decoder one layer up: that is
+/// what proves `ServerLimits` really reached the protocol layer.
 #[tokio::test(flavor = "multi_thread")]
 async fn ws_message_size_cap_is_enforced() {
     let addr = "127.0.0.1:29014";
     let server = TransportServerBuilder::new()
-        .protocol(
-            WebSocketServerConfig::new(addr)
-                .expect("cfg")
-                .max_message_size(1024)
-                .max_frame_size(1024),
+        .protocol(WebSocketServerConfig::new(addr).expect("cfg"))
+        .limits(
+            msgtrans::ServerLimits::new()
+                .max_payload_size(64)
+                .max_ext_header_size(0),
         )
         .build(Arc::new(Echo))
         .await
