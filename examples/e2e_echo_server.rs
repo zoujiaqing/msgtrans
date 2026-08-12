@@ -22,6 +22,11 @@ use msgtrans::{
 use std::{env, sync::Arc};
 
 const BIZ_DROP: u8 = 250;
+/// Echo COMPRESSED (zlib): the response/push carries a Zlib body, so the TS
+/// side can verify its inbound normalization against real Rust compression.
+/// Requires the `flate2` feature; without it the send fails loudly (which is
+/// itself the 2.0 contract) and the TS test will catch the missing feature.
+const BIZ_COMPRESS: u8 = 251;
 const DEFAULT_PORT: u16 = 18080;
 
 struct EchoHandler;
@@ -38,11 +43,13 @@ impl SessionHandler for EchoHandler {
 
         // Mirror OneWay back with same biz_type and payload. The transport
         // allocates the id — handlers cannot number packets themselves.
+        // biz 251 asks for a COMPRESSED echo (zlib interop test).
+        let mut options = msgtrans::SendOptions::new().biz_type(biz_type);
+        if biz_type == BIZ_COMPRESS {
+            options = options.compression(msgtrans::CompressionType::Zlib);
+        }
         let _ = sender
-            .send_data_with_options(
-                packet.into_payload(),
-                msgtrans::SendOptions::new().biz_type(biz_type),
-            )
+            .send_data_with_options(packet.into_payload(), options)
             .await;
     }
 
@@ -50,6 +57,17 @@ impl SessionHandler for EchoHandler {
         if request.biz_type() == BIZ_DROP {
             // Silent drop: the untouched responder leaves the request to the
             // lifecycle machinery (timeout), as the TS tests expect.
+            return;
+        }
+        if request.biz_type() == BIZ_COMPRESS {
+            // Compressed RESPONSE via respond_with_options: the zlib interop
+            // chain the TS suite verifies end-to-end.
+            let _ = responder
+                .respond_with_options(
+                    request.into_payload(),
+                    msgtrans::SendOptions::new().compression(msgtrans::CompressionType::Zlib),
+                )
+                .await;
             return;
         }
         let _ = responder.respond(request.into_payload()).await;
