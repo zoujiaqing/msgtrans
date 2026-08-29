@@ -45,6 +45,11 @@ pub(crate) mod adapters;
 /// Exposed so hosts can fail fast on bad TLS material before binding a listener.
 #[cfg(feature = "quic")]
 pub use adapters::quic::validate_server_tls_material;
+
+/// SPKI pinning: the verifier shared by the TLS/TCP and QUIC clients, and the
+/// helper that derives a pin from a certificate.
+#[cfg(any(feature = "tcp-tls", feature = "quic"))]
+pub use adapters::tls_common::{spki_sha256_base64, PinnedSpkiVerification};
 pub(crate) mod command;
 pub(crate) mod connection;
 pub(crate) mod error;

@@ -302,7 +302,7 @@ impl OptimizedReadBuffer {
     /// Read more data from stream to buffer
     async fn fill_from_stream(
         &mut self,
-        read_half: &mut tokio::net::tcp::OwnedReadHalf,
+        read_half: &mut tokio::io::ReadHalf<MaybeTlsStream>,
     ) -> Result<usize, TcpError> {
         // Ensure buffer has enough space
         if self.buffer.capacity() - self.buffer.len() < 4096 {
@@ -316,6 +316,119 @@ impl OptimizedReadBuffer {
             .map_err(TcpError::Io)?;
 
         Ok(bytes_read)
+    }
+}
+
+/// The byte stream a TCP connection actually runs on.
+///
+/// PrivChat requires `tcp://` to be TLS from the first byte, but msgtrans is a
+/// general library, so both shapes exist here and the choice is made by config.
+/// Wrapping them in one enum rather than making the adapter generic keeps the
+/// event loop and the parser untouched.
+pub enum MaybeTlsStream {
+    Plain(TcpStream),
+    #[cfg(feature = "tcp-tls")]
+    ServerTls(Box<tokio_rustls::server::TlsStream<TcpStream>>),
+    #[cfg(feature = "tcp-tls")]
+    ClientTls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+}
+
+impl std::fmt::Debug for MaybeTlsStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 只报形态，不碰流内容。
+        f.write_str(if self.is_tls() {
+            "MaybeTlsStream::Tls"
+        } else {
+            "MaybeTlsStream::Plain"
+        })
+    }
+}
+
+impl MaybeTlsStream {
+    fn tcp(&self) -> &TcpStream {
+        match self {
+            Self::Plain(s) => s,
+            #[cfg(feature = "tcp-tls")]
+            Self::ServerTls(s) => s.get_ref().0,
+            #[cfg(feature = "tcp-tls")]
+            Self::ClientTls(s) => s.get_ref().0,
+        }
+    }
+
+    pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        self.tcp().local_addr()
+    }
+
+    pub fn peer_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        self.tcp().peer_addr()
+    }
+
+    pub fn set_nodelay(&self, nodelay: bool) -> std::io::Result<()> {
+        self.tcp().set_nodelay(nodelay)
+    }
+
+    /// True when the connection is TLS-protected. Used to refuse a plaintext
+    /// connection where the deployment requires TLS.
+    pub fn is_tls(&self) -> bool {
+        !matches!(self, Self::Plain(_))
+    }
+}
+
+impl tokio::io::AsyncRead for MaybeTlsStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            #[cfg(feature = "tcp-tls")]
+            Self::ServerTls(s) => std::pin::Pin::new(s.as_mut()).poll_read(cx, buf),
+            #[cfg(feature = "tcp-tls")]
+            Self::ClientTls(s) => std::pin::Pin::new(s.as_mut()).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for MaybeTlsStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            #[cfg(feature = "tcp-tls")]
+            Self::ServerTls(s) => std::pin::Pin::new(s.as_mut()).poll_write(cx, buf),
+            #[cfg(feature = "tcp-tls")]
+            Self::ClientTls(s) => std::pin::Pin::new(s.as_mut()).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => std::pin::Pin::new(s).poll_flush(cx),
+            #[cfg(feature = "tcp-tls")]
+            Self::ServerTls(s) => std::pin::Pin::new(s.as_mut()).poll_flush(cx),
+            #[cfg(feature = "tcp-tls")]
+            Self::ClientTls(s) => std::pin::Pin::new(s.as_mut()).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            #[cfg(feature = "tcp-tls")]
+            Self::ServerTls(s) => std::pin::Pin::new(s.as_mut()).poll_shutdown(cx),
+            #[cfg(feature = "tcp-tls")]
+            Self::ClientTls(s) => std::pin::Pin::new(s.as_mut()).poll_shutdown(cx),
+        }
     }
 }
 
@@ -344,7 +457,7 @@ pub struct TcpAdapter<C> {
 
 impl<C> TcpAdapter<C> {
     pub async fn new(
-        stream: TcpStream,
+        stream: MaybeTlsStream,
         config: C,
         nodelay: bool,
         limits: crate::transport::limits::ConnectionLimits,
@@ -414,7 +527,7 @@ impl<C> TcpAdapter<C> {
 
     #[allow(clippy::too_many_arguments)]
     async fn start_event_loop(
-        stream: TcpStream,
+        stream: MaybeTlsStream,
         state: crate::adapters::core::ConnState,
         mut send_queue: mpsc::Receiver<crate::adapters::outbound::Outbound>,
         mut shutdown_signal: mpsc::UnboundedReceiver<()>,
@@ -432,7 +545,7 @@ impl<C> TcpAdapter<C> {
                 current_session_id
             );
 
-            let (mut read_half, mut write_half) = stream.into_split();
+            let (mut read_half, mut write_half) = tokio::io::split(stream);
             let mut read_buffer =
                 OptimizedReadBuffer::new_with_pool(8192, memory_pool, decode_limits);
             // Any traffic in either direction counts as activity.
@@ -578,7 +691,7 @@ impl<C> TcpAdapter<C> {
 
     /// Write packet to stream (zero-copy optimized)
     async fn write_packet_to_stream(
-        write_half: &mut tokio::net::tcp::OwnedWriteHalf,
+        write_half: &mut tokio::io::WriteHalf<MaybeTlsStream>,
         packet: &Packet,
     ) -> Result<(), TcpError> {
         // Fallible encode: an unencodable packet (ext header > u16::MAX or
@@ -637,7 +750,62 @@ impl TcpAdapter<TcpClientConfig> {
         }
 
         let nodelay = config.nodelay;
+
+        // PrivChat 语义：配了 pin 就必须 TLS。连上后立即握手，不做 STARTTLS，
+        // 握手失败直接返回错误，绝不降级明文——否则攻击者只要让握手失败，
+        // 就能把连接压回明文，pinning 形同虚设。
+        #[cfg(feature = "tcp-tls")]
+        let stream = if config.is_tls_enabled() {
+            Self::client_tls_handshake(stream, &config).await?
+        } else {
+            MaybeTlsStream::Plain(stream)
+        };
+        #[cfg(not(feature = "tcp-tls"))]
+        let stream = MaybeTlsStream::Plain(stream);
+
         Self::new(stream, config, nodelay, limits).await
+    }
+}
+
+#[cfg(feature = "tcp-tls")]
+impl TcpAdapter<TcpClientConfig> {
+    /// 用 SPKI pinning 校验器完成客户端 TLS 握手。
+    ///
+    /// 校验器同时校验握手签名：只比对 SPKI 只能证明"证书里有这个公钥"，
+    /// 证明不了对方持有私钥——公开证书谁都能复制。
+    async fn client_tls_handshake(
+        stream: TcpStream,
+        config: &TcpClientConfig,
+    ) -> Result<MaybeTlsStream, TcpError> {
+        use crate::adapters::tls_common::PinnedSpkiVerification;
+
+        let verifier = PinnedSpkiVerification::new(config.spki_pins.clone())
+            .map_err(|e| TcpError::Config(format!("invalid SPKI pins: {e}")))?;
+
+        let tls_config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| TcpError::Config(format!("TLS versions: {e}")))?
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(verifier))
+        .with_no_client_auth();
+
+        // 裸 IP 部署下 SNI 只是形式：pinning 认公钥不认名字。
+        let name = config
+            .server_name
+            .clone()
+            .unwrap_or_else(|| config.target_address.ip().to_string());
+        let server_name = rustls::pki_types::ServerName::try_from(name.clone())
+            .map_err(|e| TcpError::Config(format!("invalid server name {name:?}: {e}")))?
+            .to_owned();
+
+        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(tls_config));
+        let tls = connector.connect(server_name, stream).await.map_err(|e| {
+            TcpError::Config(format!("TLS handshake failed (no plaintext fallback): {e}"))
+        })?;
+        tracing::debug!("[TLS] client handshake complete, SPKI pin verified");
+        Ok(MaybeTlsStream::ClientTls(Box::new(tls)))
     }
 }
 
@@ -747,10 +915,77 @@ impl TcpServerBuilder {
             listener.local_addr()?
         );
 
+        // TLS acceptor 只在启动时构建一次。此前每个连接都重新解析 PEM 并重建
+        // rustls 配置——那是一条免费的 CPU 放大攻击路径。
+        let local_addr = listener.local_addr()?;
+
+        #[cfg(feature = "tcp-tls")]
+        if self.config.is_tls_enabled() {
+            let acceptor = build_tls_acceptor(&self.config)?;
+            let (tx, rx) = tokio::sync::mpsc::channel(MAX_PENDING_HANDSHAKES);
+            let permits =
+                std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_HANDSHAKES));
+            let keepalive = self.config.keepalive;
+            let pump = tokio::spawn(async move {
+                loop {
+                    let (stream, peer_addr) = match listener.accept().await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!("[TLS] accept failed: {e}");
+                            continue;
+                        }
+                    };
+                    if let Some(ka) = keepalive {
+                        apply_tcp_keepalive(&stream, ka);
+                    }
+                    // Bounded: a flood of peers that open sockets and never
+                    // speak cannot exhaust tasks or memory.
+                    let Ok(permit) = permits.clone().try_acquire_owned() else {
+                        tracing::warn!("[TLS] too many pending handshakes, dropping {peer_addr}");
+                        continue;
+                    };
+                    let acceptor = acceptor.clone();
+                    let tx = tx.clone();
+                    // Handshakes run concurrently: a slow or silent peer must
+                    // not stall connections behind it.
+                    tokio::spawn(async move {
+                        let result =
+                            tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream))
+                                .await;
+                        drop(permit);
+                        match result {
+                            Ok(Ok(tls)) => {
+                                let _ = tx
+                                    .send((MaybeTlsStream::ServerTls(Box::new(tls)), peer_addr))
+                                    .await;
+                            }
+                            Ok(Err(e)) => {
+                                tracing::debug!("[TLS] handshake failed from {peer_addr}: {e}")
+                            }
+                            Err(_) => tracing::debug!("[TLS] handshake timed out from {peer_addr}"),
+                        }
+                    });
+                }
+            });
+            return Ok(TcpServer {
+                listener: None,
+                config: self.config,
+                limits: self.limits,
+                local_addr,
+                incoming: Some(rx),
+                pump: Some(pump),
+            });
+        }
+
         Ok(TcpServer {
             listener: Some(listener),
             config: self.config,
             limits: self.limits,
+            local_addr,
+            #[cfg(feature = "tcp-tls")]
+            incoming: None,
+            #[cfg(feature = "tcp-tls")]
+            pump: None,
         })
     }
 }
@@ -766,10 +1001,84 @@ pub(crate) struct TcpServer {
     listener: Option<TcpListener>,
     config: TcpServerConfig,
     limits: crate::transport::limits::ConnectionLimits,
+    /// Bound address, captured at build time so it survives the listener being
+    /// moved into the background accept pump.
+    local_addr: std::net::SocketAddr,
+    /// Completed TLS handshakes. `None` when the listener runs in plain mode.
+    #[cfg(feature = "tcp-tls")]
+    incoming: Option<tokio::sync::mpsc::Receiver<(MaybeTlsStream, std::net::SocketAddr)>>,
+    /// Handle to the background pump, aborted on shutdown.
+    #[cfg(feature = "tcp-tls")]
+    pump: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// Upper bound on concurrently pending TLS handshakes.
+#[cfg(feature = "tcp-tls")]
+const MAX_PENDING_HANDSHAKES: usize = 256;
+
+/// A TLS handshake that has not completed within this window is abandoned.
+/// Without it a peer that opens a socket and never speaks holds a slot forever.
+#[cfg(feature = "tcp-tls")]
+const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Build the shared TLS acceptor from the configured long-lived certificate.
+/// The certificate and key come from the gateway-level TLS identity, the same
+/// one QUIC presents, so a client pins a single SPKI for both transports.
+#[cfg(feature = "tcp-tls")]
+fn build_tls_acceptor(config: &TcpServerConfig) -> Result<tokio_rustls::TlsAcceptor, TcpError> {
+    let cert_pem = config
+        .cert_pem
+        .as_deref()
+        .ok_or_else(|| TcpError::Config("TLS enabled without a certificate".into()))?;
+    let key_pem = config
+        .key_pem
+        .as_deref()
+        .ok_or_else(|| TcpError::Config("TLS enabled without a private key".into()))?;
+
+    let key = rustls_pemfile::private_key(&mut std::io::Cursor::new(key_pem.as_bytes()))
+        .map_err(|e| TcpError::Config(format!("failed to parse private key: {e}")))?
+        .ok_or_else(|| TcpError::Config("no private key found in PEM data".into()))?;
+    let certs = rustls_pemfile::certs(&mut std::io::Cursor::new(cert_pem.as_bytes()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| TcpError::Config(format!("failed to parse certificates: {e}")))?;
+    if certs.is_empty() {
+        return Err(TcpError::Config("no certificates found in PEM data".into()));
+    }
+
+    let tls_config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|e| TcpError::Config(format!("TLS versions: {e}")))?
+    .with_no_client_auth()
+    .with_single_cert(certs, key)
+    .map_err(|e| TcpError::Config(format!("TLS configuration error: {e}")))?;
+
+    Ok(tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(
+        tls_config,
+    )))
 }
 
 impl TcpServer {
     pub(crate) async fn accept(&mut self) -> Result<TcpAdapter<TcpServerConfig>, TcpError> {
+        // TLS mode: the pump already accepted the socket and finished the
+        // handshake, so nothing here can be stalled by a slow peer.
+        #[cfg(feature = "tcp-tls")]
+        if let Some(rx) = self.incoming.as_mut() {
+            let (stream, peer_addr) = rx
+                .recv()
+                .await
+                .ok_or_else(|| TcpError::Config("TCP server is shut down".to_string()))?;
+            tracing::debug!("[CONNECT] TCP+TLS new connection from: {}", peer_addr);
+            return TcpAdapter::new(
+                stream,
+                self.config.clone(),
+                self.config.nodelay,
+                self.limits,
+            )
+            .await;
+        }
+
         let listener = self
             .listener
             .as_mut()
@@ -782,6 +1091,8 @@ impl TcpServer {
             apply_tcp_keepalive(&stream, keepalive);
         }
 
+        let stream = MaybeTlsStream::Plain(stream);
+
         TcpAdapter::new(
             stream,
             self.config.clone(),
@@ -792,16 +1103,19 @@ impl TcpServer {
     }
 
     pub(crate) fn local_addr(&self) -> Result<std::net::SocketAddr, TcpError> {
-        let listener = self
-            .listener
-            .as_ref()
-            .ok_or_else(|| TcpError::Config("TCP server is shut down".to_string()))?;
-        Ok(listener.local_addr()?)
+        Ok(self.local_addr)
     }
 
     pub(crate) async fn shutdown(&mut self) -> Result<(), TcpError> {
         // Explicitly drop listener to release port without waiting for task drop.
         self.listener.take();
+        #[cfg(feature = "tcp-tls")]
+        {
+            self.incoming.take();
+            if let Some(pump) = self.pump.take() {
+                pump.abort();
+            }
+        }
         Ok(())
     }
 }
@@ -965,5 +1279,178 @@ mod strict_stream_tests {
                 "strict={strict}: oversized payload must be refused from the header"
             );
         }
+    }
+}
+
+#[cfg(all(test, feature = "tcp-tls"))]
+mod tcp_tls_tests {
+    use super::*;
+    use crate::adapters::tls_common::spki_sha256_base64;
+
+    fn cert_pair() -> (String, String, String) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let pin = spki_sha256_base64(cert.der()).unwrap();
+        (cert.pem(), key.serialize_pem(), pin)
+    }
+
+    /// 起一个真实的 TcpServer（走后台握手泵），返回监听地址。
+    async fn spawn_tls_server(cert: String, key: String) -> std::net::SocketAddr {
+        let cfg = TcpServerConfig::new("127.0.0.1:0")
+            .unwrap()
+            .cert_pem(cert)
+            .key_pem(key);
+        let mut server = TcpServerBuilder::new().config(cfg).build().await.unwrap();
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                if server.accept().await.is_err() {
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+        addr
+    }
+
+    async fn client_connect(
+        addr: std::net::SocketAddr,
+        pins: Vec<String>,
+    ) -> Result<MaybeTlsStream, TcpError> {
+        let cfg = TcpClientConfig::new(&addr.to_string())
+            .unwrap()
+            .spki_pins(pins)
+            .server_name("localhost");
+        let stream = TcpStream::connect(addr).await.unwrap();
+        TcpAdapter::<TcpClientConfig>::client_tls_handshake(stream, &cfg).await
+    }
+
+    #[tokio::test]
+    async fn matching_pin_completes_the_handshake() {
+        let (cert, key, pin) = cert_pair();
+        let addr = spawn_tls_server(cert, key).await;
+        let stream = client_connect(addr, vec![pin]).await.expect("handshake");
+        assert!(stream.is_tls(), "connection must be TLS-protected");
+    }
+
+    /// 错误 pin 必须拒绝——这是 pinning 的全部意义。
+    #[tokio::test]
+    async fn wrong_pin_is_refused() {
+        let (cert, key, _) = cert_pair();
+        let (_, _, other_pin) = cert_pair();
+        let addr = spawn_tls_server(cert, key).await;
+        let err = client_connect(addr, vec![other_pin])
+            .await
+            .expect_err("wrong pin must fail");
+        assert!(
+            format!("{err:?}").contains("TLS handshake failed"),
+            "{err:?}"
+        );
+    }
+
+    /// 轮换：客户端同时带 current + next，两把服务端密钥都能连上。
+    #[tokio::test]
+    async fn either_pin_works_during_rotation() {
+        let (cert_a, key_a, pin_a) = cert_pair();
+        let (cert_b, key_b, pin_b) = cert_pair();
+        let pins = vec![pin_a, pin_b];
+        for (cert, key) in [(cert_a, key_a), (cert_b, key_b)] {
+            let addr = spawn_tls_server(cert, key).await;
+            assert!(client_connect(addr, pins.clone()).await.is_ok());
+        }
+    }
+
+    /// 明文服务端不得被 TLS 客户端接受：攻击者丢弃 UDP 迫使回落 TCP 后，
+    /// 若还能接上明文，QUIC 侧的 pinning 就被绕过了。
+    #[tokio::test]
+    async fn plaintext_server_is_refused_by_a_pinned_client() {
+        let (_, _, pin) = cert_pair();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // 接受连接但从不进行 TLS 握手
+            while let Ok((stream, _)) = listener.accept().await {
+                std::mem::forget(stream);
+            }
+        });
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            client_connect(addr, vec![pin]),
+        )
+        .await;
+        match result {
+            Ok(r) => assert!(r.is_err(), "plaintext peer must not be accepted"),
+            Err(_) => { /* 握手挂起也算拒绝：没有明文数据被交换 */ }
+        }
+    }
+
+    /// 空 pin 列表是配置错误，不能静默变成"接受一切"。
+    #[tokio::test]
+    async fn empty_pin_list_is_a_config_error() {
+        let (cert, key, _) = cert_pair();
+        let addr = spawn_tls_server(cert, key).await;
+        let err = client_connect(addr, vec![]).await.expect_err("must fail");
+        assert!(format!("{err:?}").contains("invalid SPKI pins"), "{err:?}");
+    }
+}
+
+#[cfg(all(test, feature = "tcp-tls"))]
+mod tcp_tls_dos_tests {
+    use super::*;
+    use crate::adapters::tls_common::spki_sha256_base64;
+
+    fn cert_pair() -> (String, String, String) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let pin = spki_sha256_base64(cert.der()).unwrap();
+        (cert.pem(), key.serialize_pem(), pin)
+    }
+
+    /// 一个连上就沉默的对端不得拖住后面的连接。
+    /// 握手在 accept 路径之外并发进行，所以正常客户端应当立刻连上。
+    #[tokio::test]
+    async fn a_silent_peer_does_not_stall_healthy_connections() {
+        let (cert, key, pin) = cert_pair();
+        let cfg = TcpServerConfig::new("127.0.0.1:0")
+            .unwrap()
+            .cert_pem(cert)
+            .key_pem(key);
+        let mut server = TcpServerBuilder::new().config(cfg).build().await.unwrap();
+        let addr = server.local_addr().unwrap();
+
+        // 打开若干沉默连接：只建 TCP，不发任何 TLS 字节
+        let mut silent = Vec::new();
+        for _ in 0..8 {
+            silent.push(TcpStream::connect(addr).await.unwrap());
+        }
+
+        // 正常客户端必须仍能迅速完成握手
+        let client = tokio::spawn(async move {
+            let cfg = TcpClientConfig::new(&addr.to_string())
+                .unwrap()
+                .spki_pins(vec![pin])
+                .server_name("localhost");
+            let s = TcpStream::connect(addr).await.unwrap();
+            TcpAdapter::<TcpClientConfig>::client_tls_handshake(s, &cfg).await
+        });
+
+        let accepted = tokio::time::timeout(std::time::Duration::from_secs(5), server.accept())
+            .await
+            .expect("healthy connection must not be blocked by silent peers");
+        assert!(accepted.is_ok());
+        assert!(client.await.unwrap().is_ok());
+        drop(silent);
+    }
+
+    /// 握手超时必须回收槽位，而不是永久占用。
+    #[test]
+    fn handshake_timeout_is_bounded() {
+        assert!(TLS_HANDSHAKE_TIMEOUT <= std::time::Duration::from_secs(30));
+        assert!(MAX_PENDING_HANDSHAKES > 0);
     }
 }

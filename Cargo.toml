@@ -11,10 +11,13 @@ keywords = ["tcp", "quic", "websocket", "tokio"]
 description = "Support for a variety of communication protocols such as TCP / QUIC / WebSocket, easy to create server and client network library."
 
 [features]
-default = ["tcp", "websocket", "quic"]
+default = ["tcp", "tcp-tls", "websocket", "quic"]
 tcp = []
+# PrivChat 语义下 tcp:// 必须带 TLS（见 GATEWAY_TRANSPORT_SPEC §1.1）。
+# 作为通用库这里仍是可选 feature，由使用方决定是否强制。
+tcp-tls = ["tcp", "dep:rustls", "dep:rustls-pemfile", "dep:tokio-rustls", "dep:webpki-roots", "dep:x509-parser", "dep:sha2"]
 websocket = ["dep:tokio-tungstenite", "dep:rustls", "dep:rustls-pemfile", "dep:webpki-roots"]
-quic = ["dep:quinn", "dep:rustls", "dep:rustls-pemfile", "dep:rcgen", "dep:webpki-roots"]
+quic = ["dep:quinn", "dep:rustls", "dep:rustls-pemfile", "dep:rcgen", "dep:webpki-roots", "dep:x509-parser", "dep:sha2"]
 
 [dependencies]
 # Core dependencies
@@ -38,6 +41,10 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-pemfile = { version = "2.0", optional = true }
 rcgen = { version = "0.14", optional = true }
 webpki-roots = { version = "1", optional = true }
+tokio-rustls = { version = "0.26", optional = true }
+# SPKI 提取：pinning 要比对 SubjectPublicKeyInfo 的 SHA-256，需要真正解析 X.509
+x509-parser = { version = "0.18", optional = true }
+sha2 = { version = "0.10", optional = true }
 
 # Optional compression support
 flate2 = { version = "1", optional = true }

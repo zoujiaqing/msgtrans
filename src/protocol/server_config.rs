@@ -10,11 +10,24 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 /// TCP server configuration
+///
+/// NOTE: `key_pem` holds a real private key. `Debug` is implemented manually to
+/// redact it, and it is excluded from `Serialize`. Do not add `#[derive(Debug)]`
+/// or re-enable serialization of the key.
 #[cfg(feature = "tcp")]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct TcpServerConfig {
     /// Bind address
     pub(crate) bind_address: std::net::SocketAddr,
+    /// TLS certificate chain (PEM). When set together with `key_pem`, accepted
+    /// connections perform a TLS handshake immediately; there is no STARTTLS
+    /// and no plaintext fallback.
+    #[cfg(feature = "tcp-tls")]
+    pub(crate) cert_pem: Option<String>,
+    /// TLS private key (PEM). See the note on the struct about redaction.
+    #[cfg(feature = "tcp-tls")]
+    #[serde(default, skip_serializing)]
+    pub(crate) key_pem: Option<String>,
     /// TCP_NODELAY option
     pub(crate) nodelay: bool,
     /// Keepalive time
@@ -25,11 +38,35 @@ pub struct TcpServerConfig {
     pub(crate) reuse_addr: bool,
 }
 
+/// Manual `Debug` so the private key can never reach a log line, a panic
+/// message, or a config dump.
+#[cfg(feature = "tcp")]
+impl std::fmt::Debug for TcpServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("TcpServerConfig");
+        d.field("bind_address", &self.bind_address);
+        #[cfg(feature = "tcp-tls")]
+        {
+            d.field("cert_pem", &self.cert_pem.as_ref().map(|_| "[present]"));
+            d.field("key_pem", &self.key_pem.as_ref().map(|_| "[REDACTED]"));
+        }
+        d.field("nodelay", &self.nodelay)
+            .field("keepalive", &self.keepalive)
+            .field("idle_timeout", &self.idle_timeout)
+            .field("reuse_addr", &self.reuse_addr)
+            .finish()
+    }
+}
+
 #[cfg(feature = "tcp")]
 impl Default for TcpServerConfig {
     fn default() -> Self {
         Self {
             bind_address: "127.0.0.1:8080".parse().unwrap(),
+            #[cfg(feature = "tcp-tls")]
+            cert_pem: None,
+            #[cfg(feature = "tcp-tls")]
+            key_pem: None,
             nodelay: true,
             keepalive: Some(Duration::from_secs(60)),
             idle_timeout: Some(Duration::from_secs(300)),
@@ -139,6 +176,26 @@ impl TcpServerConfig {
     pub fn reuse_addr(mut self, reuse: bool) -> Self {
         self.reuse_addr = reuse;
         self
+    }
+
+    /// Set the TLS certificate chain (PEM).
+    #[cfg(feature = "tcp-tls")]
+    pub fn cert_pem<S: Into<String>>(mut self, cert_pem: S) -> Self {
+        self.cert_pem = Some(cert_pem.into());
+        self
+    }
+
+    /// Set the TLS private key (PEM).
+    #[cfg(feature = "tcp-tls")]
+    pub fn key_pem<S: Into<String>>(mut self, key_pem: S) -> Self {
+        self.key_pem = Some(key_pem.into());
+        self
+    }
+
+    /// Whether this listener will negotiate TLS.
+    #[cfg(feature = "tcp-tls")]
+    pub fn is_tls_enabled(&self) -> bool {
+        self.cert_pem.is_some() && self.key_pem.is_some()
     }
 
     /// Build configuration

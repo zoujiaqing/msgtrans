@@ -24,6 +24,18 @@ pub struct TcpClientConfig {
     pub(crate) keepalive: Option<Duration>,
     /// 本地绑定地址（可选）
     pub(crate) local_bind_address: Option<std::net::SocketAddr>,
+    /// TLS：允许的服务端 SPKI pin（base64 SHA-256）。非空即启用 TLS。
+    ///
+    /// PrivChat 语义下 `tcp://` 必须带 TLS：连上后立即握手，不做 STARTTLS，
+    /// 握手失败直接断开，绝不降级明文（GATEWAY_TRANSPORT_SPEC §1.1）。
+    /// 支持多个 pin 是为了密钥轮换：客户端先发布同时接受 current+next，
+    /// 服务端再换密钥，旧 pin 到下一版才删。
+    #[cfg(feature = "tcp-tls")]
+    pub(crate) spki_pins: Vec<String>,
+    /// TLS SNI / 证书校验用的服务器名。裸 IP 部署时填 IP 字面量即可——
+    /// pinning 认的是公钥，不是名字。
+    #[cfg(feature = "tcp-tls")]
+    pub(crate) server_name: Option<String>,
 }
 
 #[cfg(feature = "tcp")]
@@ -35,6 +47,10 @@ impl Default for TcpClientConfig {
             nodelay: true,
             keepalive: Some(Duration::from_secs(60)),
             local_bind_address: None,
+            #[cfg(feature = "tcp-tls")]
+            spki_pins: Vec::new(),
+            #[cfg(feature = "tcp-tls")]
+            server_name: None,
         }
     }
 }
@@ -106,6 +122,26 @@ impl TcpClientConfig {
     pub fn local_bind_address(mut self, addr: Option<std::net::SocketAddr>) -> Self {
         self.local_bind_address = addr;
         self
+    }
+
+    /// 启用 TLS 并设置允许的服务端 SPKI pin（base64 SHA-256）。
+    #[cfg(feature = "tcp-tls")]
+    pub fn spki_pins<I: IntoIterator<Item = String>>(mut self, pins: I) -> Self {
+        self.spki_pins = pins.into_iter().collect();
+        self
+    }
+
+    /// TLS SNI / 证书校验用的服务器名。
+    #[cfg(feature = "tcp-tls")]
+    pub fn server_name<S: Into<String>>(mut self, name: S) -> Self {
+        self.server_name = Some(name.into());
+        self
+    }
+
+    /// 是否启用 TLS（等价于配了 pin）。
+    #[cfg(feature = "tcp-tls")]
+    pub fn is_tls_enabled(&self) -> bool {
+        !self.spki_pins.is_empty()
     }
 
     /// 构建配置（验证并返回）
@@ -341,6 +377,11 @@ pub struct QuicClientConfig {
     /// 初始RTT估值
     pub(crate) initial_rtt: Duration,
     /// 本地绑定地址（可选）
+    /// TLS：允许的服务端 SPKI pin（base64 SHA-256）。非空时优先于
+    /// `verify_certificate` / `danger_skip_verification`：裸 IP + 自签证书
+    /// 场景下链校验必然失败，pinning 才是唯一能提供服务端身份的手段。
+    /// 与 TLS/TCP 共用同一组 pin。
+    pub(crate) spki_pins: Vec<String>,
     pub(crate) local_bind_address: Option<std::net::SocketAddr>,
 }
 
@@ -358,6 +399,7 @@ impl Default for QuicClientConfig {
             keep_alive_interval: Some(Duration::from_secs(15)),
             initial_rtt: Duration::from_millis(100),
             local_bind_address: None,
+            spki_pins: Vec::new(),
         }
     }
 }
@@ -458,6 +500,18 @@ impl QuicClientConfig {
     /// Explicitly disable certificate verification.
     ///
     /// This is intended for local development and self-signed test servers only.
+    /// 启用 SPKI pinning：设置后握手用固定公钥校验服务端身份，
+    /// 并且仍然校验握手签名（只比对公钥证明不了对方持有私钥）。
+    pub fn spki_pins<I: IntoIterator<Item = String>>(mut self, pins: I) -> Self {
+        self.spki_pins = pins.into_iter().collect();
+        self
+    }
+
+    /// 是否启用了 pinning。
+    pub fn is_pinned(&self) -> bool {
+        !self.spki_pins.is_empty()
+    }
+
     pub fn danger_skip_verification(mut self) -> Self {
         tracing::warn!(
             "[SECURITY] QUIC certificate verification disabled; use only for local testing"
