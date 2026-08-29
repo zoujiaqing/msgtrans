@@ -40,6 +40,11 @@
 pub mod readme_zh_cn_doctests {}
 
 pub(crate) mod adapters;
+
+/// Validate a server TLS certificate/key pair at startup (parse + key/cert match).
+/// Exposed so hosts can fail fast on bad TLS material before binding a listener.
+#[cfg(feature = "quic")]
+pub use adapters::quic::validate_server_tls_material;
 pub(crate) mod command;
 pub(crate) mod connection;
 pub(crate) mod error;

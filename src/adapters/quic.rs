@@ -311,6 +311,35 @@ fn configure_server_insecure_with_config(
     Ok((server_config, cert))
 }
 
+/// Validate a server TLS certificate/key pair without starting a server.
+///
+/// Callers use this at startup to fail fast on bad TLS material. It proves the
+/// certificate chain parses, the private key parses, and — via
+/// `with_single_cert` — that the key actually matches the certificate. A string
+/// check for `BEGIN CERTIFICATE` proves none of those things.
+#[cfg(feature = "quic")]
+pub fn validate_server_tls_material(cert_pem: &str, key_pem: &str) -> Result<(), QuicError> {
+    let key = rustls_pemfile::private_key(&mut std::io::Cursor::new(key_pem.as_bytes()))
+        .map_err(|e| QuicError::Config(format!("Failed to parse private key: {}", e)))?
+        .ok_or_else(|| QuicError::Config("No private key found in PEM data".to_string()))?;
+
+    let certs = rustls_pemfile::certs(&mut std::io::Cursor::new(cert_pem.as_bytes()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| QuicError::Config(format!("Failed to parse certificates: {}", e)))?;
+
+    if certs.is_empty() {
+        return Err(QuicError::Config(
+            "No certificates found in PEM data".to_string(),
+        ));
+    }
+
+    ring_server_builder()
+        .with_single_cert(certs, key)
+        .map_err(|e| QuicError::Config(format!("TLS configuration error: {}", e)))?;
+
+    Ok(())
+}
+
 /// Configure server with PEM certificate and key
 fn configure_server_with_pem(
     cert_pem: &str,

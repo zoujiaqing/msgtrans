@@ -303,14 +303,19 @@ impl WebSocketServerConfig {
 }
 
 /// QUIC server configuration
+///
+/// NOTE: `key_pem` holds a real private key. `Debug` is implemented manually to
+/// redact it, and it is excluded from `Serialize`. Do not add `#[derive(Debug)]`
+/// or re-enable serialization of the key.
 #[cfg(feature = "quic")]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct QuicServerConfig {
     /// Bind address
     pub(crate) bind_address: std::net::SocketAddr,
     /// TLS certificate PEM content (optional, if None, auto-generate self-signed certificate)
     pub(crate) cert_pem: Option<String>,
     /// TLS private key PEM content (optional, if None, auto-generate self-signed certificate)
+    #[serde(default, skip_serializing)]
     pub(crate) key_pem: Option<String>,
     /// Maximum concurrent streams
     pub(crate) max_concurrent_streams: u64,
@@ -324,6 +329,25 @@ pub struct QuicServerConfig {
     pub(crate) receive_window: u32,
     /// Send window size
     pub(crate) send_window: u32,
+}
+
+/// Manual `Debug` so the private key can never reach a log line, a panic
+/// message, or a config dump. Only whether a key is present is reported.
+#[cfg(feature = "quic")]
+impl std::fmt::Debug for QuicServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QuicServerConfig")
+            .field("bind_address", &self.bind_address)
+            .field("cert_pem", &self.cert_pem.as_ref().map(|_| "[present]"))
+            .field("key_pem", &self.key_pem.as_ref().map(|_| "[REDACTED]"))
+            .field("max_concurrent_streams", &self.max_concurrent_streams)
+            .field("max_idle_timeout", &self.max_idle_timeout)
+            .field("keep_alive_interval", &self.keep_alive_interval)
+            .field("initial_rtt", &self.initial_rtt)
+            .field("receive_window", &self.receive_window)
+            .field("send_window", &self.send_window)
+            .finish()
+    }
 }
 
 #[cfg(feature = "quic")]
@@ -566,5 +590,36 @@ mod merge_and_validate_tests {
         let client_zero = QuicClientConfig::default().max_concurrent_streams(0);
         assert!(client_zero.validate().is_err());
         assert!(QuicClientConfig::default().validate().is_ok());
+    }
+}
+
+#[cfg(all(test, feature = "quic"))]
+mod quic_key_redaction_tests {
+    use super::QuicServerConfig;
+
+    const KEY: &str = "-----BEGIN PRIVATE KEY-----\nSUPERSECRETKEYMATERIAL\n-----END PRIVATE KEY-----";
+
+    /// The private key must never reach a log line or panic message via `Debug`.
+    #[test]
+    fn debug_redacts_private_key() {
+        let cfg = QuicServerConfig::new("127.0.0.1:9001")
+            .expect("config")
+            .cert_pem("-----BEGIN CERTIFICATE-----\nX\n-----END CERTIFICATE-----")
+            .key_pem(KEY);
+        let rendered = format!("{cfg:?}");
+        assert!(!rendered.contains("SUPERSECRETKEYMATERIAL"));
+        assert!(!rendered.contains("BEGIN PRIVATE KEY"));
+        assert!(rendered.contains("[REDACTED]"));
+    }
+
+    /// The private key must not be serialized into any config dump.
+    #[test]
+    fn serialization_omits_private_key() {
+        let cfg = QuicServerConfig::new("127.0.0.1:9001")
+            .expect("config")
+            .key_pem(KEY);
+        let json = serde_json::to_string(&cfg).expect("serialize");
+        assert!(!json.contains("SUPERSECRETKEYMATERIAL"));
+        assert!(!json.contains("key_pem"));
     }
 }
