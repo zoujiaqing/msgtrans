@@ -952,18 +952,23 @@ impl TcpServerBuilder {
                         let result =
                             tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream))
                                 .await;
-                        drop(permit);
                         match result {
                             Ok(Ok(tls)) => {
-                                let _ = tx
-                                    .send((MaybeTlsStream::ServerTls(Box::new(tls)), peer_addr))
-                                    .await;
+                                // Shed completed handshakes when the bounded accept queue is full.
+                                if tx
+                                    .try_send((MaybeTlsStream::ServerTls(Box::new(tls)), peer_addr))
+                                    .is_err()
+                                {
+                                    tracing::warn!("[TLS] accept queue full, dropping {peer_addr}");
+                                }
                             }
                             Ok(Err(e)) => {
                                 tracing::debug!("[TLS] handshake failed from {peer_addr}: {e}")
                             }
                             Err(_) => tracing::debug!("[TLS] handshake timed out from {peer_addr}"),
                         }
+                        // Keep the permit until the connection is handed off or dropped.
+                        drop(permit);
                     });
                 }
             });
