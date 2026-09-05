@@ -336,7 +336,18 @@ fn configure_server_insecure_with_config(
 /// `with_single_cert` — that the key actually matches the certificate. A string
 /// check for `BEGIN CERTIFICATE` proves none of those things.
 #[cfg(feature = "quic")]
-pub fn validate_server_tls_material(cert_pem: &str, key_pem: &str) -> Result<(), QuicError> {
+pub fn validate_server_tls_material(
+    cert_pem: &str,
+    key_pem: &str,
+) -> Result<(), crate::TransportError> {
+    validate_server_tls_material_inner(cert_pem, key_pem).map_err(Into::into)
+}
+
+/// The QUIC-internal form. The public wrapper above converts to
+/// `TransportError`: `QuicError` lives in the `pub(crate)` adapters module, so
+/// a caller could never name it — an error type nobody can write down is not
+/// part of a public API.
+fn validate_server_tls_material_inner(cert_pem: &str, key_pem: &str) -> Result<(), QuicError> {
     let key = rustls_pemfile::private_key(&mut std::io::Cursor::new(key_pem.as_bytes()))
         .map_err(|e| QuicError::Config(format!("Failed to parse private key: {}", e)))?
         .ok_or_else(|| QuicError::Config("No private key found in PEM data".to_string()))?;
