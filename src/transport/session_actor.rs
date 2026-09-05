@@ -332,17 +332,23 @@ impl SessionHandle {
         self.tx.try_send(ActorMessage::InboundEvent(event)).is_ok()
     }
 
+    /// The error is BOXED: it carries the undelivered event back for
+    /// diagnostics, but that payload is large (>128 bytes) and this call sits
+    /// on the inbound event path — an unboxed `Err` would widen every `Result`
+    /// on the happy path to the size of the failure case.
     pub async fn send_event(
         &self,
         event: TransportEvent,
-    ) -> Result<(), tokio::sync::mpsc::error::SendError<TransportEvent>> {
+    ) -> Result<(), Box<tokio::sync::mpsc::error::SendError<TransportEvent>>> {
         self.tx
             .send_async(ActorMessage::InboundEvent(event))
             .await
             .map_err(|e| {
                 // Extract the TransportEvent from the ActorMessage for the error
                 match e.0 {
-                    ActorMessage::InboundEvent(evt) => tokio::sync::mpsc::error::SendError(evt),
+                    ActorMessage::InboundEvent(evt) => {
+                        Box::new(tokio::sync::mpsc::error::SendError(evt))
+                    }
                     _ => unreachable!(),
                 }
             })

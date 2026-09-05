@@ -654,7 +654,8 @@ mod merge_and_validate_tests {
 mod quic_key_redaction_tests {
     use super::QuicServerConfig;
 
-    const KEY: &str = "-----BEGIN PRIVATE KEY-----\nSUPERSECRETKEYMATERIAL\n-----END PRIVATE KEY-----";
+    const KEY: &str =
+        "-----BEGIN PRIVATE KEY-----\nSUPERSECRETKEYMATERIAL\n-----END PRIVATE KEY-----";
 
     /// The private key must never reach a log line or panic message via `Debug`.
     #[test]

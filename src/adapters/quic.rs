@@ -218,10 +218,9 @@ fn configure_client_with_config(config: &QuicClientConfig) -> Result<ClientConfi
     // identifies the server. It is shared with the TLS/TCP path so both
     // transports present the same identity to the client.
     let crypto = if config.is_pinned() {
-        let verifier = crate::adapters::tls_common::PinnedSpkiVerification::new(
-            config.spki_pins.clone(),
-        )
-        .map_err(|e| QuicError::Config(format!("invalid SPKI pins: {e}")))?;
+        let verifier =
+            crate::adapters::tls_common::PinnedSpkiVerification::new(config.spki_pins.clone())
+                .map_err(|e| QuicError::Config(format!("invalid SPKI pins: {e}")))?;
         tracing::debug!(
             "[SECURITY] QUIC client pinning {} server SPKI value(s)",
             config.spki_pins.len()

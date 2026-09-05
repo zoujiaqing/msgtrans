@@ -923,8 +923,7 @@ impl TcpServerBuilder {
         if self.config.is_tls_enabled() {
             let acceptor = build_tls_acceptor(&self.config)?;
             let (tx, rx) = tokio::sync::mpsc::channel(MAX_PENDING_HANDSHAKES);
-            let permits =
-                std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_HANDSHAKES));
+            let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_HANDSHAKES));
             let keepalive = self.config.keepalive;
             let pump = tokio::spawn(async move {
                 loop {
@@ -1456,6 +1455,6 @@ mod tcp_tls_dos_tests {
     #[test]
     fn handshake_timeout_is_bounded() {
         assert!(TLS_HANDSHAKE_TIMEOUT <= std::time::Duration::from_secs(30));
-        assert!(MAX_PENDING_HANDSHAKES > 0);
+        const { assert!(MAX_PENDING_HANDSHAKES > 0) };
     }
 }

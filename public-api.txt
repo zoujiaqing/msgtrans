@@ -880,6 +880,24 @@ impl core::marker::Unpin for msgtrans::Packet
 impl core::marker::UnsafeUnpin for msgtrans::Packet
 impl core::panic::unwind_safe::RefUnwindSafe for msgtrans::Packet
 impl core::panic::unwind_safe::UnwindSafe for msgtrans::Packet
+pub struct msgtrans::PinnedSpkiVerification
+impl msgtrans::PinnedSpkiVerification
+pub fn msgtrans::PinnedSpkiVerification::new(alloc::vec::Vec<alloc::string::String>) -> core::result::Result<Self, alloc::string::String>
+pub fn msgtrans::PinnedSpkiVerification::pins(&self) -> &[alloc::string::String]
+impl core::fmt::Debug for msgtrans::PinnedSpkiVerification
+pub fn msgtrans::PinnedSpkiVerification::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl rustls::verify::ServerCertVerifier for msgtrans::PinnedSpkiVerification
+pub fn msgtrans::PinnedSpkiVerification::supported_verify_schemes(&self) -> alloc::vec::Vec<rustls::enums::SignatureScheme>
+pub fn msgtrans::PinnedSpkiVerification::verify_server_cert(&self, &rustls_pki_types::CertificateDer<'_>, &[rustls_pki_types::CertificateDer<'_>], &rustls_pki_types::server_name::ServerName<'_>, &[u8], rustls_pki_types::UnixTime) -> core::result::Result<rustls::verify::ServerCertVerified, rustls::error::Error>
+pub fn msgtrans::PinnedSpkiVerification::verify_tls12_signature(&self, &[u8], &rustls_pki_types::CertificateDer<'_>, &rustls::verify::DigitallySignedStruct) -> core::result::Result<rustls::verify::HandshakeSignatureValid, rustls::error::Error>
+pub fn msgtrans::PinnedSpkiVerification::verify_tls13_signature(&self, &[u8], &rustls_pki_types::CertificateDer<'_>, &rustls::verify::DigitallySignedStruct) -> core::result::Result<rustls::verify::HandshakeSignatureValid, rustls::error::Error>
+impl core::marker::Freeze for msgtrans::PinnedSpkiVerification
+impl core::marker::Send for msgtrans::PinnedSpkiVerification
+impl core::marker::Sync for msgtrans::PinnedSpkiVerification
+impl core::marker::Unpin for msgtrans::PinnedSpkiVerification
+impl core::marker::UnsafeUnpin for msgtrans::PinnedSpkiVerification
+impl !core::panic::unwind_safe::RefUnwindSafe for msgtrans::PinnedSpkiVerification
+impl !core::panic::unwind_safe::UnwindSafe for msgtrans::PinnedSpkiVerification
 pub struct msgtrans::QuicClientConfig
 impl msgtrans::QuicClientConfig
 pub fn msgtrans::QuicClientConfig::build(self) -> core::result::Result<Self, msgtrans::spi::ConfigError>
@@ -890,6 +908,7 @@ pub fn msgtrans::QuicClientConfig::default_config() -> Self
 pub fn msgtrans::QuicClientConfig::high_performance(&str) -> core::result::Result<Self, msgtrans::spi::ConfigError>
 pub fn msgtrans::QuicClientConfig::initial_rtt(self, core::time::Duration) -> Self
 pub fn msgtrans::QuicClientConfig::insecure(&str) -> core::result::Result<Self, msgtrans::spi::ConfigError>
+pub fn msgtrans::QuicClientConfig::is_pinned(&self) -> bool
 pub fn msgtrans::QuicClientConfig::keep_alive_interval(self, core::option::Option<core::time::Duration>) -> Self
 pub fn msgtrans::QuicClientConfig::local_bind_address(self, core::option::Option<core::net::socket_addr::SocketAddr>) -> Self
 pub fn msgtrans::QuicClientConfig::low_latency(&str) -> core::result::Result<Self, msgtrans::spi::ConfigError>
@@ -897,6 +916,7 @@ pub fn msgtrans::QuicClientConfig::max_concurrent_streams(self, u64) -> Self
 pub fn msgtrans::QuicClientConfig::max_idle_timeout(self, core::time::Duration) -> Self
 pub fn msgtrans::QuicClientConfig::new(&str) -> core::result::Result<Self, msgtrans::spi::ConfigError>
 pub fn msgtrans::QuicClientConfig::server_name<S: core::convert::Into<alloc::string::String>>(self, S) -> Self
+pub fn msgtrans::QuicClientConfig::spki_pins<I: core::iter::traits::collect::IntoIterator<Item = alloc::string::String>>(self, I) -> Self
 pub fn msgtrans::QuicClientConfig::target_address<A: core::convert::Into<core::net::socket_addr::SocketAddr>>(self, A) -> Self
 pub fn msgtrans::QuicClientConfig::target_str(self, &str) -> core::result::Result<Self, msgtrans::spi::ConfigError>
 pub fn msgtrans::QuicClientConfig::verify_certificate(self, bool) -> Self
@@ -1180,12 +1200,15 @@ pub fn msgtrans::TcpClientConfig::build(self) -> core::result::Result<Self, msgt
 pub fn msgtrans::TcpClientConfig::connect_timeout(self, core::time::Duration) -> Self
 pub fn msgtrans::TcpClientConfig::default_config() -> Self
 pub fn msgtrans::TcpClientConfig::high_performance(&str) -> core::result::Result<Self, msgtrans::spi::ConfigError>
+pub fn msgtrans::TcpClientConfig::is_tls_enabled(&self) -> bool
 pub fn msgtrans::TcpClientConfig::keepalive(self, core::option::Option<core::time::Duration>) -> Self
 pub fn msgtrans::TcpClientConfig::local_bind_address(self, core::option::Option<core::net::socket_addr::SocketAddr>) -> Self
 pub fn msgtrans::TcpClientConfig::low_latency(&str) -> core::result::Result<Self, msgtrans::spi::ConfigError>
 pub fn msgtrans::TcpClientConfig::new(&str) -> core::result::Result<Self, msgtrans::spi::ConfigError>
 pub fn msgtrans::TcpClientConfig::nodelay(self, bool) -> Self
 pub fn msgtrans::TcpClientConfig::reliable(&str) -> core::result::Result<Self, msgtrans::spi::ConfigError>
+pub fn msgtrans::TcpClientConfig::server_name<S: core::convert::Into<alloc::string::String>>(self, S) -> Self
+pub fn msgtrans::TcpClientConfig::spki_pins<I: core::iter::traits::collect::IntoIterator<Item = alloc::string::String>>(self, I) -> Self
 pub fn msgtrans::TcpClientConfig::target_address<A: core::convert::Into<core::net::socket_addr::SocketAddr>>(self, A) -> Self
 pub fn msgtrans::TcpClientConfig::target_str(self, &str) -> core::result::Result<Self, msgtrans::spi::ConfigError>
 impl core::clone::Clone for msgtrans::TcpClientConfig
@@ -1215,9 +1238,12 @@ pub struct msgtrans::TcpServerConfig
 impl msgtrans::TcpServerConfig
 pub fn msgtrans::TcpServerConfig::bind_address<A: core::convert::Into<core::net::socket_addr::SocketAddr>>(self, A) -> Self
 pub fn msgtrans::TcpServerConfig::build(self) -> core::result::Result<Self, msgtrans::spi::ConfigError>
+pub fn msgtrans::TcpServerConfig::cert_pem<S: core::convert::Into<alloc::string::String>>(self, S) -> Self
 pub fn msgtrans::TcpServerConfig::default_config() -> Self
 pub fn msgtrans::TcpServerConfig::idle_timeout(self, core::option::Option<core::time::Duration>) -> Self
+pub fn msgtrans::TcpServerConfig::is_tls_enabled(&self) -> bool
 pub fn msgtrans::TcpServerConfig::keepalive(self, core::option::Option<core::time::Duration>) -> Self
+pub fn msgtrans::TcpServerConfig::key_pem<S: core::convert::Into<alloc::string::String>>(self, S) -> Self
 pub fn msgtrans::TcpServerConfig::new(&str) -> core::result::Result<Self, msgtrans::spi::ConfigError>
 pub fn msgtrans::TcpServerConfig::nodelay(self, bool) -> Self
 pub fn msgtrans::TcpServerConfig::reuse_addr(self, bool) -> Self
@@ -1434,5 +1460,7 @@ pub fn msgtrans::SessionHandler::on_error<'life0, 'async_trait>(&'life0 self, ms
 pub fn msgtrans::SessionHandler::on_message<'life0, 'async_trait>(&'life0 self, msgtrans::SessionId, msgtrans::Packet, msgtrans::SessionSender) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = ()> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
 pub fn msgtrans::SessionHandler::on_message_sent<'life0, 'async_trait>(&'life0 self, msgtrans::SessionId, u32) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = ()> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
 pub fn msgtrans::SessionHandler::on_request<'life0, 'async_trait>(&'life0 self, msgtrans::SessionId, msgtrans::Packet, msgtrans::Responder) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = ()> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
+pub fn msgtrans::spki_sha256_base64(&[u8]) -> core::result::Result<alloc::string::String, alloc::string::String>
+pub fn msgtrans::validate_server_tls_material(&str, &str) -> core::result::Result<(), msgtrans::adapters::quic::QuicError>
 pub type msgtrans::PacketId = u32
 pub type msgtrans::Result<T> = core::result::Result<T, msgtrans::TransportError>

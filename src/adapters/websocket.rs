@@ -795,6 +795,11 @@ impl<C: 'static> WebSocketServer<C> {
                 .unwrap_or_default();
             let expected_path = ws_cfg.path.clone();
             let supported: Vec<String> = ws_cfg.subprotocols.clone();
+            // tungstenite's handshake-callback contract fixes the error type
+            // (`Response<Option<String>>`, the HTTP rejection we must return),
+            // so the large `Err` variant is imposed by the external API — it
+            // cannot be boxed without breaking the trait it has to satisfy.
+            #[allow(clippy::result_large_err)]
             let callback = move |req: &Request, mut resp: Response| {
                 let path = req.uri().path();
                 if path != expected_path {

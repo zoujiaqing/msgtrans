@@ -93,10 +93,8 @@ impl TransportError {
                     *reason = format!("{} (session: {})", reason, session_id);
                 }
             }
-            TransportError::Protocol { reason, .. } => {
-                if !reason.contains("session:") {
-                    *reason = format!("{} (session: {})", reason, session_id);
-                }
+            TransportError::Protocol { reason, .. } if !reason.contains("session:") => {
+                *reason = format!("{} (session: {})", reason, session_id);
             }
             _ => {} // Other error types don't need session information
         }
@@ -116,10 +114,8 @@ impl TransportError {
                     *reason = format!("{} (operation: {})", reason, op);
                 }
             }
-            TransportError::Timeout { operation, .. } => {
-                if operation.is_empty() {
-                    *operation = op.to_string();
-                }
+            TransportError::Timeout { operation, .. } if operation.is_empty() => {
+                *operation = op.to_string();
             }
             _ => {}
         }
