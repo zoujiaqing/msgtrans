@@ -1,6 +1,6 @@
 # msgtrans 2.0 public API surface
 
-The **candidate** crate-root surface (`msgtrans::*`) for 2.0. **This API is NOT frozen yet** — it is still changing between alphas; the snapshot gate exists to make every change visible, not to declare it final. Types behind `#[cfg(feature)]` are noted. Everything not listed here is
+The crate-root surface (`msgtrans::*`) for 2.0. **As of 2.0.0-beta.1 this surface is frozen**: it changes before 2.0.0 only to fix a defect that cannot be fixed any other way, and any such change is called out in the release notes. The committed snapshot (`public-api.txt`) gates every change, so a silent widening or break is impossible. Types behind `#[cfg(feature)]` are noted. Everything not listed here is
 crate-internal: the implementation modules (transport::*, adapters::*) are
 `pub(crate)`, so paths like `msgtrans::transport::request_registry::*` do not
 resolve — the public API is exactly the crate root plus the feature-gated

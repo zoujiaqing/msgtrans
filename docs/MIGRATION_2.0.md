@@ -1,7 +1,7 @@
 # Migrating from msgtrans 1.x to 2.0
 
 2.0 is a deliberate breaking release, aiming at a small, honest public API.
-**The surface is not frozen yet** — it is still being revised between alphas.
+**The surface is frozen as of 2.0.0-beta.1** — it changes before 2.0.0 only to fix a defect, and any such change is called out in the release notes.
 Every change below is a compile error you fix once, not a silent behavior
 drift. The wire format is **unchanged** (byte-identical fixtures), so 1.x and
 2.0 peers interoperate.
