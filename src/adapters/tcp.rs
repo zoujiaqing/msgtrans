@@ -282,7 +282,12 @@ impl OptimizedReadBuffer {
                     // Lenient: fast-fail for non-protocol traffic on the very
                     // first packet, bounded resync afterwards.
                     if !self.progress.parsed_any {
-                        tracing::warn!(
+                        // A public port gets scanned. A peer that sends something that is
+                        // not our protocol as its very first packet is a scanner, a health
+                        // check or a browser, not a fault on our side -- debug, so it does
+                        // not spend the operator's error budget. Four days of production
+                        // logs were 86% this one line.
+                        tracing::debug!(
                             "[PARSE] Invalid protocol header on first packet, closing connection"
                         );
                         return Err(TcpError::Config(
@@ -599,7 +604,15 @@ impl<C> TcpAdapter<C> {
                                         }
                                         Ok(None) => break,
                                         Err(e) => {
-                                            tracing::error!("[RECV] TCP parse error: {:?} (session: {})", e, current_session_id);
+                                            // Never-parsed sessions are unrecognised traffic (see the
+                                            // first-packet branch above); anything after that is a real
+                                            // protocol fault on an established session and stays an error.
+                                            let unrecognised = matches!(e, TcpError::Config(_));
+                                            if unrecognised {
+                                                tracing::debug!("[RECV] TCP parse error: {:?} (session: {})", e, current_session_id);
+                                            } else {
+                                                tracing::error!("[RECV] TCP parse error: {:?} (session: {})", e, current_session_id);
+                                            }
                                             event_pipe.close(crate::error::CloseReason::Error(format!("{:?}", e)));
                                             break 'event_loop;
                                         }
