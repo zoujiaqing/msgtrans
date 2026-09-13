@@ -1346,11 +1346,31 @@ impl TransportServer {
                                 );
                                 break;
                             }
-                            tracing::warn!(
-                                "[WARN] {} accept connection failed, continue listening: {:?}",
-                                protocol_name,
-                                e
-                            );
+                            // 按错误归属分级。握手阶段的失败绝大多数是对端造成的
+                            // （扫描器发非 HTTP 字节、连上就断、TLS 对不上），它只影响
+                            // 那一条连接，监听器毫发无伤——按 WARN 打的话，一台暴露在
+                            // 公网上的服务器每天都会被扫出几十条看着像故障的日志，真正
+                            // 的 accept 故障反而淹在里面。
+                            //
+                            // 配置错误 / 资源耗尽（fd 用尽等）是另一回事：那是本机的问题，
+                            // 不会自己好，必须留在 WARN。
+                            match &e {
+                                TransportError::Connection { .. }
+                                | TransportError::Protocol { .. } => {
+                                    tracing::debug!(
+                                        "[DEBUG] {} rejected a peer during handshake, continue listening: {:?}",
+                                        protocol_name,
+                                        e
+                                    );
+                                }
+                                _ => {
+                                    tracing::warn!(
+                                        "[WARN] {} accept connection failed, continue listening: {:?}",
+                                        protocol_name,
+                                        e
+                                    );
+                                }
+                            }
                             tokio::time::sleep(LISTENER_POLL_INTERVAL).await;
                             continue;
                         }

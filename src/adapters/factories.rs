@@ -61,11 +61,15 @@ impl WebSocketServerWrapper {
 #[async_trait]
 impl Server for WebSocketServerWrapper {
     async fn accept(&mut self) -> Result<Box<dyn Connection>, TransportError> {
-        let adapter = self
-            .inner
-            .accept()
-            .await
-            .map_err(|e| TransportError::config_error("websocket", e.to_string()))?;
+        // 走 `From<WebSocketError>`，不要把所有 accept 失败拍成 config_error。
+        //
+        // 握手失败几乎都是**对端**造成的——端口扫描器发一段非 HTTP 的字节，tungstenite
+        // 报 `httparse error: invalid token`。那既不是本机配置有问题，也不该被判成
+        // 不可重试：`Configuration` 的 `is_retryable()` 恒为 false，而这种错误连
+        // "重试"都谈不上，下一个连接与它无关。原来的写法还把结构化的 WebSocketError
+        // 压成字符串，上层再想分辨也没有依据，只能一律按 WARN 打——生产日志里每天
+        // 24 条「websocket accept connection failed」就是这么来的。
+        let adapter = self.inner.accept().await.map_err(TransportError::from)?;
         Ok(Box::new(adapter))
     }
 
