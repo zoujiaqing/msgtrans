@@ -57,9 +57,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Architecture: Connection -> mpsc(4096) -> SessionActor -> Handler");
     println!();
 
-    let tcp_config = TcpServerConfig::new("127.0.0.1:8001")?;
-    let websocket_config = WebSocketServerConfig::new("127.0.0.1:8002")?;
-    let quic_config = QuicServerConfig::new("127.0.0.1:8003")?;
+    let bind_host = std::env::var("LOAD_TEST_BIND_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let tcp_config = TcpServerConfig::new(&format!("{bind_host}:8001"))?;
+    let websocket_config = WebSocketServerConfig::new(&format!("{bind_host}:8002"))?;
+    let quic_config = QuicServerConfig::new(&format!("{bind_host}:8003"))?;
 
     // Create echo handler
     let handler = Arc::new(EchoHandler);
@@ -75,9 +76,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     println!("Listening on:");
-    println!("  TCP:       127.0.0.1:8001");
-    println!("  WebSocket: 127.0.0.1:8002");
-    println!("  QUIC:      127.0.0.1:8003");
+    println!("  TCP:       {bind_host}:8001");
+    println!("  WebSocket: {bind_host}:8002");
+    println!("  QUIC:      {bind_host}:8003");
     println!();
     println!("Mode: Actor (per-connection mpsc)");
     println!("Server running... Press Ctrl+C to stop.");
