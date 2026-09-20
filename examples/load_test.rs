@@ -594,8 +594,11 @@ async fn run_client(
         if config.interval_ms > 0 {
             tokio::time::sleep(interval).await;
         } else {
-            // Yield to allow event_task to process received messages
-            tokio::time::sleep(Duration::from_micros(1)).await;
+            // Yield to let this connection's event task drain. NOT a sleep:
+            // tokio's timer granularity is ~1ms, so `sleep(1us)` actually
+            // parked each iteration for a millisecond and the "unthrottled"
+            // numbers measured the timer wheel instead of the transport.
+            tokio::task::yield_now().await;
         }
     }
 
