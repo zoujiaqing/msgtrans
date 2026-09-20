@@ -360,6 +360,20 @@ impl SessionHandle {
     /// full fails with a resource error rather than stalling the caller. See
     /// [`crate::adapters::outbound`] for the rationale behind this policy.
     async fn enqueue(&self, message: ActorMessage) -> Result<(), crate::TransportError> {
+        // Fast path: a mailbox with room needs no timer. The timeout below
+        // arms (and then cancels) a timer-wheel entry even when the send
+        // completes immediately, which on a healthy session is every send.
+        let message = match self.tx.try_send(message) {
+            Ok(()) => return Ok(()),
+            Err(flume::TrySendError::Full(message)) => message,
+            Err(flume::TrySendError::Disconnected(_)) => {
+                return Err(crate::TransportError::connection_error(
+                    "Actor channel closed",
+                    false,
+                ))
+            }
+        };
+        // Mailbox is full: fall back to the bounded wait, unchanged.
         match tokio::time::timeout(SEND_QUEUE_WAIT, self.tx.send_async(message)).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(_)) => Err(crate::TransportError::connection_error(

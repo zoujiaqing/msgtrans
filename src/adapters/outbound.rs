@@ -17,7 +17,10 @@ use crate::connection::WriteCompletion;
 use crate::error::TransportError;
 use crate::packet::Packet;
 use std::time::Duration;
-use tokio::sync::mpsc::{self, error::SendTimeoutError};
+use tokio::sync::mpsc::{
+    self,
+    error::{SendTimeoutError, TrySendError},
+};
 use tokio::sync::oneshot;
 
 /// One outbound queue item: the packet, plus an optional write completion.
@@ -86,6 +89,17 @@ async fn send_item(
     queue_name: &'static str,
     closed_msg: &'static str,
 ) -> Result<(), TransportError> {
+    // Fast path: a queue with room needs no timer. `send_timeout` arms (and
+    // then cancels) a timer-wheel entry even when the send would succeed
+    // immediately, which on a healthy link is every send.
+    let item = match queue.try_send(item) {
+        Ok(()) => return Ok(()),
+        Err(TrySendError::Full(item)) => item,
+        Err(TrySendError::Closed(_)) => {
+            return Err(TransportError::connection_error(closed_msg, false))
+        }
+    };
+    // Queue is full: fall back to the bounded wait, unchanged.
     match queue.send_timeout(item, SEND_QUEUE_WAIT).await {
         Ok(()) => Ok(()),
         Err(SendTimeoutError::Timeout(_)) => Err(TransportError::resource_error(
