@@ -57,7 +57,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Architecture: Connection -> mpsc(4096) -> SessionActor -> Handler");
     println!();
 
-    let bind_host = std::env::var("LOAD_TEST_BIND_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let bind_host =
+        std::env::var("LOAD_TEST_BIND_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     let tcp_config = TcpServerConfig::new(&format!("{bind_host}:8001"))?;
     let websocket_config = WebSocketServerConfig::new(&format!("{bind_host}:8002"))?;
     let quic_config = QuicServerConfig::new(&format!("{bind_host}:8003"))?;
