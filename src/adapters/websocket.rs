@@ -745,117 +745,211 @@ impl<C> WebSocketServerBuilder<C> {
             .ok_or_else(|| WebSocketError::Config("Missing WebSocket server config".to_string()))?;
         Ok(WebSocketServer {
             config,
-            listener: None,
             limits: self.limits,
+            local_addr: None,
+            incoming: None,
+            pump: None,
         })
     }
 }
 
+/// Upper bound on concurrently pending WebSocket upgrades. A flood of peers
+/// that open sockets and never speak cannot exhaust tasks or memory.
+const MAX_PENDING_WS_HANDSHAKES: usize = 256;
+
+/// A WebSocket upgrade that has not completed within this window is abandoned.
+///
+/// 🔴 生产事故（2026-09，Weey :9080）：此前升级握手在 `accept()` 里**同步等待**
+/// 且没有超时。一个连上来后一个字节都不发的对端（公网扫描器就是这种行为）会让
+/// `accept_hdr_async` 永远挂着，后面所有连接都排在它后面：内核 accept 队列灌满
+/// （Recv-Q 129/128），新客户端 TCP 能连上但握手永远超时，而进程本身一条异常日志
+/// 都没有。TCP+TLS 路径早已改成「后台泵 + 并发握手 + 超时」，这里对齐同一模式。
+const WS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A completed upgrade handed from the accept pump to `accept()`.
+type AcceptedWebSocket = (
+    WebSocketStream<MaybeTlsStream<TcpStream>>,
+    std::net::SocketAddr,
+);
+
 pub(crate) struct WebSocketServer<C> {
     config: C,
-    listener: Option<TcpListener>,
     limits: crate::transport::limits::ConnectionLimits,
+    /// Bound address, captured when the listener is created so it survives the
+    /// listener being moved into the background accept pump.
+    local_addr: Option<std::net::SocketAddr>,
+    /// Completed upgrades. `None` until the first `accept()` binds the port.
+    incoming: Option<mpsc::Receiver<AcceptedWebSocket>>,
+    /// Handle to the background pump, aborted on shutdown/drop.
+    pump: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl<C: 'static> WebSocketServer<C> {
+    fn server_config(&self) -> crate::protocol::WebSocketServerConfig {
+        (&self.config as &dyn std::any::Any)
+            .downcast_ref::<crate::protocol::WebSocketServerConfig>()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Bind the port and start the accept pump. The pump owns the listener:
+    /// it accepts raw sockets and runs each upgrade handshake on its own task
+    /// under `WS_HANDSHAKE_TIMEOUT`, so a slow or silent peer can never stall
+    /// the connections behind it.
+    async fn start_pump(&mut self) -> Result<(), WebSocketError> {
+        let ws_cfg = self.server_config();
+        let listener = TcpListener::bind(ws_cfg.bind_address).await?;
+        let local_addr = listener.local_addr()?;
+        tracing::debug!("[START] WebSocket server listening on: {}", local_addr);
+
+        let accept_limits = self.limits;
+        let expected_path = ws_cfg.path;
+        let supported: Vec<String> = ws_cfg.subprotocols;
+        let (tx, rx) = mpsc::channel::<AcceptedWebSocket>(MAX_PENDING_WS_HANDSHAKES);
+        let permits = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_WS_HANDSHAKES));
+
+        let pump = tokio::spawn(async move {
+            loop {
+                let (tcp_stream, addr) = match listener.accept().await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!("[WS] accept failed: {e}");
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        continue;
+                    }
+                };
+                tracing::debug!("[ACCEPT] WebSocket server accepted connection: {}", addr);
+                let Ok(permit) = permits.clone().try_acquire_owned() else {
+                    tracing::warn!("[WS] too many pending handshakes, dropping {addr}");
+                    continue;
+                };
+                let tx = tx.clone();
+                let expected_path = expected_path.clone();
+                let supported = supported.clone();
+                tokio::spawn(async move {
+                    let handshake =
+                        ws_upgrade(tcp_stream, expected_path, supported, &accept_limits);
+                    match tokio::time::timeout(WS_HANDSHAKE_TIMEOUT, handshake).await {
+                        Ok(Ok(ws_stream)) => {
+                            // Shed completed upgrades when the bounded accept queue is full.
+                            if tx.try_send((ws_stream, addr)).is_err() {
+                                tracing::warn!("[WS] accept queue full, dropping {addr}");
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            tracing::debug!("[WS] upgrade failed from {addr}: {e}")
+                        }
+                        Err(_) => tracing::debug!("[WS] upgrade timed out from {addr}"),
+                    }
+                    drop(permit);
+                });
+            }
+        });
+
+        self.local_addr = Some(local_addr);
+        self.incoming = Some(rx);
+        self.pump = Some(pump);
+        Ok(())
+    }
+
     pub(crate) async fn accept(&mut self) -> Result<WebSocketAdapter<C>, WebSocketError>
     where
         C: Clone + crate::protocol::ProtocolConfig,
     {
-        // Create listener if not already created
-        if self.listener.is_none() {
-            let bind_addr = if let Some(ws_config) = (&self.config as &dyn std::any::Any)
-                .downcast_ref::<crate::protocol::WebSocketServerConfig>(
-            ) {
-                ws_config.bind_address.to_string()
-            } else {
-                "127.0.0.1:8080".parse().unwrap()
-            };
-
-            let listener = TcpListener::bind(&bind_addr).await?;
-            tracing::debug!("[START] WebSocket server listening on: {}", bind_addr);
-            self.listener = Some(listener);
+        if self.incoming.is_none() {
+            self.start_pump().await?;
         }
+        let rx = self
+            .incoming
+            .as_mut()
+            .ok_or_else(|| WebSocketError::Config("No listener available".to_string()))?;
+        // The pump already accepted the socket and finished the upgrade, so
+        // nothing here can be stalled by a slow peer.
+        let (ws_stream, addr) = rx
+            .recv()
+            .await
+            .ok_or_else(|| WebSocketError::Config("WebSocket server is shut down".to_string()))?;
+        tracing::debug!("[ACCEPT] WebSocket upgrade completed: {}", addr);
 
-        if let Some(listener) = &self.listener {
-            let (tcp_stream, addr) = listener.accept().await?;
-            tracing::debug!("[ACCEPT] WebSocket server accepted connection: {}", addr);
-
-            // Handshake with the configured contract enforced (previously the
-            // path, subprotocols and frame caps in the config were ignored):
-            // - request path must match config.path (404 otherwise)
-            // - a client-offered subprotocol is negotiated and echoed when it
-            //   matches; peers that offer none are accepted (not required)
-            // - tungstenite enforces THIS CONNECTION's frame caps, derived
-            //   from ConnectionLimits (not a second set on the ws config)
-            let accept_limits = self.limits;
-            let ws_cfg = (&self.config as &dyn std::any::Any)
-                .downcast_ref::<crate::protocol::WebSocketServerConfig>()
-                .cloned()
-                .unwrap_or_default();
-            let expected_path = ws_cfg.path.clone();
-            let supported: Vec<String> = ws_cfg.subprotocols.clone();
-            // tungstenite's handshake-callback contract fixes the error type
-            // (`Response<Option<String>>`, the HTTP rejection we must return),
-            // so the large `Err` variant is imposed by the external API — it
-            // cannot be boxed without breaking the trait it has to satisfy.
-            #[allow(clippy::result_large_err)]
-            let callback = move |req: &Request, mut resp: Response| {
-                let path = req.uri().path();
-                if path != expected_path {
-                    tracing::debug!(
-                        "[ACCEPT] WebSocket path {} rejected (expected {})",
-                        path,
-                        expected_path
-                    );
-                    let mut rejection = ErrorResponse::new(Some("Not Found".to_string()));
-                    *rejection.status_mut() =
-                        tokio_tungstenite::tungstenite::http::StatusCode::NOT_FOUND;
-                    return Err(rejection);
-                }
-                if let Some(offered) = req.headers().get("Sec-WebSocket-Protocol") {
-                    if let Ok(offered) = offered.to_str() {
-                        if let Some(chosen) = offered
-                            .split(',')
-                            .map(str::trim)
-                            .find(|o| supported.iter().any(|sp| sp == o))
-                        {
-                            if let Ok(value) = chosen.parse() {
-                                resp.headers_mut().insert("Sec-WebSocket-Protocol", value);
-                            }
-                        }
-                    }
-                }
-                Ok(resp)
-            };
-            let maybe_tls_stream = MaybeTlsStream::Plain(tcp_stream);
-            let ws_stream = accept_hdr_async_with_config(
-                maybe_tls_stream,
-                callback,
-                Some(ws_protocol_config(&accept_limits.decode_limits())),
-            )
-            .await?;
-
-            // Create WebSocket adapter
-            WebSocketAdapter::new_with_stream(self.config.clone(), ws_stream, self.limits).await
-        } else {
-            Err(WebSocketError::Config("No listener available".to_string()))
-        }
+        WebSocketAdapter::new_with_stream(self.config.clone(), ws_stream, self.limits).await
     }
 
     pub(crate) fn local_addr(&self) -> Result<std::net::SocketAddr, WebSocketError> {
-        if let Some(listener) = &self.listener {
-            listener.local_addr().map_err(WebSocketError::Io)
-        } else {
-            Err(WebSocketError::Config("Server not bound".to_string()))
-        }
+        self.local_addr
+            .ok_or_else(|| WebSocketError::Config("Server not bound".to_string()))
     }
 
     pub(crate) async fn shutdown(&mut self) -> Result<(), WebSocketError> {
-        // Explicitly drop listener to release TCP port.
-        self.listener.take();
+        // Abort the pump to release the TCP port without waiting for task drop.
+        self.incoming.take();
+        if let Some(pump) = self.pump.take() {
+            pump.abort();
+        }
+        self.local_addr = None;
         Ok(())
     }
+}
+
+impl<C> Drop for WebSocketServer<C> {
+    fn drop(&mut self) {
+        if let Some(pump) = self.pump.take() {
+            pump.abort();
+        }
+    }
+}
+
+/// Run the HTTP → WebSocket upgrade for one accepted socket with the configured
+/// contract enforced:
+/// - request path must match config.path (404 otherwise)
+/// - a client-offered subprotocol is negotiated and echoed when it matches;
+///   peers that offer none are accepted (not required)
+/// - tungstenite enforces THIS CONNECTION's frame caps, derived from
+///   ConnectionLimits (not a second set on the ws config)
+async fn ws_upgrade(
+    tcp_stream: TcpStream,
+    expected_path: String,
+    supported: Vec<String>,
+    accept_limits: &crate::transport::limits::ConnectionLimits,
+) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, WebSocketError> {
+    // tungstenite's handshake-callback contract fixes the error type
+    // (`Response<Option<String>>`, the HTTP rejection we must return),
+    // so the large `Err` variant is imposed by the external API — it
+    // cannot be boxed without breaking the trait it has to satisfy.
+    #[allow(clippy::result_large_err)]
+    let callback = move |req: &Request, mut resp: Response| {
+        let path = req.uri().path();
+        if path != expected_path {
+            tracing::debug!(
+                "[ACCEPT] WebSocket path {} rejected (expected {})",
+                path,
+                expected_path
+            );
+            let mut rejection = ErrorResponse::new(Some("Not Found".to_string()));
+            *rejection.status_mut() = tokio_tungstenite::tungstenite::http::StatusCode::NOT_FOUND;
+            return Err(rejection);
+        }
+        if let Some(offered) = req.headers().get("Sec-WebSocket-Protocol") {
+            if let Ok(offered) = offered.to_str() {
+                if let Some(chosen) = offered
+                    .split(',')
+                    .map(str::trim)
+                    .find(|o| supported.iter().any(|sp| sp == o))
+                {
+                    if let Ok(value) = chosen.parse() {
+                        resp.headers_mut().insert("Sec-WebSocket-Protocol", value);
+                    }
+                }
+            }
+        }
+        Ok(resp)
+    };
+    let ws_stream = accept_hdr_async_with_config(
+        MaybeTlsStream::Plain(tcp_stream),
+        callback,
+        Some(ws_protocol_config(&accept_limits.decode_limits())),
+    )
+    .await?;
+    Ok(ws_stream)
 }
 
 pub(crate) struct WebSocketClientBuilder<C> {
@@ -1042,5 +1136,65 @@ mod frame_policy_tests {
                 other => panic!("expected packet under {policy:?}, got {other:?}"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod accept_pump_tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    /// Regression for the Weey :9080 outage: a peer that connects and never
+    /// sends the HTTP upgrade must not block the handshakes of peers behind it.
+    #[tokio::test]
+    async fn silent_peer_does_not_stall_later_handshakes() {
+        let mut cfg = crate::protocol::WebSocketServerConfig::default();
+        cfg.bind_address = "127.0.0.1:0".parse().unwrap();
+        cfg.path = "/gate".to_string();
+        let mut server = WebSocketServerBuilder::new()
+            .config(cfg)
+            .build()
+            .await
+            .unwrap();
+        server.start_pump().await.unwrap();
+        let addr = server.local_addr().unwrap();
+
+        // Silent peers: TCP connected, never speak. Before the fix the first
+        // one parked `accept()` inside `accept_hdr_async` for good.
+        let mut silent = Vec::new();
+        for _ in 0..3 {
+            silent.push(TcpStream::connect(addr).await.unwrap());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // A well-behaved client must still complete the upgrade promptly.
+        let url = format!("ws://{}/gate", addr);
+        let client = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            tokio_tungstenite::connect_async(url),
+        )
+        .await
+        .expect("handshake stalled behind silent peers")
+        .expect("handshake failed");
+        drop(client);
+
+        let accepted = tokio::time::timeout(std::time::Duration::from_secs(3), server.accept())
+            .await
+            .expect("accept() stalled behind silent peers")
+            .expect("accept() failed");
+        drop(accepted);
+
+        // Silent peers are cut off once the handshake window elapses; they
+        // never reach `accept()`.
+        for s in silent.iter_mut() {
+            let _ = s.shutdown().await;
+        }
+        server.shutdown().await.unwrap();
+        assert!(server.local_addr().is_err());
+    }
+
+    #[test]
+    fn handshake_window_is_bounded() {
+        assert!(WS_HANDSHAKE_TIMEOUT <= std::time::Duration::from_secs(30));
     }
 }
