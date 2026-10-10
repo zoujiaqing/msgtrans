@@ -441,7 +441,10 @@ impl RequestRegistry {
             return None;
         }
         // `fetch_update` so exhaustion is detected atomically: the counter
-        // saturates at u32::MAX and never rolls over to 0.
+        // saturates at u32::MAX and never rolls over to 0. Rust 1.99 renamed
+        // it `try_update`; the old name is kept so this library does not
+        // require a 1.99 compiler for a rename.
+        #[allow(deprecated)]
         runtime
             .next_request_id
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
