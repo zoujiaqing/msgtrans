@@ -170,7 +170,12 @@ pub struct TransportClient {
     /// has exactly one connection, so there is nothing to fan out to, and a
     /// bounded queue means a slow consumer is throttled rather than silently
     /// skipped the way a broadcast lag would skip it.
-    event_sender: tokio::sync::mpsc::Sender<crate::event::ClientEvent>,
+    ///
+    /// `None` once `shutdown()` ran: the client's own copy is the last sender
+    /// left after the forwarding task is aborted, so releasing it is what lets
+    /// the stream end — `ClientEvents::next()` returns `None` after draining
+    /// instead of waiting forever on a client that can never deliver again.
+    event_sender: Option<tokio::sync::mpsc::Sender<crate::event::ClientEvent>>,
     event_receiver: Arc<RwLock<Option<tokio::sync::mpsc::Receiver<crate::event::ClientEvent>>>>,
     event_forwarding_running: Arc<AtomicBool>,
     event_forwarding_task: Arc<RwLock<Option<JoinHandle<()>>>>,
@@ -223,7 +228,7 @@ impl TransportClient {
             protocol_config,
             frame_policy,
             current_session_id: Arc::new(RwLock::new(None)),
-            event_sender,
+            event_sender: Some(event_sender),
             event_receiver: Arc::new(RwLock::new(Some(event_receiver))),
             event_forwarding_running: Arc::new(AtomicBool::new(false)),
             event_forwarding_task: Arc::new(RwLock::new(None)),
@@ -385,6 +390,12 @@ impl TransportClient {
     /// `connect()` again); `shutdown()` ends the client. After it returns, no
     /// background task of this client is running.
     pub async fn shutdown(&mut self) -> Result<(), TransportError> {
+        // Release the client's own event sender first, so the stream can end
+        // once the teardown below aborts the forwarding task (the only other
+        // sender). Done before any await: a cancelled shutdown() future still
+        // leaves it released, and the owned teardown task finishes the rest.
+        self.event_sender = None;
+
         // Lifecycle gate: Active starts the teardown; ShuttingDown (including
         // a shutdown future that was cancelled mid-flight) resumes by
         // OBSERVING the owned task; Stopped is done.
@@ -692,7 +703,14 @@ impl TransportClient {
 
         // Get Transport's event stream
         if let Some(mut transport_events) = self.inner.get_event_stream().await {
-            let client_event_sender = self.event_sender.clone();
+            let Some(client_event_sender) = self.event_sender.clone() else {
+                // Only shutdown() clears it, and connect() is gated on the
+                // lifecycle phase before reaching here.
+                return Err(TransportError::connection_error(
+                    "Client has been shut down; create a new client to reconnect",
+                    false,
+                ));
+            };
             // Weak: the forwarding task must not keep the Transport (and thus
             // the socket/session) alive after the client is dropped.
             let transport_for_response = Arc::downgrade(&self.inner);

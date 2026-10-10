@@ -393,6 +393,28 @@ async fn client_shutdown_joins_forwarding_and_is_idempotent() {
     assert!(report.clean);
 }
 
+/// shutdown() ends the event stream: a consumer parked in `ClientEvents::next`
+/// gets `None` once anything still buffered is drained, even though the
+/// client object itself is still alive. Previously the client's own copy of
+/// the event sender kept the channel open, so the consumer waited forever on
+/// a client that can never deliver again.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_shutdown_ends_the_event_stream() {
+    let addr = "127.0.0.1:28875";
+    let _server = start_server(addr).await;
+    let mut client = connect(addr).await;
+    let mut events = client.events().await.expect("event stream");
+    let consumer = tokio::spawn(async move { while events.next().await.is_some() {} });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    client.shutdown().await.expect("shutdown");
+    tokio::time::timeout(Duration::from_secs(5), consumer)
+        .await
+        .expect("ClientEvents::next() still pending after shutdown()")
+        .expect("consumer task");
+    drop(client); // alive until here on purpose: shutdown alone must suffice
+}
+
 /// serve() is one-shot: shutdown-before-serve and a concurrent second serve
 /// are both rejected before touching shared state, and the running instance
 /// is unaffected.
