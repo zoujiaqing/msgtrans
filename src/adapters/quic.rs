@@ -65,6 +65,26 @@ pub enum QuicError {
     Serialization(String),
 }
 
+impl QuicError {
+    /// Whether the connection was refused by the TLS handshake: QUIC carries
+    /// TLS alerts in its crypto error-code range (0x100..=0x1ff), whether we
+    /// raised the alert (e.g. an SPKI pin mismatch) or the peer did. Network
+    /// failures surface as timeouts and resets, never as TLS alerts. A refusal
+    /// is deterministic, so never retryable.
+    pub(crate) fn is_tls_rejection(&self) -> bool {
+        const TLS_ALERTS: std::ops::RangeInclusive<u64> = 0x100..=0x1ff;
+        match self {
+            QuicError::Connection(ConnectionError::TransportError(e)) => {
+                TLS_ALERTS.contains(&u64::from(e.code))
+            }
+            QuicError::Connection(ConnectionError::ConnectionClosed(close)) => {
+                TLS_ALERTS.contains(&u64::from(close.error_code))
+            }
+            _ => false,
+        }
+    }
+}
+
 impl From<QuicError> for TransportError {
     fn from(error: QuicError) -> Self {
         match error {

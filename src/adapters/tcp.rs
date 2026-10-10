@@ -47,6 +47,11 @@ pub enum TcpError {
 
     #[error("Configuration error: {0}")]
     Config(String),
+
+    /// The TLS layer refused the peer (an SPKI pin or certificate that does
+    /// not verify). Deterministic: retrying the same connect cannot succeed.
+    #[error("{0}")]
+    TlsRejected(String),
 }
 
 impl From<TcpError> for TransportError {
@@ -67,6 +72,7 @@ impl From<TcpError> for TransportError {
                 TransportError::protocol_error("generic", "TCP buffer overflow".to_string())
             }
             TcpError::Config(msg) => TransportError::config_error("tcp", msg),
+            TcpError::TlsRejected(msg) => TransportError::connection_error(msg, false),
         }
     }
 }
@@ -815,7 +821,12 @@ impl TcpAdapter<TcpClientConfig> {
 
         let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(tls_config));
         let tls = connector.connect(server_name, stream).await.map_err(|e| {
-            TcpError::Config(format!("TLS handshake failed (no plaintext fallback): {e}"))
+            let message = format!("TLS handshake failed (no plaintext fallback): {e}");
+            if crate::adapters::tls_common::is_tls_rejection(&e) {
+                TcpError::TlsRejected(message)
+            } else {
+                TcpError::Config(message)
+            }
         })?;
         tracing::debug!("[TLS] client handshake complete, SPKI pin verified");
         Ok(MaybeTlsStream::ClientTls(Box::new(tls)))

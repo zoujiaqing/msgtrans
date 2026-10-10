@@ -8,6 +8,18 @@
 
 use std::sync::Arc;
 
+/// Whether a failed TLS handshake was refused by the TLS layer itself (a
+/// certificate or SPKI pin that does not verify, a protocol it will not
+/// speak) rather than failing on the network underneath it. tokio-rustls
+/// surfaces a refusal as an `io::Error` wrapping a `rustls::Error`; resets and
+/// EOFs are plain I/O errors. A refusal is deterministic, so never retryable.
+#[cfg(feature = "tcp-tls")]
+pub(crate) fn is_tls_rejection(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<rustls::Error>())
+}
+
 use rustls::{
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     pki_types::{CertificateDer, ServerName, UnixTime},

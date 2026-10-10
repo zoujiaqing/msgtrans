@@ -152,9 +152,11 @@ impl ClientConfig for TcpClientConfig {
             .connect()
             .await
             .map_err(|e| {
+                // A TLS refusal is deterministic; anything else may be transient.
+                let retryable = !matches!(e, crate::adapters::tcp::TcpError::TlsRejected(_));
                 TransportError::connection_error(
                     format!("Failed to build TCP connection: {:?}", e),
-                    true,
+                    retryable,
                 )
             })
     }
@@ -258,9 +260,11 @@ impl ClientConfig for QuicClientConfig {
             .connect()
             .await
             .map_err(|e| {
+                // A TLS refusal is deterministic; anything else may be transient.
+                let retryable = !e.is_tls_rejection();
                 TransportError::connection_error(
                     format!("Failed to build QUIC connection: {:?}", e),
-                    true,
+                    retryable,
                 )
             })
     }
