@@ -12,7 +12,7 @@ the server sends. Client only — there is no server surface.
 
 The workspace is pinned to **Rust 1.99.0** (`rust-toolchain.toml` at the
 repository root), with the Android and iOS targets listed there. UniFFI is
-0.31.0, the same version as `privchat-sdk`.
+0.32.2.
 
 ## Building
 

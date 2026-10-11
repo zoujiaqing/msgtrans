@@ -16,7 +16,7 @@ crate-type = ["cdylib", "staticlib", "lib"]
 
 [dependencies]
 msgtrans = { path = "../msgtrans" }
-uniffi = "0.31.0"
+uniffi = "0.32.2"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 futures = { version = "0.3", default-features = false, features = ["executor"] }
 pin-project-lite = "0.2"
