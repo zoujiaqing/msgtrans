@@ -10,7 +10,7 @@ resolver = "3"
 [workspace.package]
 # msgtrans and msgtrans-ffi are versioned in lockstep, so a binding build
 # names the library it wraps.
-version = "2.0.0-beta.2"
+version = "2.0.0-beta.3"
 authors = ["Jiaqing Zou <zoujiaqing@gmail.com>"]
 license = "Apache-2.0"
 repository = "https://github.com/zoujiaqing/msgtrans"

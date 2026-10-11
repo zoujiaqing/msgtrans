@@ -44,7 +44,7 @@
 
 ```toml
 [dependencies]
-msgtrans = "1.0"
+msgtrans = "2.0.0-beta.3"
 ```
 
 ### 创建多协议服务端

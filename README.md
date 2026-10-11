@@ -23,7 +23,7 @@ This repository is a Cargo workspace.
 
 ```toml
 [dependencies]
-msgtrans = "2.0.0-beta.2"
+msgtrans = "2.0.0-beta.3"
 ```
 
 The [crate README](crates/msgtrans/README.md) covers servers, clients and
