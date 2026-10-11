@@ -94,8 +94,10 @@ MsgTrans aims to make multi-protocol communication simple, efficient, and reliab
 
 ### Code Organization
 
+The repository is a Cargo workspace; the library lives in `crates/msgtrans/`:
+
 ```
-src/
+crates/msgtrans/src/
 ├── lib.rs              # Public API exports
 ├── error.rs            # Error types and handling
 ├── event.rs            # Event system definitions

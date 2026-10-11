@@ -397,7 +397,7 @@ msgtrans 传输层**不**定义心跳 Packet。心跳由应用层实现，约定
 
 为防止跨语言实现漂移，msgtrans 维护一组**二进制 fixture**，所有实现必须同时通过 `encode(fixture.input) == fixture.bytes` 与 `decode(fixture.bytes) == fixture.input`。
 
-**计划中的 fixture 列表**（位于 `msgtrans/tests/fixtures/`，待生成）：
+**计划中的 fixture 列表**（位于 `crates/msgtrans/tests/fixtures/`，待生成）：
 
 #### 第一批 — 基础 wire format（必做）
 

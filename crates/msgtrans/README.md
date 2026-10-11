@@ -1,86 +1,87 @@
-# 🚀 MsgTrans - 现代化多协议通信框架
+# 🚀 MsgTrans - Modern Multi-Protocol Communication Framework
 
-[![Rust](https://img.shields.io/badge/rust-1.80+-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.88+-orange.svg)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-Apache-blue.svg)](https://github.com/zoujiaqing/msgtrans/blob/main/LICENSE)
 [![Crates.io](https://img.shields.io/crates/v/msgtrans.svg)](https://crates.io/crates/msgtrans)
 [![Docs.rs](https://img.shields.io/docsrs/msgtrans)](https://docs.rs/msgtrans)
 
-🌐 语言：[English](README.md) | [简体中文](README.zh-CN.md)
+🌐 Language: [English](README.md) | [简体中文](README.zh-CN.md)
 
-> **现代化多协议通信框架，用统一接口封装 TCP、WebSocket、QUIC**
+> **Modern multi-protocol communication framework with a unified interface over TCP, WebSocket and QUIC**
 
-## 🌟 核心特性
+## 🌟 Core Features
 
-### 🏗️ 统一架构
+### 🏗️ Unified Architecture
 
-- **三层架构**：应用层 → 传输层 → 协议层，职责清晰分离
-- **业务逻辑协议无关**：一套代码，多协议部署
-- **配置驱动**：切换协议只改配置，不动业务逻辑
-- **可插拔适配器**：实现 `Connection` trait 即可接入新协议
+- **Three-layer architecture**: Application → Transport → Protocol, with clear separation
+- **Protocol-agnostic business logic**: one codebase, multi-protocol deployment
+- **Configuration-driven**: switch protocols through configuration without changing business logic
+- **Pluggable adapters**: implement the `Connection` trait to add a new protocol
 
-### ⚡ 现代并发
+### ⚡ Modern Concurrency
 
-- **无锁内核**：按会话的 actor + 无锁 map，热路径上避免 Mutex 竞争
-- **零拷贝报文**：`Packet` 承载 `Bytes` 载荷，尽可能直接交给网络层
-- **事件驱动模型**：全异步、非阻塞
-- **有界背压**：出站队列按连接有界，慢速对端既不会撑爆内存，也不会阻塞扇出循环
+- **Lock-free internals**: per-session actors and lock-free maps avoid Mutex contention on the hot path
+- **Zero-copy packets**: `Packet` carries a `Bytes` payload, handed straight to the wire where possible
+- **Event-driven model**: fully asynchronous, non-blocking event handling
+- **Bounded backpressure**: outbound queues are bounded per connection so a slow peer cannot exhaust memory or stall a fan-out loop
 
-### 🔌 协议
+### 🔌 Protocols
 
-- **TCP** - 可靠流式传输
-- **WebSocket** - 实时 Web 通信
-- **QUIC** - 基于 UDP 的现代传输
-- **自定义协议** - 实现 `Connection` trait
+- **TCP** - reliable stream transport
+- **WebSocket** - real-time web communication
+- **QUIC** - modern UDP-based transport
+- **Custom protocols** - implement the `Connection` trait
 
-### 🎯 极简 API
+### 🎯 Minimalist API
 
-- **Builder 模式**：流畅、可读的配置
-- **类型安全**：配置在编译期检查
-- **合理默认值**：开箱即用，按需调优
+- **Builder pattern**: fluent, readable configuration
+- **Type safety**: compile-time checked configuration
+- **Sensible defaults**: works out of the box, tune only when needed
 
-## 🚀 快速开始
+## 🚀 Quick Start
 
-### 安装
+### Installation
 
 ```toml
 [dependencies]
 msgtrans = "1.0"
 ```
 
-### 创建多协议服务端
+### Create a Multi-Protocol Server
 
 ```rust,no_run
 use async_trait::async_trait;
 use msgtrans::{
-    SessionHandler, SessionSender, TransportServerBuilder,
+    Responder, SessionHandler, SessionSender, TransportServerBuilder,
     TcpServerConfig, WebSocketServerConfig, QuicServerConfig,
     Packet,
     SessionId,
 };
 use std::sync::Arc;
 
-// 业务逻辑写在 handler 里。每个连接有自己的 actor 来调用它，
-// 所以处理慢只会拖慢它自己那条连接，而不会让所有人丢消息。
+// Business logic lives in a handler. Each connection gets its own actor that
+// calls it, so a slow handler slows only its own connection instead of
+// dropping messages for everyone.
 struct Echo;
 
 #[async_trait]
 impl SessionHandler for Echo {
-    // `on_request` 是必需方法：请求带着「必须应答一次」的义务，
-    // 只能通过消费式 `Responder` 应答。
-    async fn on_request(&self, _s: SessionId, req: Packet, responder: msgtrans::Responder) {
-        let _ = responder.respond(req.into_payload()).await;
-    }
-
     async fn on_message(&self, _session: SessionId, packet: Packet, sender: SessionSender) {
-        // 原样回显 —— 协议无关。
+        // One-way traffic: echo it back - protocol transparent.
         let response = format!("Echo: {}", String::from_utf8_lossy(packet.payload()));
         let _ = sender.send_data(response.into_bytes()).await;
+    }
+
+    async fn on_request(&self, _session: SessionId, request: Packet, responder: Responder) {
+        // Requests carry an obligation to answer: the consuming Responder is
+        // the only way to do it, and Ok(Written) means the bytes were written.
+        let _ = responder.respond(request.into_payload()).await;
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 配置多种协议 —— 同一套业务逻辑服务所有协议。
+    // Configure multiple protocols - the same business logic serves all of them.
     let tcp_config = TcpServerConfig::new("127.0.0.1:8001")?;
     let websocket_config = WebSocketServerConfig::new("127.0.0.1:8002")?.path("/ws");
     let quic_config = QuicServerConfig::new("127.0.0.1:8003")?;
@@ -93,13 +94,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build(Arc::new(Echo))
         .await?;
 
-    // 一直运行直到服务器停止。
+    // Runs until the server is stopped.
     server.serve().await?;
     Ok(())
 }
 ```
 
-### 创建客户端连接
+### Create a Client Connection
 
 ```rust,no_run
 use msgtrans::{
@@ -121,22 +122,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     client.connect().await?;
 
-    // 发送单向消息
-    client.send("Hello, MsgTrans!".as_bytes()).await?;
-    println!("消息已发送");
+    // Send a one-way message. `send` is write-confirmed: it returns once the
+    // bytes reached the socket (use `send_detached` for fire-and-forget).
+    let receipt = client.send("Hello, MsgTrans!".as_bytes()).await?;
+    println!("Message sent (id {})", receipt.message_id);
 
-    // 发送请求并等待响应
-    // `Ok` 即响应字节；任何失败（含超时）都是 `Err`。
+    // Send a request and wait for the response. `Ok` carries the response
+    // bytes; every failure, including a timeout, is an `Err`.
     let response = client.request("What time is it?".as_bytes()).await?;
-    println!("收到响应: {}", String::from_utf8_lossy(&response));
+    println!("Received response: {}", String::from_utf8_lossy(&response));
 
-    // 消费事件
+    // Consume events. The stream has a single consumer and is taken once.
     let mut events = client.events().await?;
     tokio::spawn(async move {
         while let Some(event) = events.next().await {
             match event {
                 ClientEvent::Message(msg) => {
-                    println!("收到: {}", msg.as_text_lossy());
+                    println!("Received: {}", msg.as_text_lossy());
+                }
+                ClientEvent::Request(req) => {
+                    // Server-initiated request: `req` is consuming; answer it.
+                    req.respond_detached(b"ack".to_vec());
                 }
                 ClientEvent::Disconnected { .. } => break,
                 _ => {}
@@ -148,31 +154,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-## 🏗️ 架构设计
+## 🏗️ Architecture Design
 
-### 三层架构
+### Three-Layer Architecture
 
 ```text
 +-------------------------------------+
-|  应用层                             |  <- 业务逻辑，协议无关
+|  Application Layer                  |  <- Business logic, protocol-agnostic
 +-------------------------------------+
-|  传输层                             |  <- 连接管理，统一 API
-|  - TransportServer / TransportClient|     - 连接生命周期
-|  - SessionActor                     |     - 事件路由
-|  - RequestRegistry                  |     - 请求/响应生命周期
+|  Transport Layer                    |  <- Connection management, unified API
+|  - TransportServer / TransportClient|     - Connection lifecycle
+|  - SessionActor                     |     - Event routing
+|  - RequestRegistry                  |     - Request/response lifecycle
 +-------------------------------------+
-|  协议层                             |  <- 协议实现
-|  - TCP / WebSocket / QUIC 适配器    |     - Connection trait
-|  - 协议配置                         |     - 协议注册
+|  Protocol Layer                     |  <- Protocol implementation
+|  - TCP / WebSocket / QUIC adapters  |     - Connection trait
+|  - Protocol configs                 |     - Protocol registration
 +-------------------------------------+
 ```
 
-### 设计原则
+### Design Principles
 
-**统一抽象、协议透明** —— `TransportServer`/`TransportClient` 暴露一套业务接口；
-每个适配器实现 `Connection` trait，隐藏协议细节。
+**Unified abstraction, protocol transparency** — `TransportServer`/`TransportClient`
+expose one business interface; each adapter implements the `Connection` trait and
+hides protocol details.
 
-**配置驱动** —— 同一套服务端代码可跑在任意协议上，只需改传给 `.protocol(..)` 的配置：
+**Configuration-driven** — the same server code runs on any protocol; only the
+config passed to `.protocol(..)` changes:
 
 ```rust,no_run
 # use msgtrans::{TransportServerBuilder, SessionHandler, SessionSender, TcpServerConfig, QuicServerConfig, Packet, SessionId};
@@ -180,32 +188,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 # struct H;
 # #[async_trait::async_trait]
 # impl SessionHandler for H {
-    // `on_request` 是必需方法：请求带着「必须应答一次」的义务，
-    // 只能通过消费式 `Responder` 应答。
-    async fn on_request(&self, _s: SessionId, req: Packet, responder: msgtrans::Responder) {
-        let _ = responder.respond(req.into_payload()).await;
-    }
-
 #     async fn on_message(&self, _s: SessionId, _p: Packet, _tx: SessionSender) {}
+#     async fn on_request(&self, _s: SessionId, _p: Packet, _r: msgtrans::Responder) {}
 # }
 # async fn f() -> Result<(), Box<dyn std::error::Error>> {
 # let handler = Arc::new(H);
-// TCP 服务端
+// TCP server
 let server = TransportServerBuilder::new()
     .protocol(TcpServerConfig::new("0.0.0.0:8080")?)
     .build(handler.clone()).await?;
 
-// QUIC 服务端 —— 业务逻辑完全相同
+// QUIC server - identical business logic
 let server = TransportServerBuilder::new()
     .protocol(QuicServerConfig::new("0.0.0.0:8080")?)
     .build(handler).await?;
 # Ok(()) }
 ```
 
-### Handler 模型
+### Handler Model
 
-服务端把每个会话的流量交给 `SessionHandler`；客户端仍然是事件流，
-因为一个客户端只有一条连接。
+The server delivers each session's traffic to a `SessionHandler`; the client
+still exposes an event stream, since a client has exactly one connection.
 
 ```rust
 use msgtrans::{
@@ -213,44 +216,43 @@ use msgtrans::{
     ConnectionInfo,
     TransportError, CloseReason,
     Packet,
-    SessionHandler, SessionSender,
+    Responder, SessionHandler, SessionSender,
     SessionId,
 };
 
-// 服务端：实现 handler，只有 on_message 是必须的。
+// Server side: implement the handler. `on_message` (one-way traffic) and
+// `on_request` (requests, answered through the consuming Responder) are
+// required; the lifecycle hooks are optional.
 struct MyHandler;
 
 #[async_trait::async_trait]
 impl SessionHandler for MyHandler {
-    // `on_request` 是必需方法：请求带着「必须应答一次」的义务，
-    // 只能通过消费式 `Responder` 应答。
-    async fn on_request(&self, _s: SessionId, req: Packet, responder: msgtrans::Responder) {
-        let _ = responder.respond(req.into_payload()).await;
-    }
-
     async fn on_message(&self, session_id: SessionId, packet: Packet, sender: SessionSender) { /* ... */ }
+    async fn on_request(&self, session_id: SessionId, request: Packet, responder: Responder) {
+        let _ = responder.respond(request.into_payload()).await; // Ok(Written) == bytes written
+    }
     async fn on_connected(&self, session_id: SessionId, info: ConnectionInfo) { /* ... */ }
     async fn on_disconnected(&self, session_id: SessionId, reason: CloseReason) { /* ... */ }
     async fn on_error(&self, session_id: SessionId, error: TransportError) { /* ... */ }
 }
 
-// 客户端：事件
+// Client side: events
 # fn _client_events(ev: ClientEvent) { match ev {
 ClientEvent::Connected { info } => { /* ... */ }
-ClientEvent::Message(msg) => { /* 单向消息 */ }
-ClientEvent::Request(req) => { /* 请求：必须且只能应答一次 */ }
+ClientEvent::Message(msg) => { /* one-way data; msg.payload() */ }
+ClientEvent::Request(req) => { /* consuming; req.respond_detached(..) */ }
 ClientEvent::MessageSent { message_id } => { /* ... */ }
 ClientEvent::Disconnected { reason } => { /* ... */ }
 ClientEvent::Error { error } => { /* ... */ }
 # _ => {} } }
 ```
 
-## ⚡ 使用模式
+## ⚡ Usage Patterns
 
-### 并发发送
+### Concurrent Sending
 
-`TransportServer` 可廉价克隆（内部通过 `Arc` 共享状态），因此可以 move 进 spawn
-出的任务里做并发、无锁的会话访问：
+`TransportServer` is cheaply cloneable (it shares state via `Arc`), so it can be
+moved into spawned tasks for concurrent, lock-free session access:
 
 ```rust,no_run
 # use msgtrans::{TransportServer, SessionHandler, SessionSender, Packet, SessionId};
@@ -259,38 +261,40 @@ struct Echo { server: TransportServer }
 
 #[async_trait::async_trait]
 impl SessionHandler for Echo {
-    // `on_request` 是必需方法：请求带着「必须应答一次」的义务，
-    // 只能通过消费式 `Responder` 应答。
-    async fn on_request(&self, _s: SessionId, req: Packet, responder: msgtrans::Responder) {
-        let _ = responder.respond(req.into_payload()).await;
-    }
-
     async fn on_message(&self, session_id: SessionId, packet: Packet, _tx: SessionSender) {
-        // 丢给 spawn 出去的任务处理，让这个会话的 actor 能立刻去取下一条消息。
+        // Handing work to a spawned task keeps this session's actor free to
+        // pick up the next message.
         let server = self.server.clone();
         tokio::spawn(async move {
             let response = format!("Echo: {}", String::from_utf8_lossy(packet.payload()));
             let _ = server.send(session_id, response.as_bytes()).await;
         });
     }
+
+    async fn on_request(&self, _s: SessionId, request: Packet, responder: msgtrans::Responder) {
+        // respond_detached hands the write off; the registry still records
+        // the true outcome.
+        responder.respond_detached(request.into_payload());
+    }
 }
 ```
 
-### 请求 / 响应
+### Request / Response
 
 ```rust,no_run
 # use msgtrans::TransportClient;
 # async fn f(client: &TransportClient) -> Result<(), Box<dyn std::error::Error>> {
-// `Ok` 即响应字节；任何失败（含超时）都是 `Err`。
+// `Ok` carries the response bytes; a timeout is an `Err`.
 let response = client.request(b"Get user data").await?;
-println!("收到 {} 字节", response.len());
+println!("Got {} bytes", response.len());
 # Ok(()) }
 ```
 
-## 🔌 协议扩展
+## 🔌 Protocol Extension
 
-要接入新协议，为你的适配器实现 `Connection` trait，再配一个对应的 config 类型。
-完整可用的参考见内置的 `adapters::{tcp, websocket, quic}`；下面是骨架示意：
+To add a protocol, implement the `Connection` trait for your adapter and a
+matching config type. See the built-in `adapters::{tcp, websocket, quic}` for
+complete, working references; the outline below shows the shape:
 
 ```rust
 use msgtrans::spi::{
@@ -300,8 +304,9 @@ use msgtrans::spi::{
 use msgtrans::FramePolicy;
 use std::sync::Arc;
 
-/// 写半边。与连接对象分开，是为了让传输层能在连接锁内克隆它、**先释放锁**再 await
-/// 入队——队列打满时绝不能把 reconnect/close/shutdown 堵在后面。
+/// The write half. Kept separate from the connection so the transport can clone
+/// it under its connection lock and RELEASE the lock before awaiting the
+/// enqueue — a saturated queue must not park reconnect/close/shutdown.
 struct MyWriter {
     queue: tokio::sync::mpsc::Sender<(Packet, WriteCompletion)>,
 }
@@ -313,12 +318,13 @@ impl ConnectionWriter for MyWriter {
         packet: Packet,
         completion: WriteCompletion,
     ) -> Result<(), TransportError> {
-        // 把**包和它的 completion 一起**交给写循环。completion 只能在字节
-        // 真正写入 socket 之后才被 resolve——在这里 resolve 就是**伪造写入确认**，
-        // 而 `WriteCompletion` 存在的全部意义就是让 `Ok` 可被证明。
+        // Hand BOTH the packet and its completion to the write loop. The
+        // completion must only be resolved once the bytes have actually reached
+        // the socket — resolving it here would be a false write confirmation,
+        // and the whole point of `WriteCompletion` is that `Ok` is provable.
         //
-        // 队列没了就**丢弃** completion：丢弃本身即上报失败，
-        // 所以不存在任何凭空造 `Ok` 的路径。
+        // If the queue is gone, DROP the completion: dropping reports failure
+        // by construction, so there is no path that invents an `Ok`.
         self.queue
             .send((packet, completion))
             .await
@@ -326,7 +332,8 @@ impl ConnectionWriter for MyWriter {
     }
 }
 
-/// 持有 socket 的写循环。只有它有资格声称一次写入成功。
+/// The write loop that owns the socket. It is the only thing allowed to say a
+/// write succeeded.
 async fn write_loop(mut queue: tokio::sync::mpsc::Receiver<(Packet, WriteCompletion)>) {
     while let Some((packet, completion)) = queue.recv().await {
         let bytes = match packet.try_encode() {
@@ -336,7 +343,7 @@ async fn write_loop(mut queue: tokio::sync::mpsc::Receiver<(Packet, WriteComplet
                 continue;
             }
         };
-        // 换成你真实的 socket 写；如实上报它返回了什么。
+        // Replace with your real socket write; report exactly what it returned.
         let written: Result<(), TransportError> = my_socket_write(&bytes).await;
         completion.complete(written);
     }
@@ -358,8 +365,8 @@ impl MyAdapter {
         Self { session_id: SessionId::new(0), sink, events: Some(events), queue }
     }
 
-    /// 你的读循环把入站包推到这里。管道会统一解压/规范化，
-    /// 所以每个消费者拿到的都是明文。
+    /// Your read loop pushes inbound packets here. The pipe decompresses and
+    /// normalizes them, so every consumer sees plaintext.
     pub async fn on_packet(&self, packet: Packet) -> bool {
         self.sink.message(packet).await
     }
@@ -380,18 +387,18 @@ impl Connection for MyAdapter {
     fn is_connected(&self) -> bool { true }
     async fn flush(&mut self) -> Result<(), TransportError> { Ok(()) }
     fn take_event_pipe(&mut self) -> Option<ConnectionEvents> { self.events.take() }
-    fn set_frame_policy(&self, _policy: FramePolicy) { /* 在这里落实 Strict */ }
+    fn set_frame_policy(&self, _policy: FramePolicy) { /* honor Strict here */ }
 }
 ```
 
-## 📖 使用示例
+## 📖 Usage Examples
 
-### WebSocket 服务端
+### WebSocket Server
 
 ```rust,no_run
 use async_trait::async_trait;
 use msgtrans::{
-    SessionHandler, SessionSender, TransportServerBuilder,
+    Responder, SessionHandler, SessionSender, TransportServerBuilder,
     WebSocketServerConfig,
     Packet,
     SessionId,
@@ -402,15 +409,14 @@ struct Chat;
 
 #[async_trait]
 impl SessionHandler for Chat {
-    // `on_request` 是必需方法：请求带着「必须应答一次」的义务，
-    // 只能通过消费式 `Responder` 应答。
-    async fn on_request(&self, _s: SessionId, req: Packet, responder: msgtrans::Responder) {
-        let _ = responder.respond(req.into_payload()).await;
-    }
-
     async fn on_message(&self, _session: SessionId, packet: Packet, sender: SessionSender) {
         let msg = String::from_utf8_lossy(packet.payload());
         let _ = sender.send_data(format!("You said: {msg}").into_bytes()).await;
+    }
+
+    async fn on_request(&self, _session: SessionId, request: Packet, responder: Responder) {
+        let msg = String::from_utf8_lossy(request.payload()).to_string();
+        let _ = responder.respond(format!("You asked: {msg}").into_bytes()).await;
     }
 }
 
@@ -429,7 +435,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### QUIC 客户端
+### QUIC Client
 
 ```rust,no_run
 use msgtrans::{
@@ -439,9 +445,9 @@ use msgtrans::{
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 本地 / 自签名测试服务端：跳过证书校验。
-    // 生产环境请去掉 danger_skip_verification()，改为配置真实的
-    // server name 和 CA。
+    // Local / self-signed test server: skip certificate verification.
+    // In production, drop danger_skip_verification() and configure a real
+    // server name and CA instead.
     let config = QuicClientConfig::new("127.0.0.1:8003")?
         .server_name("localhost")
         .danger_skip_verification();
@@ -456,14 +462,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 0..1000u32 {
         client.send(format!("message {i}").as_bytes()).await?;
     }
-    println!("完成");
+    println!("Done");
     Ok(())
 }
 ```
 
-## 🛠️ 配置选项
+## 🛠️ Configuration Options
 
-### 服务端配置
+### Server Configuration
 
 ```rust,no_run
 use msgtrans::{TcpServerConfig, WebSocketServerConfig, QuicServerConfig};
@@ -485,38 +491,38 @@ let quic_config = QuicServerConfig::new("0.0.0.0:8003")?
 # Ok(()) }
 ```
 
-## 🔧 进阶功能
+## 🔧 Advanced Features
 
-### 统计信息
+### Statistics
 
 ```rust,no_run
 # use msgtrans::TransportServer;
 # async fn f(server: &TransportServer) {
 let active = server.session_count().await;
-println!("活跃会话: {active}");
+println!("Active sessions: {active}");
 # }
 ```
 
-### 错误处理
+### Graceful Error Handling
 
 ```rust,no_run
 # use msgtrans::{TransportClient, TransportError};
 # async fn f(client: &mut TransportClient) -> Result<(), Box<dyn std::error::Error>> {
 match client.send("Hello, World!".as_bytes()).await {
-    Ok(result) => println!("已发送 (ID: {})", result.message_id),
+    Ok(result) => println!("Sent (ID: {})", result.message_id),
     Err(TransportError::Connection { .. }) => {
-        println!("连接丢失，重连中");
+        println!("Connection lost, reconnecting");
         client.connect().await?;
     }
     Err(TransportError::Protocol { protocol, reason }) => {
-        println!("协议错误 [{protocol}]: {reason}");
+        println!("Protocol error [{protocol}]: {reason}");
     }
-    Err(e) => println!("其他错误: {e}"),
+    Err(e) => println!("Other error: {e}"),
 }
 # Ok(()) }
 ```
 
-### 优雅关闭
+### Graceful Shutdown
 
 ```rust,no_run
 use msgtrans::{TransportServerBuilder, SessionHandler, SessionSender, TcpServerConfig, Packet, SessionId};
@@ -525,58 +531,53 @@ use std::sync::Arc;
 # struct H;
 # #[async_trait::async_trait]
 # impl SessionHandler for H {
-    // `on_request` 是必需方法：请求带着「必须应答一次」的义务，
-    // 只能通过消费式 `Responder` 应答。
-    async fn on_request(&self, _s: SessionId, req: Packet, responder: msgtrans::Responder) {
-        let _ = responder.respond(req.into_payload()).await;
-    }
-
 #     async fn on_message(&self, _s: SessionId, _p: Packet, _tx: SessionSender) {}
+#     async fn on_request(&self, _s: SessionId, _p: Packet, _r: msgtrans::Responder) {}
 # }
 # async fn f() -> Result<(), Box<dyn std::error::Error>> {
 let server = TransportServerBuilder::new()
     .protocol(TcpServerConfig::new("0.0.0.0:8001")?)
     .build(Arc::new(H)).await?;
 
-// ... 稍后，按配置的超时排空活跃会话：
+// ... later, drain active sessions (TransportConfig::graceful_timeout):
 server.stop().await;
 # Ok(()) }
 ```
 
-## 📚 文档与示例
+## 📚 Documentation and Examples
 
-[`examples/`](examples/) 目录包含完整可运行的程序：
+The [`examples/`](examples/) directory contains complete, runnable programs:
 
-- [`echo_server.rs`](examples/echo_server.rs) - 多协议回显服务端
-- [`echo_client_tcp.rs`](examples/echo_client_tcp.rs) - TCP 客户端
-- [`echo_client_websocket.rs`](examples/echo_client_websocket.rs) - WebSocket 客户端
-- [`echo_client_quic.rs`](examples/echo_client_quic.rs) - QUIC 客户端
-- [`load_test.rs`](examples/load_test.rs) / [`load_test_server.rs`](examples/load_test_server.rs) - 压力测试
-- [`packet.rs`](examples/packet.rs) - 报文序列化
+- [`echo_server.rs`](examples/echo_server.rs) - multi-protocol echo server
+- [`echo_client_tcp.rs`](examples/echo_client_tcp.rs) - TCP client
+- [`echo_client_websocket.rs`](examples/echo_client_websocket.rs) - WebSocket client
+- [`echo_client_quic.rs`](examples/echo_client_quic.rs) - QUIC client
+- [`load_test.rs`](examples/load_test.rs) / [`load_test_server.rs`](examples/load_test_server.rs) - load testing
+- [`packet.rs`](examples/packet.rs) - packet serialization
 
 ```bash
-# 启动多协议回显服务端
+# Start the multi-protocol echo server
 cargo run --example echo_server
 
-# 另开一个终端，运行客户端
+# In another terminal, run a client
 cargo run --example echo_client_tcp
 ```
 
-## 🏆 适用场景
+## 🏆 Use Cases
 
-- **游戏服务器** - 高并发实时通信
-- **聊天系统** - 多协议即时消息
-- **微服务通信** - 高效的服务间传输
-- **实时数据** - 金融、监控、遥测等系统
-- **IoT 平台** - 大规模设备连接管理
-- **协议网关** - 多协议转换与代理
+- **Game servers** - high-concurrency real-time communication
+- **Chat systems** - multi-protocol instant messaging
+- **Microservice communication** - efficient inter-service transport
+- **Real-time data** - financial, monitoring and telemetry systems
+- **IoT platforms** - large-scale device connection management
+- **Protocol gateways** - multi-protocol conversion and proxying
 
-## 📝 许可
+## 📝 License
 
-基于 [Apache License 2.0](https://github.com/zoujiaqing/msgtrans/blob/main/LICENSE) 授权。
+Licensed under the [Apache License 2.0](https://github.com/zoujiaqing/msgtrans/blob/main/LICENSE).
 
 Copyright © 2024 [zoujiaqing](mailto:zoujiaqing@gmail.com)
 
-## 🤝 贡献
+## 🤝 Contributing
 
-欢迎提交 Issue 和 Pull Request。
+Issues and Pull Requests are welcome.

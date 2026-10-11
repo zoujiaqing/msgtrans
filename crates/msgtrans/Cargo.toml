@@ -1,0 +1,135 @@
+[package]
+name = "msgtrans"
+version.workspace = true
+edition = "2021"
+# The floor set by the dependency tree (rcgen 0.14, time 0.3.54); CI builds
+# the library on exactly this version.
+rust-version = "1.88"
+authors.workspace = true
+license.workspace = true
+readme = "README.md"
+repository.workspace = true
+categories = ["asynchronous", "network-programming"]
+keywords = ["tcp", "quic", "websocket", "tokio"]
+description = "Support for a variety of communication protocols such as TCP / QUIC / WebSocket, easy to create server and client network library."
+
+[features]
+default = ["tcp", "tcp-tls", "websocket", "quic"]
+tcp = []
+# PrivChat 语义下 tcp:// 必须带 TLS（见 GATEWAY_TRANSPORT_SPEC §1.1）。
+# 作为通用库这里仍是可选 feature，由使用方决定是否强制。
+tcp-tls = ["tcp", "dep:rustls", "dep:rustls-pemfile", "dep:tokio-rustls", "dep:webpki-roots", "dep:x509-parser", "dep:sha2"]
+websocket = ["dep:tokio-tungstenite", "dep:rustls", "dep:rustls-pemfile", "dep:webpki-roots"]
+quic = ["dep:quinn", "dep:rustls", "dep:rustls-pemfile", "dep:rcgen", "dep:webpki-roots", "dep:x509-parser", "dep:sha2"]
+
+[dependencies]
+# Core dependencies
+tokio = { version = "1.40", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures-util = "0.3"
+futures = "0.3.28"
+async-trait = "0.1"
+bytes = "1.0"
+thiserror = "2"
+serde = { version = "1.0", features = ["derive"] }
+tracing = "0.1"
+
+# Lock-free data structures
+flume = "0.12"
+
+# Protocol-specific dependencies
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"], optional = true }
+quinn = { version = "0.11", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+rustls-pemfile = { version = "2.0", optional = true }
+rcgen = { version = "0.14", optional = true }
+webpki-roots = { version = "1", optional = true }
+tokio-rustls = { version = "0.26", optional = true }
+# SPKI 提取：pinning 要比对 SubjectPublicKeyInfo 的 SHA-256，需要真正解析 X.509
+x509-parser = { version = "0.18", optional = true }
+sha2 = { version = "0.10", optional = true }
+
+# Optional compression support
+flate2 = { version = "1", optional = true }
+zstd = { version = "0.13", optional = true }
+
+# Added for dashmap
+dashmap = "6"
+
+# TCP keepalive support (cross-platform via SockRef)
+socket2 = "0.6"
+
+[dev-dependencies]
+serde_json = "1.0"
+tracing-subscriber = "0.3"
+toml = "1"
+criterion = "0.8"
+# Raw-protocol peers for config behavior tests (foreign ALPN, non-ponging
+# WS peer, TLS WS server, handshake header assertions).
+tokio-tungstenite = "0.30"
+tokio-rustls = "0.26"
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.14"
+futures-util = "0.3"
+
+[[bench]]
+name = "packet_codec"
+harness = false
+
+# --- Per-target protocol requirements -------------------------------------
+# Targets that exercise specific protocols are skipped (not broken) when the
+# corresponding feature is disabled, so every feature combination passes
+# `cargo check --all-targets`.
+
+[[example]]
+name = "e2e_echo_server"
+required-features = ["websocket"]
+
+[[example]]
+name = "echo_client_quic"
+required-features = ["quic"]
+
+[[example]]
+name = "echo_client_tcp"
+required-features = ["tcp"]
+
+[[example]]
+name = "echo_client_websocket"
+required-features = ["websocket"]
+
+[[example]]
+name = "echo_server"
+required-features = ["tcp", "websocket", "quic"]
+
+[[example]]
+name = "load_test"
+required-features = ["tcp", "websocket", "quic"]
+
+[[example]]
+name = "load_test_server"
+required-features = ["tcp", "websocket", "quic"]
+
+[[example]]
+name = "transport_events"
+required-features = ["tcp"]
+
+[[test]]
+name = "backpressure"
+required-features = ["tcp"]
+
+[[test]]
+name = "lifecycle"
+required-features = ["tcp", "websocket", "quic"]
+
+[[test]]
+name = "max_connections"
+required-features = ["tcp", "websocket"]
+
+[[test]]
+name = "write_deadline"
+required-features = ["tcp"]
+
+[[test]]
+name = "config_truthfulness"
+required-features = ["tcp", "websocket", "quic"]

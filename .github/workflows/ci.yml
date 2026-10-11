@@ -14,14 +14,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.0
       - uses: Swatinem/rust-cache@v2
       - name: Build (all targets)
         run: cargo build --all-targets
       - name: Test
-        run: cargo test --all
+        run: cargo test --workspace
       - name: Test (compression features)
-        run: cargo test --features flate2,zstd
+        run: cargo test -p msgtrans --features flate2,zstd
 
   # Every protocol feature combination must build ALL targets (lib, tests,
   # examples, benches) with zero warnings — this is what keeps the feature
@@ -43,8 +45,9 @@ jobs:
           - "tcp,websocket,quic"
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.99.0
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
@@ -53,7 +56,7 @@ jobs:
       # combination must lint clean, so a warning that only appears under, say,
       # websocket-only cannot slip through.
       - name: Clippy all targets
-        run: cargo clippy --no-default-features --features "${{ matrix.features }}" --all-targets -- -D warnings
+        run: cargo clippy -p msgtrans --no-default-features --features "${{ matrix.features }}" --all-targets -- -D warnings
       # --all-targets does NOT cover doctests. The README (the only doctest
       # source) documents the default build and is attached to the crate docs
       # only when all three protocol features are enabled, so the doctest run
@@ -61,7 +64,7 @@ jobs:
       # combinations would run zero doctests and are skipped honestly.
       - name: Doctests (full feature set only)
         if: matrix.features == 'tcp,websocket,quic'
-        run: cargo test --no-default-features --features "${{ matrix.features }}" --doc
+        run: cargo test -p msgtrans --no-default-features --features "${{ matrix.features }}" --doc
         env:
           RUSTFLAGS: -D warnings
 
@@ -71,8 +74,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.99.0
           components: rustfmt
       - name: Format check
         run: cargo fmt --all -- --check
@@ -82,8 +86,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.99.0
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Clippy
@@ -98,16 +103,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.0
       - uses: Swatinem/rust-cache@v2
       - name: Doc (deny warnings)
         run: cargo doc --all-features --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
 
-  # `public-api.txt` is the committed snapshot of the CANDIDATE 2.0 surface
-  # (the API is not frozen yet). It is
-  # the crate-root surface plus `msgtrans::spi`; this job diffs the live surface
+  # `crates/msgtrans/public-api.txt` is the committed snapshot of the 2.0
+  # surface (frozen since 2.0.0-beta.1). It is the crate-root surface plus `msgtrans::spi`; this job diffs the live surface
   # against it and fails on any unrecorded add/remove/change. Widening or
   # breaking the API therefore requires regenerating the baseline
   # (scripts/gen_public_api.sh) in the same commit — no silent drift.
@@ -131,8 +137,26 @@ jobs:
         run: cargo install cargo-public-api --locked --version 0.52.0
       - name: Check public API against committed baseline
         run: |
-          cargo +nightly-2026-07-23 public-api --all-features -s > /tmp/public-api.current
-          if ! diff -u public-api.txt /tmp/public-api.current; then
-            echo "::error::Public API drifted from public-api.txt. If intended, regenerate with scripts/gen_public_api.sh and commit the result."
+          cargo +nightly-2026-07-23 public-api -p msgtrans --all-features -s > /tmp/public-api.current
+          if ! diff -u crates/msgtrans/public-api.txt /tmp/public-api.current; then
+            echo "::error::Public API drifted from crates/msgtrans/public-api.txt. If intended, regenerate with scripts/gen_public_api.sh and commit the result."
             exit 1
           fi
+
+  # msgtrans is a published library: it must keep building on its declared
+  # rust-version (crates/msgtrans/Cargo.toml), independent of the toolchain
+  # the workspace is pinned to. The lockfile is resolved MSRV-aware
+  # (resolver = "3"), so this checks the same dependency versions users get.
+  msrv:
+    name: msgtrans MSRV (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.88.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      - name: Check msgtrans on its MSRV
+        run: cargo +1.88.0 check -p msgtrans --all-features --locked
