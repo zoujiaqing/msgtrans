@@ -181,9 +181,9 @@ jobs:
           tool: cargo-ndk
       - name: Build arm64-v8a
         working-directory: crates/msgtrans-ffi
-        env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
-        run: scripts/build-android.sh
+        # ANDROID_NDK_LATEST_HOME is a runner environment variable, which the
+        # `env` expression context does not see; read it in the shell.
+        run: ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" scripts/build-android.sh
       - name: Check architecture and 16 KB alignment
         working-directory: crates/msgtrans-ffi
         run: |
