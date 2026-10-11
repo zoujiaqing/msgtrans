@@ -1,0 +1,8 @@
+[bindings.kotlin]
+package_name = "uniffi.msgtrans_ffi"
+cdylib_name = "msgtrans_ffi"
+
+[bindings.swift]
+module_name = "MsgtransFFI"
+ffi_module_name = "MsgtransFFIFFI"
+ffi_module_filename = "msgtrans_ffiFFI"

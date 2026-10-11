@@ -1,0 +1,12 @@
+[package]
+name = "uniffi-bindgen"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+uniffi = { version = "0.31.0", features = ["cli"] }
+
+# Standalone: the CLI feature pulls in bindgen-only dependencies that must not
+# end up in the library's dependency graph.
+[workspace]

@@ -1,0 +1,7 @@
+/target
+/uniffi-bindgen/target
+/bindings
+/dist
+/kotlin-smoke/.gradle
+/kotlin-smoke/build
+/kotlin-smoke/.gradle-home
