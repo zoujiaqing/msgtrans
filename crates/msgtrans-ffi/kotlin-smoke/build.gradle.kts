@@ -25,6 +25,9 @@ tasks.register<JavaExec>("smoke") {
     dependsOn(main.compileTaskProvider)
     classpath = main.output.allOutputs + main.runtimeDependencyFiles!!
     mainClass.set("SmokeKt")
-    jvmArgs("-Djna.library.path=${rootDir}/../target/release")
+    // The host library's directory, passed by ../scripts/kotlin-smoke.sh.
+    val jnaPath = project.findProperty("jnaLibraryPath") as String?
+        ?: "${rootDir}/../../../target/release"
+    jvmArgs("-Djna.library.path=$jnaPath")
     args((project.findProperty("smokeArgs") as String? ?: "").split(" ").filter { it.isNotBlank() })
 }

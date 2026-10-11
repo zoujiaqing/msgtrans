@@ -1,5 +1,8 @@
 [workspace]
-members = ["crates/msgtrans"]
+members = ["crates/msgtrans", "crates/msgtrans-ffi"]
+# Standalone on purpose: it enables uniffi's `cli` feature, which must not be
+# feature-unified into the bindings library.
+exclude = ["crates/msgtrans-ffi/uniffi-bindgen"]
 # MSRV-aware resolution: dependencies are chosen to build on msgtrans's
 # declared rust-version, not just on the pinned toolchain.
 resolver = "3"

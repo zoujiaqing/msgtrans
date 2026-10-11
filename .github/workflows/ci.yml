@@ -160,3 +160,61 @@ jobs:
           key: msrv
       - name: Check msgtrans on its MSRV
         run: cargo +1.88.0 check -p msgtrans --all-features --locked
+
+  # The bindings' main deliverable is the Android library: it must keep
+  # cross-compiling, stay arm64-v8a, and keep the 16 KB segment alignment
+  # Google Play requires for Android 15+.
+  ffi-android:
+    name: msgtrans-ffi Android build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.0
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ffi-android
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+      - name: Build arm64-v8a
+        working-directory: crates/msgtrans-ffi
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
+        run: scripts/build-android.sh
+      - name: Check architecture and 16 KB alignment
+        working-directory: crates/msgtrans-ffi
+        run: |
+          SO=dist/android/jniLibs/arm64-v8a/libmsgtrans_ffi.so
+          READELF="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          "$READELF" -h "$SO" | grep -q 'AArch64'
+          ALIGN=$("$READELF" -l "$SO" | awk '/LOAD/{print $NF}' | sort -u)
+          echo "LOAD alignment: $ALIGN"
+          [ "$ALIGN" = "0x4000" ]
+
+  # The generated Kotlin, compiled unchanged and driven over JNA against a
+  # pinned TCP+TLS / QUIC test server. Catches binding shapes that compile in
+  # Rust but not in Kotlin, and regressions across the FFI boundary.
+  ffi-kotlin-smoke:
+    name: msgtrans-ffi Kotlin smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ffi-kotlin
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.14.2"
+      - name: Kotlin smoke
+        working-directory: crates/msgtrans-ffi
+        run: scripts/kotlin-smoke.sh

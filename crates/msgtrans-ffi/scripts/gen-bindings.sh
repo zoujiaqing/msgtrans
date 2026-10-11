@@ -2,18 +2,15 @@
 # Generate Kotlin and Swift bindings from the compiled library's metadata.
 #
 #   scripts/gen-bindings.sh [out-dir]
-set -euo pipefail
-cd "$(dirname "$0")/.."
+source "$(dirname "$0")/common.sh"
 
 OUT="${1:-bindings}"
-cargo build --release
-case "$(uname -s)" in
-  Darwin) LIB=target/release/libmsgtrans_ffi.dylib ;;
-  *)      LIB=target/release/libmsgtrans_ffi.so ;;
-esac
+# The default release profile: unstripped, so the UniFFI metadata the
+# generator reads is intact.
+cargo build -p msgtrans-ffi --release
 
 for lang in kotlin swift; do
   cargo run --quiet --manifest-path uniffi-bindgen/Cargo.toml -- \
-    generate --library "$LIB" --language "$lang" --no-format --out-dir "$OUT/$lang"
+    generate --library "$HOST_LIB" --language "$lang" --no-format --out-dir "$OUT/$lang"
 done
 find "$OUT" -type f | sort

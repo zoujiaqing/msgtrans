@@ -10,10 +10,14 @@ the server sends. Client only — there is no server surface.
 
 ## Toolchain
 
-Pinned to **Rust 1.99.0** (`rust-toolchain.toml`), with the Android and iOS
-targets listed there. UniFFI is 0.31.0, the same version as `privchat-sdk`.
+The workspace is pinned to **Rust 1.99.0** (`rust-toolchain.toml` at the
+repository root), with the Android and iOS targets listed there. UniFFI is
+0.31.0, the same version as `privchat-sdk`.
 
 ## Building
+
+Run from `crates/msgtrans-ffi`. The shipped libraries use the size-optimised
+`release-ffi` profile defined at the workspace root.
 
 | What | Command | Output |
 |---|---|---|
@@ -116,7 +120,7 @@ try await client.shutdown()   // the only way to end `loop`, see below
 ## Tests
 
 ```bash
-cargo test                 # Rust surface against real TCP / TLS / WS / QUIC servers
+cargo test -p msgtrans-ffi # Rust surface against real TCP / TLS / WS / QUIC servers
 scripts/kotlin-smoke.sh    # generated Kotlin, compiled unchanged, driven over JNA
 scripts/swift-smoke.sh     # generated Swift, compiled unchanged, on the macOS host
 ```
@@ -135,8 +139,10 @@ that runtime first (`src/runtime.rs`). The future stays owned by the caller:
 cancelling the coroutine drops the in-flight operation with it, instead of
 leaving a detached task whose result nobody reads.
 
-## Status
+## Versioning and distribution
 
-`0.1.0-beta.1`. Depends on msgtrans through `../msgtrans`: the shutdown and
-retryability fixes it relies on are not in a released msgtrans yet
-(2.0.0-beta.2 lacks them).
+msgtrans-ffi lives in the msgtrans workspace and is versioned in lockstep with
+it: a build reports the msgtrans version it wraps (`msgtransFfiVersion()`). It
+always builds against the msgtrans crate beside it, never a crates.io release,
+and is not itself published to crates.io — it ships as built libraries plus the
+generated bindings.

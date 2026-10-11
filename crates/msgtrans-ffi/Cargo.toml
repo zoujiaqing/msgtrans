@@ -1,19 +1,21 @@
 [package]
 name = "msgtrans-ffi"
-version = "0.1.0-beta.1"
+version.workspace = true
 edition = "2024"
 rust-version = "1.99"
-license = "Apache-2.0"
-authors = ["zoujiaqing <zoujiaqing@gmail.com>"]
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "UniFFI bindings for the msgtrans client (TCP / WebSocket / QUIC) for Kotlin and Swift"
-repository = "https://github.com/zoujiaqing/msgtrans-ffi"
+# Distributed as built libraries (.so / XCFramework) plus generated bindings,
+# not as a crate.
 publish = false
 
 [lib]
 crate-type = ["cdylib", "staticlib", "lib"]
 
 [dependencies]
-msgtrans = { version = "2.0.0-beta.2", path = "../msgtrans" }
+msgtrans = { path = "../msgtrans" }
 uniffi = "0.31.0"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 futures = { version = "0.3", default-features = false, features = ["executor"] }
@@ -25,9 +27,3 @@ bytes = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "signal"] }
 async-trait = "0.1"
 rcgen = "0.14"
-
-[profile.release]
-opt-level = "s"
-lto = "thin"
-codegen-units = 1
-strip = "symbols"

@@ -1,4 +1,4 @@
-/target
+# Paths relative to crates/msgtrans-ffi; the workspace root ignores /target.
 /uniffi-bindgen/target
 /bindings
 /dist

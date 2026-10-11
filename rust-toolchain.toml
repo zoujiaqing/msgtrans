@@ -1,0 +1,14 @@
+[toolchain]
+channel = "1.99.0"
+# clippy / rustfmt are not listed: on a toolchain where they were installed
+# under their old `-preview` component names, listing them makes rustup try
+# to reinstall over the existing files and abort. Add them explicitly if
+# missing: rustup component add clippy rustfmt --toolchain 1.99.0
+#
+# msgtrans itself builds on its own rust-version (1.88, checked in CI); the
+# pin is the toolchain the workspace and the shipped mobile libraries use.
+targets = [
+    "aarch64-linux-android",
+    "aarch64-apple-ios",
+    "aarch64-apple-ios-sim",
+]
