@@ -478,6 +478,25 @@ impl SessionActor {
     /// commands (send requests from TransportServer). This eliminates the need
     /// for external callers to lock the connection Mutex.
     pub async fn run(self) {
+        use futures_util::FutureExt;
+        let handler = self.handler.clone();
+        let session_id = self.session_id;
+        let result = std::panic::AssertUnwindSafe(self.run_loop())
+            .catch_unwind()
+            .await;
+        let reason = match &result {
+            Ok(reason) => reason.clone(),
+            Err(_) => crate::CloseReason::Error("session handler panicked".into()),
+        };
+        // Finalization is owned by the actor, even when cancellation bypasses
+        // a full mailbox or an application callback panics.
+        handler.on_disconnected(session_id, reason).await;
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    async fn run_loop(self) -> crate::CloseReason {
         tracing::debug!(
             "[ACTOR] SessionActor started for session {}",
             self.session_id
@@ -494,6 +513,7 @@ impl SessionActor {
         // Create sender once, reuse for all messages (it's Clone + cheap)
         let sender = SessionSender::new(self.session_id, self.transport.clone());
 
+        let mut close_reason = crate::CloseReason::Normal;
         loop {
             batch.clear();
 
@@ -594,7 +614,7 @@ impl SessionActor {
                                     self.session_id,
                                     reason
                                 );
-                                self.handler.on_disconnected(self.session_id, reason).await;
+                                close_reason = reason;
                                 should_break = true;
                             }
                             TransportEvent::TransportError { error } => {
@@ -649,6 +669,7 @@ impl SessionActor {
             "[ACTOR] SessionActor stopped for session {}",
             self.session_id
         );
+        close_reason
     }
 }
 

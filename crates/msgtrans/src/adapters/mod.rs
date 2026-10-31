@@ -1,3 +1,4 @@
+pub(crate) mod budget;
 pub(crate) mod core;
 pub(crate) mod events;
 pub(crate) mod factories;

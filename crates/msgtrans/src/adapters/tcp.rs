@@ -456,6 +456,7 @@ pub struct TcpAdapter<C> {
     connection_info: ConnectionInfo,
     /// Send queue
     send_queue: mpsc::Sender<crate::adapters::outbound::Outbound>,
+    outbound_budget: Arc<crate::adapters::budget::ByteBudget>,
     /// Consumer half of the bounded event pipe, taken exactly once.
     event_pipe_rx: Option<crate::adapters::events::EventPipeRx>,
     /// Shutdown signal sender
@@ -498,7 +499,11 @@ impl<C> TcpAdapter<C> {
         let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel();
         // Bounded event backbone: the loop task owns the sender half; when the
         // loop ends the pipe drops and the consumer sees end-of-data.
-        let (event_pipe, event_pipe_rx) = crate::adapters::events::event_pipe(limits.pipe_capacity);
+        let (event_pipe, event_pipe_rx) = crate::adapters::events::event_pipe_with_limit(
+            limits.pipe_capacity,
+            limits.decode_limits().max_payload_size,
+            limits.buffer_bytes(),
+        );
 
         let memory_pool = shared_memory_pool();
         let frame_policy = Arc::new(std::sync::atomic::AtomicU8::new(
@@ -529,6 +534,9 @@ impl<C> TcpAdapter<C> {
             config,
             connection_info,
             send_queue: send_queue_tx,
+            outbound_budget: Arc::new(crate::adapters::budget::ByteBudget::new(
+                limits.buffer_bytes(),
+            )),
             event_pipe_rx: Some(event_pipe_rx),
             shutdown_sender: shutdown_tx,
             event_loop_handle: Some(event_loop_handle),
@@ -550,161 +558,90 @@ impl<C> TcpAdapter<C> {
         decode_limits: crate::packet::DecodeLimits,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            let current_session_id = state.session_id();
-            tracing::debug!(
-                "[START] TCP event loop started (session: {})",
-                current_session_id
-            );
-
-            let (mut read_half, mut write_half) = tokio::io::split(stream);
-            let mut read_buffer =
-                OptimizedReadBuffer::new_with_pool(8192, memory_pool, decode_limits);
-            // Any traffic in either direction counts as activity.
-            let mut last_activity = tokio::time::Instant::now();
-
-            'event_loop: loop {
-                // Get current session ID
-                let current_session_id = state.session_id();
-
-                tokio::select! {
-                    // [IDLE] Enforce the configured idle timeout: a connection
-                    // with no traffic in either direction for the duration is
-                    // closed (previously the option was accepted and ignored).
-                    _ = tokio::time::sleep_until(last_activity + idle_timeout.unwrap_or_default()), if idle_timeout.is_some() => {
-                        tracing::info!("[IDLE] TCP connection idle for {:?}, closing (session: {})", idle_timeout.unwrap(), current_session_id);
-                        event_pipe.close(crate::error::CloseReason::Timeout);
-                        break;
+            let (mut reader, mut writer) = tokio::io::split(stream);
+            let activity = std::sync::Mutex::new(tokio::time::Instant::now());
+            let read = async {
+                let mut buffer =
+                    OptimizedReadBuffer::new_with_pool(8192, memory_pool, decode_limits);
+                loop {
+                    match buffer.fill_from_stream(&mut reader).await {
+                        Ok(0) => return crate::error::CloseReason::Normal,
+                        Err(e) => return crate::error::CloseReason::Error(format!("{e:?}")),
+                        Ok(_) => *activity.lock().unwrap() = tokio::time::Instant::now(),
                     }
-                    // [RECV] Handle receive data - using optimized buffer method
-                    read_result = read_buffer.fill_from_stream(&mut read_half) => {
-                        match read_result {
-                            Ok(0) => {
-                                tracing::debug!("[RECV] Peer actively closed TCP connection (session: {})", current_session_id);
-                                // Peer actively closed: notify upper layer that connection is closed for resource cleanup
-                                event_pipe.close(crate::error::CloseReason::Normal);
-                                break;
-                            }
-                            Ok(_) => {
-                                last_activity = tokio::time::Instant::now();
-                                // Parse all complete packets currently in the buffer.
-                                let strict = crate::packet::FramePolicy::from_u8(
-                                    frame_policy.load(std::sync::atomic::Ordering::Relaxed),
-                                ) == crate::packet::FramePolicy::Strict;
-                                loop {
-                                    match read_buffer.try_parse_next_packet(strict) {
-                                        Ok(Some(packet)) => {
-                                            tracing::debug!("[RECV] TCP received packet: {} bytes (session: {})", packet.payload.len(), current_session_id);
-                                            tracing::debug!("[DETAIL] Packet details: ID={}, type={:?}, payload_len={}", packet.header.message_id, packet.header.packet_type, packet.payload.len());
-
-                                            // Data plane: backpressure. A slow
-                                            // consumer parks the read loop here,
-                                            // which parks the socket via TCP
-                                            // flow control — no event is dropped.
-                                            if !event_pipe
-                                                .deliver(TransportEvent::MessageReceived(packet))
-                                                .await
-                                            {
-                                                tracing::debug!("[RECV] Event consumer gone (session: {})", current_session_id);
-                                                break 'event_loop;
-                                            }
-                                        }
-                                        Ok(None) => break,
-                                        Err(e) => {
-                                            // Never-parsed sessions are unrecognised traffic (see the
-                                            // first-packet branch above); anything after that is a real
-                                            // protocol fault on an established session and stays an error.
-                                            let unrecognised = matches!(e, TcpError::Config(_));
-                                            if unrecognised {
-                                                tracing::debug!("[RECV] TCP parse error: {:?} (session: {})", e, current_session_id);
-                                            } else {
-                                                tracing::error!("[RECV] TCP parse error: {:?} (session: {})", e, current_session_id);
-                                            }
-                                            event_pipe.close(crate::error::CloseReason::Error(format!("{:?}", e)));
-                                            break 'event_loop;
-                                        }
-                                    }
+                    let strict = crate::packet::FramePolicy::from_u8(
+                        frame_policy.load(std::sync::atomic::Ordering::Relaxed),
+                    ) == crate::packet::FramePolicy::Strict;
+                    loop {
+                        match buffer.try_parse_next_packet(strict) {
+                            Ok(Some(packet)) => {
+                                if !event_pipe
+                                    .deliver(TransportEvent::MessageReceived(packet))
+                                    .await
+                                {
+                                    return crate::error::CloseReason::Normal;
                                 }
                             }
-                            Err(e) => {
-                                tracing::error!("[RECV] TCP connection error: {:?} (session: {})", e, current_session_id);
-                                // Network error: notify upper layer of connection error for resource cleanup
-                                event_pipe.close(crate::error::CloseReason::Error(format!("{:?}", e)));
-                                break;
-                            }
+                            Ok(None) => break,
+                            Err(e) => return crate::error::CloseReason::Error(format!("{e:?}")),
                         }
-                    }
-
-                    // [SEND] Handle send data
-                    item = send_queue.recv() => {
-                        if let Some(item) = item {
-                            let (packet, completion) = (item.packet, item.completion);
-                            // A write that exceeds the deadline means the peer stopped
-                            // draining: the connection is declared dead rather than
-                            // blocking every queued sender behind it.
-                            let write = tokio::time::timeout(
-                                write_deadline,
-                                Self::write_packet_to_stream(&mut write_half, &packet),
-                            ).await;
-                            match write {
-                                Ok(Ok(_)) => {
-                                    last_activity = tokio::time::Instant::now();
-                                    tracing::debug!("[SEND] TCP send successful: {} bytes (session: {})", packet.payload.len(), current_session_id);
-                                    // Write completion: the REAL result, after the write.
-                                    if let Some(completion) = completion {
-                                        completion.complete(Ok(()));
-                                    }
-                                    // Diagnostic tier: droppable under load.
-                                    event_pipe.diagnostic(TransportEvent::MessageSent { packet_id: packet.header.message_id });
-                                }
-                                Ok(Err(e)) => {
-                                    tracing::error!("[SEND] TCP send error: {:?} (session: {})", e, current_session_id);
-                                    if let Some(completion) = completion {
-                                        completion.complete(Err(crate::error::TransportError::connection_error(
-                                            "TCP write failed",
-                                            false,
-                                        )));
-                                    }
-                                    // Send error: notify upper layer of connection error for resource cleanup
-                                    event_pipe.close(crate::error::CloseReason::Error(format!("{:?}", e)));
-                                    break;
-                                }
-                                Err(_) => {
-                                    tracing::error!("[SEND] TCP write deadline exceeded (session: {})", current_session_id);
-                                    if let Some(completion) = completion {
-                                        completion.complete(Err(crate::error::TransportError::connection_error(
-                                            "TCP write deadline exceeded",
-                                            false,
-                                        )));
-                                    }
-                                    event_pipe.close(crate::error::CloseReason::Error(
-                                        "TCP write deadline exceeded".to_string(),
-                                    ));
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    // [STOP] Handle shutdown signal
-                    _ = shutdown_signal.recv() => {
-                        tracing::info!("[STOP] Received shutdown signal, stopping TCP event loop (session: {})", current_session_id);
-                        // Locally initiated close: publish the reason so the
-                        // consumer's single ConnectionClosed carries Normal
-                        // instead of the synthesized abnormal-end reason.
-                        event_pipe.close(crate::error::CloseReason::Normal);
-                        break;
                     }
                 }
-            }
-
-            // The loop has ended (peer close, error, or shutdown): mark closed so
-            // is_connected() reflects reality, not just what close() sets.
+            };
+            let write = async {
+                while let Some(item) = send_queue.recv().await {
+                    let result = tokio::time::timeout(
+                        write_deadline,
+                        Self::write_packet_to_stream(&mut writer, &item.packet),
+                    )
+                    .await;
+                    let result = match result {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(e)) => Err(crate::error::TransportError::connection_error(
+                            format!("TCP write failed: {e:?}"),
+                            false,
+                        )),
+                        Err(_) => Err(crate::error::TransportError::connection_error(
+                            "TCP write deadline exceeded",
+                            false,
+                        )),
+                    };
+                    let failed = result.as_ref().err().map(ToString::to_string);
+                    if let Some(completion) = item.completion {
+                        completion.complete(result);
+                    }
+                    if let Some(reason) = failed {
+                        return crate::error::CloseReason::Error(reason);
+                    }
+                    *activity.lock().unwrap() = tokio::time::Instant::now();
+                    event_pipe.diagnostic(TransportEvent::MessageSent {
+                        packet_id: item.packet.header.message_id,
+                    });
+                }
+                crate::error::CloseReason::Normal
+            };
+            let idle = async {
+                let Some(timeout) = idle_timeout else {
+                    return std::future::pending().await;
+                };
+                loop {
+                    let deadline = *activity.lock().unwrap() + timeout;
+                    tokio::time::sleep_until(deadline).await;
+                    if tokio::time::Instant::now() >= *activity.lock().unwrap() + timeout {
+                        return crate::error::CloseReason::Timeout;
+                    }
+                }
+            };
+            // Both IO futures are owned here. Backpressure parks only the reader;
+            // ending either direction drops the other, including pending receipts.
+            let reason = tokio::select! {
+                reason = read => reason,
+                reason = write => reason,
+                reason = idle => reason,
+                _ = shutdown_signal.recv() => crate::error::CloseReason::Normal,
+            };
+            event_pipe.close(reason);
             state.set_status(crate::adapters::core::ConnStatus::Closed);
-
-            tracing::debug!(
-                "[SUCCESS] TCP event loop ended (session: {})",
-                current_session_id
-            );
         })
     }
 
@@ -739,6 +676,8 @@ impl TcpAdapter<TcpClientConfig> {
 
         // Optional local bind (previously silently ignored): connect through a
         // TcpSocket so the source address/port can be pinned.
+        let deadline = (config.connect_timeout != std::time::Duration::ZERO)
+            .then(|| tokio::time::Instant::now() + config.connect_timeout);
         let connect = async {
             match config.local_bind_address {
                 Some(local) => {
@@ -754,7 +693,7 @@ impl TcpAdapter<TcpClientConfig> {
             }
         };
         let stream = if config.connect_timeout != std::time::Duration::from_secs(0) {
-            tokio::time::timeout(config.connect_timeout, connect)
+            tokio::time::timeout_at(deadline.unwrap(), connect)
                 .await
                 .map_err(|_| TcpError::Timeout)?
                 .map_err(TcpError::Io)?
@@ -775,7 +714,14 @@ impl TcpAdapter<TcpClientConfig> {
         // 就能把连接压回明文，pinning 形同虚设。
         #[cfg(feature = "tcp-tls")]
         let stream = if config.is_tls_enabled() {
-            Self::client_tls_handshake(stream, &config).await?
+            let handshake = Self::client_tls_handshake(stream, &config);
+            if let Some(deadline) = deadline {
+                tokio::time::timeout_at(deadline, handshake)
+                    .await
+                    .map_err(|_| TcpError::Timeout)??
+            } else {
+                handshake.await?
+            }
         } else {
             MaybeTlsStream::Plain(stream)
         };
@@ -838,6 +784,7 @@ impl<C: Send + Sync + 'static> Connection for TcpAdapter<C> {
     fn writer(&self) -> std::sync::Arc<dyn crate::connection::ConnectionWriter> {
         std::sync::Arc::new(crate::adapters::outbound::QueueWriter::new(
             self.send_queue.clone(),
+            self.outbound_budget.clone(),
             "tcp_outbound_queue",
             "TCP connection closed",
         ))

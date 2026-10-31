@@ -624,10 +624,11 @@ impl TransportServer {
                     };
                     let Some(transport_event) = event else { break };
                     if let Some(handle) = &actor_handle {
-                        if !server_clone
-                            .pump_one_event(session_id, handle, transport_event)
-                            .await
-                        {
+                        let keep_running = tokio::select! {
+                            _ = pump_cancel.cancelled() => false,
+                            keep = server_clone.pump_one_event(session_id, handle, transport_event) => keep,
+                        };
+                        if !keep_running {
                             break;
                         }
                     }
@@ -1471,9 +1472,9 @@ impl TransportServer {
     /// A caller whose deadline expires while another shutdown is still
     /// running gets a clean=false snapshot without disturbing the owner.
     ///
-    /// Note: handlers' `on_disconnected` is best-effort during shutdown (the
-    /// close offer is non-blocking; a full mailbox skips it and cancellation
-    /// ends the actor directly).
+    /// Each actor finalizes `on_disconnected` exactly once, including when
+    /// cancellation bypasses a full mailbox. A blocked callback prevents a
+    /// clean report until it completes; the deadline does not cancel it.
     pub async fn shutdown_with_timeout(&self, timeout: std::time::Duration) -> ShutdownReport {
         let started = std::time::Instant::now();
         let deadline = tokio::time::Instant::now() + timeout;

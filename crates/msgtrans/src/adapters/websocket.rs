@@ -7,7 +7,6 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::{
     accept_hdr_async_with_config, connect_async_tls_with_config,
     tungstenite::{
-        error,
         handshake::server::{ErrorResponse, Request, Response},
         protocol::{Message, WebSocketConfig},
         Error as TungsteniteError,
@@ -236,6 +235,7 @@ pub struct WebSocketAdapter<C> {
     connection_info: ConnectionInfo,
     /// Send queue
     send_queue: mpsc::Sender<crate::adapters::outbound::Outbound>,
+    outbound_budget: Arc<crate::adapters::budget::ByteBudget>,
     /// Event sender
     event_pipe_rx: Option<crate::adapters::events::EventPipeRx>,
     /// Shutdown signal sender
@@ -291,7 +291,11 @@ impl<C> WebSocketAdapter<C> {
         let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel();
         // Bounded event backbone: the loop task owns the sender half; when the
         // loop ends the pipe drops and the consumer sees end-of-data.
-        let (event_pipe, event_pipe_rx) = crate::adapters::events::event_pipe(limits.pipe_capacity);
+        let (event_pipe, event_pipe_rx) = crate::adapters::events::event_pipe_with_limit(
+            limits.pipe_capacity,
+            limits.decode_limits().max_payload_size,
+            limits.buffer_bytes(),
+        );
 
         // Keepalive/idle enforcement parameters from the config (previously
         // declared but never enforced).
@@ -316,6 +320,9 @@ impl<C> WebSocketAdapter<C> {
             config,
             connection_info,
             send_queue: send_queue_tx,
+            outbound_budget: Arc::new(crate::adapters::budget::ByteBudget::new(
+                limits.buffer_bytes(),
+            )),
             event_pipe_rx: Some(event_pipe_rx),
             shutdown_sender: shutdown_tx,
             event_loop_handle: Some(event_loop_handle),
@@ -326,7 +333,7 @@ impl<C> WebSocketAdapter<C> {
     /// Start event loop based on tokio::select!
     #[allow(clippy::too_many_arguments)]
     async fn start_event_loop(
-        mut stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
+        stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
         state: crate::adapters::core::ConnState,
         mut send_queue: mpsc::Receiver<crate::adapters::outbound::Outbound>,
         mut shutdown_signal: mpsc::UnboundedReceiver<()>,
@@ -337,226 +344,121 @@ impl<C> WebSocketAdapter<C> {
         decode_limits: crate::packet::DecodeLimits,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            let current_session_id = state.session_id();
-            tracing::debug!(
-                "[START] WebSocket event loop started (session: {})",
-                current_session_id
-            );
-
-            // Keepalive/idle state: any traffic in either direction counts as
-            // activity; an unanswered ping past pong_timeout is a dead peer.
-            let mut last_activity = tokio::time::Instant::now();
-            let mut next_ping =
-                tokio::time::Instant::now() + keepalive.ping_interval.unwrap_or_default();
-            let mut ping_sent_at: Option<tokio::time::Instant> = None;
-
-            loop {
-                // Get current session ID
-                let current_session_id = state.session_id();
-
-                tokio::select! {
-                    // [IDLE] No traffic in either direction for the configured
-                    // duration closes the connection.
-                    _ = tokio::time::sleep_until(last_activity + keepalive.idle_timeout.unwrap_or_default()), if keepalive.idle_timeout.is_some() => {
-                        tracing::info!("[IDLE] WebSocket connection idle for {:?}, closing (session: {})", keepalive.idle_timeout.unwrap(), current_session_id);
-                        event_pipe.close(crate::error::CloseReason::Timeout);
-                        state.set_status(crate::adapters::core::ConnStatus::Closed);
-                        break;
-                    }
-
-                    // [PING] Two separate deadlines share this arm: while a
-                    // ping is outstanding the wake-up is its pong deadline
-                    // (dead-peer detection); otherwise it is the next
-                    // interval-scheduled ping. A healthy connection therefore
-                    // pings exactly once per ping_interval — the pong_timeout
-                    // never shortens the cadence.
-                    _ = tokio::time::sleep_until(match ping_sent_at {
-                        Some(sent_at) => sent_at + keepalive.pong_timeout,
-                        None => next_ping,
-                    }), if keepalive.ping_interval.is_some() => {
-                        if ping_sent_at.is_some() {
-                            // Pong deadline elapsed without a pong.
-                            tracing::info!("[PING] WebSocket pong timeout ({:?}), closing (session: {})", keepalive.pong_timeout, current_session_id);
-                            event_pipe.close(crate::error::CloseReason::Timeout);
-                            state.set_status(crate::adapters::core::ConnStatus::Closed);
-                            break;
+            let (mut writer, mut reader) = stream.split();
+            let activity = std::sync::Mutex::new(tokio::time::Instant::now());
+            let pending_ping = std::sync::Mutex::new(None::<tokio::time::Instant>);
+            let control = tokio::sync::Notify::new();
+            let read = async {
+                while let Some(message) = reader.next().await {
+                    let message = match message {
+                        Ok(message) => message,
+                        Err(TungsteniteError::ConnectionClosed) => {
+                            return crate::error::CloseReason::Normal
                         }
-                        if let Err(e) = stream.send(Message::Ping(Bytes::new())).await {
-                            tracing::debug!("[PING] WebSocket ping send failed: {:?} (session: {})", e, current_session_id);
-                            event_pipe.close(crate::error::CloseReason::Error(format!("{:?}", e)));
-                            state.set_status(crate::adapters::core::ConnStatus::Closed);
-                            break;
-                        }
-                        ping_sent_at = Some(tokio::time::Instant::now());
-                        next_ping = tokio::time::Instant::now() + keepalive.ping_interval.unwrap();
+                        Err(e) => return crate::error::CloseReason::Error(format!("{e:?}")),
+                    };
+                    *activity.lock().unwrap() = tokio::time::Instant::now();
+                    if matches!(message, Message::Pong(_)) {
+                        *pending_ping.lock().unwrap() = None;
+                        control.notify_one();
+                    } else if matches!(message, Message::Ping(_)) {
+                        // tungstenite queues the automatic pong while reading.
+                        control.notify_one();
                     }
-
-                    // [RECV] Handle incoming data
-                    read_result = stream.next() => {
-                        match read_result {
-                            Some(Ok(message)) => {
-                                last_activity = tokio::time::Instant::now();
-                                if matches!(message, Message::Pong(_)) {
-                                    ping_sent_at = None;
-                                }
-                                let policy = crate::packet::FramePolicy::from_u8(
-                                    frame_policy.load(std::sync::atomic::Ordering::Relaxed),
-                                );
-                                match Self::process_websocket_message(message, policy, &decode_limits) {
-                                    MessageProcessResult::Packet(packet) => {
-                                        tracing::debug!("[RECV] WebSocket received packet: {} bytes (session: {})", packet.payload.len(), current_session_id);
-
-                                        // Send receive event
-                                        // Data plane: backpressure, no loss.
-                                        if !event_pipe
-                                            .deliver(TransportEvent::MessageReceived(packet))
-                                            .await
-                                        {
-                                            break;
-                                        }
-                                    }
-                                    MessageProcessResult::Heartbeat => {
-                                        // Heartbeat message, continue loop
-                                        continue;
-                                    }
-                                    MessageProcessResult::PeerClosed => {
-                                        // Peer closed normally: notify upper layer application that connection is closed for resource cleanup
-                                        event_pipe.close(crate::error::CloseReason::Normal);
-                                        state.set_status(crate::adapters::core::ConnStatus::Closed);
-                                        break;
-                                    }
-                                    MessageProcessResult::Error(e) => {
-                                        tracing::error!("[ERROR] WebSocket message processing error: {:?} (session: {})", e, current_session_id);
-                                        // Message processing error: notify upper layer application of connection error for resource cleanup
-                                        event_pipe.close(crate::error::CloseReason::Error(format!("{:?}", e)));
-                                        state.set_status(crate::adapters::core::ConnStatus::Closed);
-                                        break;
-                                    }
-                                }
-                            }
-                            Some(Err(e)) => {
-                                // Gracefully handle different types of WebSocket errors
-                                let reason = match e {
-                                    TungsteniteError::Protocol(error::ProtocolError::ResetWithoutClosingHandshake) => {
-                                        tracing::debug!("[CLOSE] Peer actively reset WebSocket connection (session: {})", current_session_id);
-                                        crate::error::CloseReason::Normal
-                                    }
-                                    TungsteniteError::ConnectionClosed => {
-                                        tracing::debug!("[CLOSE] Peer actively closed WebSocket connection (session: {})", current_session_id);
-                                        crate::error::CloseReason::Normal
-                                    }
-                                    _ => {
-                                        tracing::error!("[ERROR] WebSocket connection error: {:?} (session: {})", e, current_session_id);
-                                        crate::error::CloseReason::Error(format!("{:?}", e))
-                                    }
-                                };
-
-                                // Network exception or peer closed: notify upper layer application that connection is closed for resource cleanup
-                                event_pipe.close(reason);
-                                state.set_status(crate::adapters::core::ConnStatus::Closed);
-                                break;
-                            }
-                            None => {
-                                tracing::debug!("[CLOSE] Peer actively closed WebSocket connection (session: {})", current_session_id);
-                                // Peer actively closed: notify upper layer application that connection is closed for resource cleanup
-                                event_pipe.close(crate::error::CloseReason::Normal);
-                                state.set_status(crate::adapters::core::ConnStatus::Closed);
-                                break;
+                    let policy = crate::packet::FramePolicy::from_u8(
+                        frame_policy.load(std::sync::atomic::Ordering::Relaxed),
+                    );
+                    match Self::process_websocket_message(message, policy, &decode_limits) {
+                        MessageProcessResult::Packet(packet) => {
+                            if !event_pipe
+                                .deliver(TransportEvent::MessageReceived(packet))
+                                .await
+                            {
+                                return crate::error::CloseReason::Normal;
                             }
                         }
+                        MessageProcessResult::Heartbeat => {}
+                        MessageProcessResult::PeerClosed => {
+                            return crate::error::CloseReason::Normal
+                        }
+                        MessageProcessResult::Error(e) => {
+                            return crate::error::CloseReason::Error(format!("{e:?}"))
+                        }
                     }
-
-                    // [SEND] Handle outgoing data - zero-copy optimization
-                    item = send_queue.recv() => {
-                        if let Some(item) = item {
-                            let (packet, completion) = (item.packet, item.completion);
-                            // tungstenite takes Bytes directly, so the packet's own
-                            // Bytes buffer is handed over without another copy.
-                            let encoded = match packet.try_encode() {
-                                Ok(bytes) => bytes,
+                }
+                crate::error::CloseReason::Normal
+            };
+            let write = async {
+                let mut next_ping =
+                    tokio::time::Instant::now() + keepalive.ping_interval.unwrap_or_default();
+                loop {
+                    let ping_deadline = pending_ping
+                        .lock()
+                        .unwrap()
+                        .map(|sent| sent + keepalive.pong_timeout)
+                        .unwrap_or(next_ping);
+                    tokio::select! {
+                        _ = control.notified() => {
+                            if !matches!(tokio::time::timeout(write_deadline, writer.flush()).await, Ok(Ok(()))) {
+                                return crate::error::CloseReason::Error("WebSocket control write failed".into());
+                            }
+                        }
+                        _ = tokio::time::sleep_until(ping_deadline), if keepalive.ping_interval.is_some() => {
+                            if pending_ping.lock().unwrap().is_some() { return crate::error::CloseReason::Timeout; }
+                            // Publish before write: a fast pong may arrive during send().
+                            *pending_ping.lock().unwrap() = Some(tokio::time::Instant::now());
+                            if !matches!(tokio::time::timeout(write_deadline, writer.send(Message::Ping(Bytes::new()))).await, Ok(Ok(()))) {
+                                return crate::error::CloseReason::Error("WebSocket ping write failed".into());
+                            }
+                            next_ping = tokio::time::Instant::now() + keepalive.ping_interval.unwrap();
+                        }
+                        item = send_queue.recv() => {
+                            let Some(item) = item else { return crate::error::CloseReason::Normal; };
+                            let encoded = match item.packet.try_encode() {
+                                Ok(encoded) => encoded,
                                 Err(e) => {
-                                    if let Some(completion) = completion {
-                                        completion.complete(Err(crate::error::TransportError::protocol_error("websocket", format!("encode failed: {e}"))));
-                                    }
+                                    if let Some(completion) = item.completion { completion.complete(Err(crate::error::TransportError::protocol_error("websocket", format!("encode failed: {e}")))); }
                                     continue;
                                 }
                             };
-                            let message = Message::Binary(encoded);
-
-                            // Deadline: a peer that stops draining kills the
-                            // connection instead of blocking queued senders.
-                            let write = tokio::time::timeout(
-                                write_deadline,
-                                stream.send(message),
-                            ).await;
-                            match write {
-                                Ok(Ok(_)) => {
-                                    last_activity = tokio::time::Instant::now();
-                                    tracing::debug!("[SEND] WebSocket send successful: {} bytes (session: {})", packet.payload.len(), current_session_id);
-                                    if let Some(completion) = completion {
-                                        completion.complete(Ok(()));
-                                    }
-                                    // Send send event
-                                    event_pipe.diagnostic(TransportEvent::MessageSent { packet_id: packet.header.message_id });
-                                }
-                                Ok(Err(e)) => {
-                                    tracing::error!("[ERROR] WebSocket send error: {:?} (session: {})", e, current_session_id);
-                                    if let Some(completion) = completion {
-                                        completion.complete(Err(crate::error::TransportError::connection_error(
-                                            "WebSocket write failed",
-                                            false,
-                                        )));
-                                    }
-                                    // Send error: notify upper layer application of connection error for resource cleanup
-                                    event_pipe.close(crate::error::CloseReason::Error(format!("{:?}", e)));
-                                    state.set_status(crate::adapters::core::ConnStatus::Closed);
-                                    break;
-                                }
-                                Err(_) => {
-                                    tracing::error!("[ERROR] WebSocket write deadline exceeded (session: {})", current_session_id);
-                                    if let Some(completion) = completion {
-                                        completion.complete(Err(crate::error::TransportError::connection_error(
-                                            "WebSocket write deadline exceeded",
-                                            false,
-                                        )));
-                                    }
-                                    event_pipe.close(crate::error::CloseReason::Error(
-                                        "WebSocket write deadline exceeded".to_string(),
-                                    ));
-                                    state.set_status(crate::adapters::core::ConnStatus::Closed);
-                                    break;
-                                }
-                            }
+                            let result = match tokio::time::timeout(write_deadline, writer.send(Message::Binary(encoded))).await {
+                                Ok(Ok(())) => Ok(()),
+                                Ok(Err(e)) => Err(crate::error::TransportError::connection_error(format!("WebSocket write failed: {e}"), false)),
+                                Err(_) => Err(crate::error::TransportError::connection_error("WebSocket write deadline exceeded", false)),
+                            };
+                            let failed = result.as_ref().err().map(ToString::to_string);
+                            if let Some(completion) = item.completion { completion.complete(result); }
+                            if let Some(reason) = failed { return crate::error::CloseReason::Error(reason); }
+                            *activity.lock().unwrap() = tokio::time::Instant::now();
+                            event_pipe.diagnostic(TransportEvent::MessageSent { packet_id: item.packet.header.message_id });
                         }
-                    }
-
-                    // [STOP] Handle shutdown signal
-                    _ = shutdown_signal.recv() => {
-                        tracing::info!("[STOP] Received shutdown signal, stopping WebSocket event loop (session: {})", current_session_id);
-                        // Locally initiated close is Normal, not an abnormal end.
-                        event_pipe.close(crate::error::CloseReason::Normal);
-                        // Active close: first send WebSocket Close frame, then close connection
-                        tracing::debug!("[CLOSE] Send WebSocket Close frame for graceful shutdown");
-
-                        // Send Close frame
-                        if let Err(e) = stream.close(None).await {
-                            tracing::warn!("[SEND] Failed to send WebSocket Close frame: {:?} (session: {})", e, current_session_id);
-                        } else {
-                            tracing::debug!("[SEND] WebSocket Close frame sent successfully (session: {})", current_session_id);
-                        }
-
-                        // Active close: no need to send close event, because it was initiated by upper layer
-                        // Lower layer protocol close has already notified peer, upper layer already knows about the close
-                        tracing::debug!("[CLOSE] Active close, not sending close event");
-                        break;
                     }
                 }
-            }
+            };
+            let idle = async {
+                let Some(timeout) = keepalive.idle_timeout else {
+                    return std::future::pending().await;
+                };
+                loop {
+                    let deadline = *activity.lock().unwrap() + timeout;
+                    tokio::time::sleep_until(deadline).await;
+                    if tokio::time::Instant::now() >= *activity.lock().unwrap() + timeout {
+                        return crate::error::CloseReason::Timeout;
+                    }
+                }
+            };
+            let (reason, local_close) = tokio::select! {
+                reason = read => (reason, false),
+                reason = write => (reason, false),
+                reason = idle => (reason, false),
+                _ = shutdown_signal.recv() => (crate::error::CloseReason::Normal, true),
+            };
 
-            tracing::debug!(
-                "[SUCCESS] WebSocket event loop ended (session: {})",
-                current_session_id
-            );
+            event_pipe.close(reason);
+            state.set_status(crate::adapters::core::ConnStatus::Closed);
+            if local_close {
+                let _ = tokio::time::timeout(write_deadline, writer.close()).await;
+            }
         })
     }
 
@@ -643,6 +545,7 @@ impl<C: Send + Sync + 'static> Connection for WebSocketAdapter<C> {
     fn writer(&self) -> std::sync::Arc<dyn crate::connection::ConnectionWriter> {
         std::sync::Arc::new(crate::adapters::outbound::QueueWriter::new(
             self.send_queue.clone(),
+            self.outbound_budget.clone(),
             "websocket_outbound_queue",
             "WebSocket connection closed",
         ))

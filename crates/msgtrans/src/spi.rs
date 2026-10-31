@@ -105,3 +105,15 @@ pub fn event_channel(capacity: std::num::NonZeroUsize) -> (EventSink, Connection
     let (tx, rx) = crate::adapters::events::event_pipe(capacity.get());
     (EventSink(tx), ConnectionEvents(rx))
 }
+
+/// Create an inbound channel using the adapter's connection limits, including
+/// the decompressed payload cap and retained-byte budget. Custom adapters should
+/// prefer this constructor when their config receives `ConnectionLimits`.
+pub fn event_channel_with_limits(limits: ConnectionLimits) -> (EventSink, ConnectionEvents) {
+    let (tx, rx) = crate::adapters::events::event_pipe_with_limit(
+        limits.pipe_capacity(),
+        limits.decode_limits().max_payload_size,
+        limits.buffer_bytes(),
+    );
+    (EventSink(tx), ConnectionEvents(rx))
+}

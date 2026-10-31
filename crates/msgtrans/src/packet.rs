@@ -1,6 +1,5 @@
 use bytes::{Bytes, BytesMut};
 
-#[cfg(any(feature = "flate2", feature = "zstd"))]
 const MAX_DECOMPRESSED_PAYLOAD_SIZE: usize = 16 * 1024 * 1024;
 
 /// Packet types - simplified to 3 core types
@@ -450,12 +449,23 @@ impl Packet {
 
     /// Decompress payload
     pub fn decompress_payload(&mut self) -> Result<(), PacketError> {
+        self.decompress_payload_with_limit(MAX_DECOMPRESSED_PAYLOAD_SIZE)
+    }
+
+    pub(crate) fn decompress_payload_with_limit(
+        &mut self,
+        max_size: usize,
+    ) -> Result<(), PacketError> {
         let compression = self.header.compression;
         if compression == CompressionType::None {
             return Ok(());
         }
 
-        self.payload = Bytes::from(Self::decompress_data(&self.payload, compression)?);
+        self.payload = Bytes::from(Self::decompress_data_with_limit(
+            &self.payload,
+            compression,
+            max_size,
+        )?);
         Ok(())
     }
 
@@ -781,7 +791,17 @@ impl Packet {
     }
 
     /// Decompress data
+    #[cfg(test)]
     fn decompress_data(data: &[u8], compression: CompressionType) -> Result<Vec<u8>, PacketError> {
+        Self::decompress_data_with_limit(data, compression, MAX_DECOMPRESSED_PAYLOAD_SIZE)
+    }
+
+    fn decompress_data_with_limit(
+        data: &[u8],
+        compression: CompressionType,
+        max_size: usize,
+    ) -> Result<Vec<u8>, PacketError> {
+        let _ = max_size; // Codec features can both be disabled.
         match compression {
             CompressionType::None => Ok(data.to_vec()),
             CompressionType::Zlib => {
@@ -792,15 +812,15 @@ impl Packet {
 
                     let decoder = ZlibDecoder::new(data);
                     let mut result = Vec::new();
-                    let limit = (MAX_DECOMPRESSED_PAYLOAD_SIZE + 1) as u64;
+                    let limit = (max_size as u64).saturating_add(1);
                     decoder
                         .take(limit)
                         .read_to_end(&mut result)
                         .map_err(|e| PacketError::CompressionError(e.to_string()))?;
-                    if result.len() > MAX_DECOMPRESSED_PAYLOAD_SIZE {
+                    if result.len() > max_size {
                         return Err(PacketError::CompressionError(format!(
                             "decompressed payload exceeds {} bytes",
-                            MAX_DECOMPRESSED_PAYLOAD_SIZE
+                            max_size
                         )));
                     }
                     Ok(result)
@@ -813,7 +833,7 @@ impl Packet {
             CompressionType::Zstd => {
                 #[cfg(feature = "zstd")]
                 {
-                    zstd::bulk::decompress(data, MAX_DECOMPRESSED_PAYLOAD_SIZE)
+                    zstd::bulk::decompress(data, max_size)
                         .map_err(|e| PacketError::CompressionError(e.to_string()))
                 }
                 #[cfg(not(feature = "zstd"))]

@@ -164,6 +164,7 @@ impl core::panic::unwind_safe::RefUnwindSafe for msgtrans::ConnectionInfo
 impl core::panic::unwind_safe::UnwindSafe for msgtrans::ConnectionInfo
 pub struct msgtrans::spi::ConnectionLimits
 impl msgtrans::ConnectionLimits
+pub fn msgtrans::ConnectionLimits::buffer_bytes(&self) -> usize
 pub fn msgtrans::ConnectionLimits::decode_limits(&self) -> msgtrans::DecodeLimits
 pub fn msgtrans::ConnectionLimits::outbound_capacity(&self) -> usize
 pub fn msgtrans::ConnectionLimits::pipe_capacity(&self) -> usize
@@ -373,6 +374,7 @@ pub fn msgtrans::spi::Server::accept<'life0, 'async_trait>(&'life0 mut self) -> 
 pub fn msgtrans::spi::Server::local_addr(&self) -> core::result::Result<core::net::socket_addr::SocketAddr, msgtrans::TransportError>
 pub fn msgtrans::spi::Server::shutdown<'life0, 'async_trait>(&'life0 mut self) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<(), msgtrans::TransportError>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait
 pub fn msgtrans::spi::event_channel(core::num::nonzero::NonZeroUsize) -> (msgtrans::spi::EventSink, msgtrans::spi::ConnectionEvents)
+pub fn msgtrans::spi::event_channel_with_limits(msgtrans::ConnectionLimits) -> (msgtrans::spi::EventSink, msgtrans::spi::ConnectionEvents)
 #[non_exhaustive] pub enum msgtrans::ClientEvent
 pub msgtrans::ClientEvent::Connected
 pub msgtrans::ClientEvent::Connected::info: msgtrans::ConnectionInfo
@@ -684,6 +686,7 @@ impl core::panic::unwind_safe::RefUnwindSafe for msgtrans::ClientEvents
 impl core::panic::unwind_safe::UnwindSafe for msgtrans::ClientEvents
 pub struct msgtrans::ClientLimits
 impl msgtrans::ClientLimits
+pub fn msgtrans::ClientLimits::buffer_bytes(self, usize) -> Self
 pub fn msgtrans::ClientLimits::connection_limits(&self) -> msgtrans::ConnectionLimits
 pub fn msgtrans::ClientLimits::max_ext_header_size(self, usize) -> Self
 pub fn msgtrans::ClientLimits::max_payload_size(self, usize) -> Self
@@ -777,6 +780,7 @@ impl core::panic::unwind_safe::RefUnwindSafe for msgtrans::ConnectionInfo
 impl core::panic::unwind_safe::UnwindSafe for msgtrans::ConnectionInfo
 pub struct msgtrans::ConnectionLimits
 impl msgtrans::ConnectionLimits
+pub fn msgtrans::ConnectionLimits::buffer_bytes(&self) -> usize
 pub fn msgtrans::ConnectionLimits::decode_limits(&self) -> msgtrans::DecodeLimits
 pub fn msgtrans::ConnectionLimits::outbound_capacity(&self) -> usize
 pub fn msgtrans::ConnectionLimits::pipe_capacity(&self) -> usize
@@ -1101,6 +1105,7 @@ impl core::panic::unwind_safe::RefUnwindSafe for msgtrans::SendReceipt
 impl core::panic::unwind_safe::UnwindSafe for msgtrans::SendReceipt
 pub struct msgtrans::ServerLimits
 impl msgtrans::ServerLimits
+pub fn msgtrans::ServerLimits::buffer_bytes(self, usize) -> Self
 pub fn msgtrans::ServerLimits::connection_limits(&self) -> msgtrans::ConnectionLimits
 pub fn msgtrans::ServerLimits::mailbox(&self) -> usize
 pub fn msgtrans::ServerLimits::mailbox_capacity(self, usize) -> Self
@@ -1284,10 +1289,10 @@ pub async fn msgtrans::TransportClient::request_with_options(&self, bytes::bytes
 pub async fn msgtrans::TransportClient::send(&self, &[u8]) -> core::result::Result<msgtrans::SendReceipt, msgtrans::TransportError>
 pub async fn msgtrans::TransportClient::send_detached(&self, &[u8]) -> core::result::Result<msgtrans::SendReceipt, msgtrans::TransportError>
 pub async fn msgtrans::TransportClient::send_with_options(&self, impl core::convert::Into<bytes::bytes::Bytes>, msgtrans::SendOptions) -> core::result::Result<(), msgtrans::TransportError>
-pub async fn msgtrans::TransportClient::shutdown(&mut self) -> core::result::Result<(), msgtrans::TransportError>
+pub async fn msgtrans::TransportClient::shutdown(&self) -> core::result::Result<(), msgtrans::TransportError>
 impl core::ops::drop::Drop for msgtrans::TransportClient
 pub fn msgtrans::TransportClient::drop(&mut self)
-impl core::marker::Freeze for msgtrans::TransportClient
+impl !core::marker::Freeze for msgtrans::TransportClient
 impl core::marker::Send for msgtrans::TransportClient
 impl core::marker::Sync for msgtrans::TransportClient
 impl core::marker::Unpin for msgtrans::TransportClient

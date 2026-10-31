@@ -374,7 +374,7 @@ async fn concurrent_and_repeated_shutdowns_are_idempotent() {
 async fn client_shutdown_joins_forwarding_and_is_idempotent() {
     let addr = "127.0.0.1:28891";
     let server = start_server(addr).await;
-    let mut client = connect(addr).await;
+    let client = connect(addr).await;
     assert!(echo_ok(&client).await);
 
     client.shutdown().await.expect("shutdown");
@@ -402,7 +402,7 @@ async fn client_shutdown_joins_forwarding_and_is_idempotent() {
 async fn client_shutdown_ends_the_event_stream() {
     let addr = "127.0.0.1:28875";
     let _server = start_server(addr).await;
-    let mut client = connect(addr).await;
+    let client = connect(addr).await;
     let mut events = client.events().await.expect("event stream");
     let consumer = tokio::spawn(async move { while events.next().await.is_some() {} });
     tokio::time::sleep(Duration::from_millis(100)).await;

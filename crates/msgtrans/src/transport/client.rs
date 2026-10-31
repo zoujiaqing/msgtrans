@@ -175,7 +175,7 @@ pub struct TransportClient {
     /// left after the forwarding task is aborted, so releasing it is what lets
     /// the stream end — `ClientEvents::next()` returns `None` after draining
     /// instead of waiting forever on a client that can never deliver again.
-    event_sender: Option<tokio::sync::mpsc::Sender<crate::event::ClientEvent>>,
+    event_sender: std::sync::Mutex<Option<tokio::sync::mpsc::Sender<crate::event::ClientEvent>>>,
     event_receiver: Arc<RwLock<Option<tokio::sync::mpsc::Receiver<crate::event::ClientEvent>>>>,
     event_forwarding_running: Arc<AtomicBool>,
     event_forwarding_task: Arc<RwLock<Option<JoinHandle<()>>>>,
@@ -228,7 +228,7 @@ impl TransportClient {
             protocol_config,
             frame_policy,
             current_session_id: Arc::new(RwLock::new(None)),
-            event_sender: Some(event_sender),
+            event_sender: std::sync::Mutex::new(Some(event_sender)),
             event_receiver: Arc::new(RwLock::new(Some(event_receiver))),
             event_forwarding_running: Arc::new(AtomicBool::new(false)),
             event_forwarding_task: Arc::new(RwLock::new(None)),
@@ -359,6 +359,9 @@ impl TransportClient {
                         attempt + 1,
                         e
                     );
+                    if !e.is_retryable() {
+                        return Err(e);
+                    }
                     last_error = Some(e);
                 }
             }
@@ -389,12 +392,15 @@ impl TransportClient {
     /// `disconnect()` is the reconnectable operation (the client can
     /// `connect()` again); `shutdown()` ends the client. After it returns, no
     /// background task of this client is running.
-    pub async fn shutdown(&mut self) -> Result<(), TransportError> {
+    pub async fn shutdown(&self) -> Result<(), TransportError> {
         // Release the client's own event sender first, so the stream can end
         // once the teardown below aborts the forwarding task (the only other
         // sender). Done before any await: a cancelled shutdown() future still
         // leaves it released, and the owned teardown task finishes the rest.
-        self.event_sender = None;
+        self.event_sender
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
 
         // Lifecycle gate: Active starts the teardown; ShuttingDown (including
         // a shutdown future that was cancelled mid-flight) resumes by
@@ -513,10 +519,9 @@ impl TransportClient {
                     // actually happened — a panicked teardown must not be
                     // presented as a successful shutdown.
                     if handle.await.is_err() {
-                        return Err(TransportError::connection_error(
-                            "client teardown panicked",
-                            false,
-                        ));
+                        *self.teardown_err.lock().unwrap_or_else(|e| e.into_inner()) = Some(
+                            TransportError::connection_error("client teardown panicked", false),
+                        );
                     }
                 }
                 break;
@@ -527,7 +532,7 @@ impl TransportClient {
             .teardown_err
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .take()
+            .clone()
         {
             Some(e) => Err(e),
             None => Ok(()),
@@ -703,7 +708,12 @@ impl TransportClient {
 
         // Get Transport's event stream
         if let Some(mut transport_events) = self.inner.get_event_stream().await {
-            let Some(client_event_sender) = self.event_sender.clone() else {
+            let Some(client_event_sender) = self
+                .event_sender
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+            else {
                 // Only shutdown() clears it, and connect() is gated on the
                 // lifecycle phase before reaching here.
                 return Err(TransportError::connection_error(

@@ -209,6 +209,7 @@ impl Transport {
         // was already replaced by a newer generation (which must not be
         // touched, but the OLD generation's state must still say closed).
         self.state_manager.mark_closed(session_id).await;
+        self.state_manager.remove_connection(session_id);
         if taken.is_some() {
             tracing::debug!(
                 "[RETIRE] Generation {} slot removed after peer close",
@@ -291,6 +292,7 @@ impl Transport {
         }
 
         self.state_manager.mark_closed(session_id).await;
+        self.state_manager.remove_connection(session_id);
         tracing::info!("[SUCCESS] Session {} shutdown complete", session_id);
         Ok(())
     }
@@ -331,6 +333,7 @@ impl Transport {
         }
 
         self.state_manager.mark_closed(session_id).await;
+        self.state_manager.remove_connection(session_id);
 
         tracing::info!("[SUCCESS] Session {} force close complete", session_id);
         Ok(())
@@ -932,6 +935,18 @@ mod generation_tests {
         }
         fn take_event_pipe(&mut self) -> Option<crate::spi::ConnectionEvents> {
             None
+        }
+    }
+
+    #[tokio::test]
+    async fn retired_generations_do_not_accumulate_connection_state() {
+        let ctx = TransportContext::new().await.unwrap();
+        let transport = Arc::new(Transport::with_context(TransportConfig::default(), &ctx));
+        for _ in 0..100 {
+            let closed = Arc::new(AtomicBool::new(false));
+            let id = transport.set_connection(mock(&closed)).await;
+            transport.retire_generation(id).await;
+            assert!(transport.state_manager.get_state(id).await.is_none());
         }
     }
 

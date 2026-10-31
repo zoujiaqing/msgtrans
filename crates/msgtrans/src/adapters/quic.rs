@@ -444,6 +444,7 @@ pub struct QuicAdapter<C> {
     connection_info: ConnectionInfo,
     /// Send queue
     send_queue: mpsc::Sender<crate::adapters::outbound::Outbound>,
+    outbound_budget: Arc<crate::adapters::budget::ByteBudget>,
     /// Event sender
     event_pipe_rx: Option<crate::adapters::events::EventPipeRx>,
     /// Shutdown signal sender
@@ -490,7 +491,11 @@ impl<C> QuicAdapter<C> {
         // Bounded event backbone shared by the supervisor/read/write tasks;
         // whichever ends first publishes the close, and when all clones drop
         // the consumer sees end-of-data.
-        let (event_pipe, event_pipe_rx) = crate::adapters::events::event_pipe(limits.pipe_capacity);
+        let (event_pipe, event_pipe_rx) = crate::adapters::events::event_pipe_with_limit(
+            limits.pipe_capacity,
+            limits.decode_limits().max_payload_size,
+            limits.buffer_bytes(),
+        );
         let event_pipe = std::sync::Arc::new(event_pipe);
         let event_loop_handle = Self::start_event_loop(
             connection,
@@ -510,6 +515,9 @@ impl<C> QuicAdapter<C> {
             config,
             connection_info,
             send_queue: send_queue_tx,
+            outbound_budget: Arc::new(crate::adapters::budget::ByteBudget::new(
+                limits.buffer_bytes(),
+            )),
             event_pipe_rx: Some(event_pipe_rx),
             shutdown_sender: shutdown_tx,
             event_loop_handle: Some(event_loop_handle),
@@ -913,6 +921,7 @@ impl<C: Send + Sync + 'static> Connection for QuicAdapter<C> {
     fn writer(&self) -> std::sync::Arc<dyn crate::connection::ConnectionWriter> {
         std::sync::Arc::new(crate::adapters::outbound::QueueWriter::new(
             self.send_queue.clone(),
+            self.outbound_budget.clone(),
             "quic_outbound_queue",
             "QUIC connection closed",
         ))

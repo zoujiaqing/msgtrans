@@ -125,6 +125,7 @@ async fn send_item(
 /// the replacement connection.
 pub(crate) struct QueueWriter {
     queue: mpsc::Sender<Outbound>,
+    budget: std::sync::Arc<crate::adapters::budget::ByteBudget>,
     queue_name: &'static str,
     closed_msg: &'static str,
 }
@@ -132,11 +133,13 @@ pub(crate) struct QueueWriter {
 impl QueueWriter {
     pub(crate) fn new(
         queue: mpsc::Sender<Outbound>,
+        budget: std::sync::Arc<crate::adapters::budget::ByteBudget>,
         queue_name: &'static str,
         closed_msg: &'static str,
     ) -> Self {
         Self {
             queue,
+            budget,
             queue_name,
             closed_msg,
         }
@@ -150,6 +153,9 @@ impl crate::connection::ConnectionWriter for QueueWriter {
         packet: Packet,
         completion: WriteCompletion,
     ) -> Result<(), TransportError> {
+        let packet = tokio::time::timeout(SEND_QUEUE_WAIT, self.budget.charge(packet))
+            .await
+            .map_err(|_| self.budget.exhausted())??;
         send_with_completion_bounded(
             &self.queue,
             packet,

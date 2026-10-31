@@ -52,6 +52,7 @@ pub const DEFAULT_MAX_EXT_HEADER_SIZE: usize = u16::MAX as usize;
 /// the values with the accessors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConnectionLimits {
+    pub(crate) buffer_bytes: usize,
     pub(crate) write_deadline: Duration,
     pub(crate) pipe_capacity: usize,
     pub(crate) outbound_capacity: usize,
@@ -59,6 +60,11 @@ pub struct ConnectionLimits {
 }
 
 impl ConnectionLimits {
+    /// Maximum retained bytes per direction (inbound and outbound have separate budgets).
+    pub fn buffer_bytes(&self) -> usize {
+        self.buffer_bytes
+    }
+
     /// Maximum duration of a single socket write.
     pub fn write_deadline(&self) -> Duration {
         self.write_deadline
@@ -82,6 +88,7 @@ impl ConnectionLimits {
 impl Default for ConnectionLimits {
     fn default() -> Self {
         Self {
+            buffer_bytes: 64 * 1024 * 1024,
             write_deadline: DEFAULT_WRITE_DEADLINE,
             pipe_capacity: DEFAULT_PIPE_CAPACITY,
             outbound_capacity: DEFAULT_OUTBOUND_CAPACITY,
@@ -108,6 +115,14 @@ impl Default for ServerLimits {
 }
 
 impl ServerLimits {
+    /// Retained payload/ext-header bytes per connection, independently in each
+    /// direction. Clamped to [64 KiB, 1 GiB]. Retaining inbound Bytes retains
+    /// the charge; an individual packet larger than this budget is rejected.
+    pub fn buffer_bytes(mut self, bytes: usize) -> Self {
+        self.connection.buffer_bytes = bytes.clamp(64 * 1024, 1024 * 1024 * 1024);
+        self
+    }
+
     /// Start from the defaults.
     pub fn new() -> Self {
         Self::default()
@@ -178,6 +193,14 @@ pub struct ClientLimits {
 }
 
 impl ClientLimits {
+    /// Retained payload/ext-header bytes per connection, independently in each
+    /// direction. Clamped to [64 KiB, 1 GiB]. Retaining inbound Bytes retains
+    /// the charge; an individual packet larger than this budget is rejected.
+    pub fn buffer_bytes(mut self, bytes: usize) -> Self {
+        self.connection.buffer_bytes = bytes.clamp(64 * 1024, 1024 * 1024 * 1024);
+        self
+    }
+
     /// Start from the defaults.
     pub fn new() -> Self {
         Self::default()

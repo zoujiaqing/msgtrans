@@ -25,6 +25,8 @@ use tokio::sync::{mpsc, watch};
 #[derive(Debug)]
 pub struct EventPipe {
     data_tx: mpsc::Sender<TransportEvent>,
+    max_payload_size: usize,
+    budget: crate::adapters::budget::ByteBudget,
     close_tx: watch::Sender<Option<CloseReason>>,
 }
 
@@ -39,10 +41,27 @@ pub struct EventPipeRx {
 
 /// Create a connected pipe with the given data-plane capacity.
 pub fn event_pipe(capacity: usize) -> (EventPipe, EventPipeRx) {
+    event_pipe_with_limit(
+        capacity,
+        crate::packet::DEFAULT_MAX_FRAME_SIZE,
+        64 * 1024 * 1024,
+    )
+}
+
+pub(crate) fn event_pipe_with_limit(
+    capacity: usize,
+    max_payload_size: usize,
+    buffer_bytes: usize,
+) -> (EventPipe, EventPipeRx) {
     let (data_tx, data_rx) = mpsc::channel(capacity);
     let (close_tx, close_rx) = watch::channel(None);
     (
-        EventPipe { data_tx, close_tx },
+        EventPipe {
+            data_tx,
+            close_tx,
+            max_payload_size,
+            budget: crate::adapters::budget::ByteBudget::new(buffer_bytes),
+        },
         EventPipeRx {
             data_rx,
             close_rx,
@@ -56,12 +75,18 @@ pub fn event_pipe(capacity: usize) -> (EventPipe, EventPipeRx) {
 ///
 /// Decompression is bounded by `Packet::decompress_payload` (16 MiB cap), so a
 /// decompression bomb is refused rather than buffered.
-fn normalize_inbound(mut packet: crate::packet::Packet) -> Result<crate::packet::Packet, String> {
+fn normalize_inbound(
+    mut packet: crate::packet::Packet,
+    max_payload_size: usize,
+) -> Result<crate::packet::Packet, String> {
     if packet.compression() == crate::packet::CompressionType::None {
+        if packet.payload().len() > max_payload_size {
+            return Err(format!("payload exceeds {max_payload_size} bytes"));
+        }
         return Ok(packet);
     }
     packet
-        .decompress_payload()
+        .decompress_payload_with_limit(max_payload_size)
         .map_err(|e| format!("failed to decompress packet: {e}"))?;
     packet.set_compression(crate::packet::CompressionType::None);
     Ok(packet)
@@ -84,17 +109,43 @@ impl EventPipe {
     /// connection ends rather than delivering garbage.
     pub async fn deliver(&self, event: TransportEvent) -> bool {
         let event = match event {
-            TransportEvent::MessageReceived(packet) => match normalize_inbound(packet) {
-                Ok(packet) => TransportEvent::MessageReceived(packet),
-                Err(reason) => {
-                    tracing::warn!("[PIPE] Undecodable inbound packet, closing: {reason}");
-                    self.close(CloseReason::Error(reason));
-                    return false;
+            TransportEvent::MessageReceived(packet) => {
+                match normalize_inbound(packet, self.max_payload_size) {
+                    Ok(packet) => {
+                        let mut closed = self.close_tx.subscribe();
+                        if closed.borrow().is_some() {
+                            return false;
+                        }
+                        let packet = tokio::select! {
+                            _ = closed.changed() => return false,
+                            packet = self.budget.charge(packet) => packet,
+                        };
+                        match packet {
+                            Ok(packet) => TransportEvent::MessageReceived(packet),
+                            Err(error) => {
+                                self.close(CloseReason::Error(error.to_string()));
+                                return false;
+                            }
+                        }
+                    }
+
+                    Err(reason) => {
+                        tracing::warn!("[PIPE] Undecodable inbound packet, closing: {reason}");
+                        self.close(CloseReason::Error(reason));
+                        return false;
+                    }
                 }
-            },
+            }
             other => other,
         };
-        self.data_tx.send(event).await.is_ok()
+        let mut closed = self.close_tx.subscribe();
+        if closed.borrow().is_some() {
+            return false;
+        }
+        tokio::select! {
+            _ = closed.changed() => false,
+            result = self.data_tx.send(event) => result.is_ok(),
+        }
     }
 
     /// Emit a droppable diagnostic (send confirmations). Never blocks; under
