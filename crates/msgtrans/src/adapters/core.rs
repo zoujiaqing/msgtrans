@@ -8,7 +8,7 @@
 use crate::SessionId;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
-#[cfg(feature = "quic")]
+#[cfg(any(feature = "quic", feature = "tcp-tls", feature = "websocket"))]
 use tokio::task::JoinHandle;
 
 /// Lifecycle state of a connection.
@@ -64,6 +64,34 @@ impl ConnState {
 
     pub(crate) fn set_session_id(&self, session_id: SessionId) {
         self.session_id.store(session_id.0, Ordering::SeqCst);
+    }
+}
+
+/// Owns the accept loop. The loop in turn owns its in-flight handshakes in a
+/// JoinSet. A successful shutdown waits for both the listener and accepted
+/// sockets; dropping a partially constructed server actively aborts the loop.
+#[cfg(any(feature = "tcp-tls", feature = "websocket"))]
+pub(crate) struct AcceptPump {
+    cancel: tokio_util::sync::CancellationToken,
+    handle: JoinHandle<()>,
+}
+
+#[cfg(any(feature = "tcp-tls", feature = "websocket"))]
+impl AcceptPump {
+    pub(crate) fn new(cancel: tokio_util::sync::CancellationToken, handle: JoinHandle<()>) -> Self {
+        Self { cancel, handle }
+    }
+
+    pub(crate) async fn shutdown(&mut self) -> Result<(), tokio::task::JoinError> {
+        self.cancel.cancel();
+        (&mut self.handle).await
+    }
+}
+
+#[cfg(any(feature = "tcp-tls", feature = "websocket"))]
+impl Drop for AcceptPump {
+    fn drop(&mut self) {
+        self.handle.abort();
     }
 }
 

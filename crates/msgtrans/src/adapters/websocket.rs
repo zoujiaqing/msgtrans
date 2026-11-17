@@ -609,7 +609,7 @@ pub(crate) struct WebSocketServerBuilder<C> {
     limits: crate::transport::limits::ConnectionLimits,
 }
 
-impl<C> WebSocketServerBuilder<C> {
+impl<C: 'static> WebSocketServerBuilder<C> {
     pub(crate) fn new() -> Self {
         Self {
             config: None,
@@ -646,10 +646,16 @@ impl<C> WebSocketServerBuilder<C> {
         let config = self
             .config
             .ok_or_else(|| WebSocketError::Config("Missing WebSocket server config".to_string()))?;
+        let addr = (&config as &dyn std::any::Any)
+            .downcast_ref::<crate::protocol::WebSocketServerConfig>()
+            .map(|cfg| cfg.bind_address)
+            .unwrap_or_else(|| crate::protocol::WebSocketServerConfig::default().bind_address);
+        let listener = TcpListener::bind(addr).await?;
         Ok(WebSocketServer {
             config,
             limits: self.limits,
-            local_addr: None,
+            local_addr: Some(listener.local_addr()?),
+            listener: Some(listener),
             incoming: None,
             pump: None,
         })
@@ -681,10 +687,11 @@ pub(crate) struct WebSocketServer<C> {
     /// Bound address, captured when the listener is created so it survives the
     /// listener being moved into the background accept pump.
     local_addr: Option<std::net::SocketAddr>,
-    /// Completed upgrades. `None` until the first `accept()` binds the port.
+    listener: Option<TcpListener>,
+    /// Completed upgrades. The pump starts on the first accept.
     incoming: Option<mpsc::Receiver<AcceptedWebSocket>>,
     /// Handle to the background pump, aborted on shutdown/drop.
-    pump: Option<tokio::task::JoinHandle<()>>,
+    pump: Option<crate::adapters::core::AcceptPump>,
 }
 
 impl<C: 'static> WebSocketServer<C> {
@@ -695,15 +702,16 @@ impl<C: 'static> WebSocketServer<C> {
             .unwrap_or_default()
     }
 
-    /// Bind the port and start the accept pump. The pump owns the listener:
+    /// Start the accept pump after all ports have bound. The pump owns the listener:
     /// it accepts raw sockets and runs each upgrade handshake on its own task
     /// under `WS_HANDSHAKE_TIMEOUT`, so a slow or silent peer can never stall
     /// the connections behind it.
-    async fn start_pump(&mut self) -> Result<(), WebSocketError> {
+    fn start_pump(&mut self) -> Result<(), WebSocketError> {
         let ws_cfg = self.server_config();
-        let listener = TcpListener::bind(ws_cfg.bind_address).await?;
-        let local_addr = listener.local_addr()?;
-        tracing::debug!("[START] WebSocket server listening on: {}", local_addr);
+        let listener = self
+            .listener
+            .take()
+            .ok_or_else(|| WebSocketError::Config("WebSocket server is shut down".into()))?;
 
         let accept_limits = self.limits;
         let expected_path = ws_cfg.path;
@@ -711,9 +719,17 @@ impl<C: 'static> WebSocketServer<C> {
         let (tx, rx) = mpsc::channel::<AcceptedWebSocket>(MAX_PENDING_WS_HANDSHAKES);
         let permits = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_WS_HANDSHAKES));
 
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let stop = cancel.clone();
         let pump = tokio::spawn(async move {
+            let mut handshakes = tokio::task::JoinSet::new();
             loop {
-                let (tcp_stream, addr) = match listener.accept().await {
+                let (tcp_stream, addr) = match tokio::select! {
+                    biased;
+                    _ = stop.cancelled() => break,
+                    _ = handshakes.join_next(), if !handshakes.is_empty() => continue,
+                    conn = listener.accept() => conn,
+                } {
                     Ok(v) => v,
                     Err(e) => {
                         tracing::warn!("[WS] accept failed: {e}");
@@ -729,7 +745,7 @@ impl<C: 'static> WebSocketServer<C> {
                 let tx = tx.clone();
                 let expected_path = expected_path.clone();
                 let supported = supported.clone();
-                tokio::spawn(async move {
+                handshakes.spawn(async move {
                     let handshake =
                         ws_upgrade(tcp_stream, expected_path, supported, &accept_limits);
                     match tokio::time::timeout(WS_HANDSHAKE_TIMEOUT, handshake).await {
@@ -747,11 +763,11 @@ impl<C: 'static> WebSocketServer<C> {
                     drop(permit);
                 });
             }
+            handshakes.shutdown().await;
         });
 
-        self.local_addr = Some(local_addr);
         self.incoming = Some(rx);
-        self.pump = Some(pump);
+        self.pump = Some(crate::adapters::core::AcceptPump::new(cancel, pump));
         Ok(())
     }
 
@@ -760,7 +776,7 @@ impl<C: 'static> WebSocketServer<C> {
         C: Clone + crate::protocol::ProtocolConfig,
     {
         if self.incoming.is_none() {
-            self.start_pump().await?;
+            self.start_pump()?;
         }
         let rx = self
             .incoming
@@ -783,21 +799,16 @@ impl<C: 'static> WebSocketServer<C> {
     }
 
     pub(crate) async fn shutdown(&mut self) -> Result<(), WebSocketError> {
-        // Abort the pump to release the TCP port without waiting for task drop.
+        // Join the listener and every in-flight upgrade before reporting shutdown.
+        self.listener.take();
         self.incoming.take();
-        if let Some(pump) = self.pump.take() {
-            pump.abort();
+        if let Some(mut pump) = self.pump.take() {
+            pump.shutdown()
+                .await
+                .map_err(|e| WebSocketError::Config(format!("accept pump failed: {e}")))?;
         }
         self.local_addr = None;
         Ok(())
-    }
-}
-
-impl<C> Drop for WebSocketServer<C> {
-    fn drop(&mut self) {
-        if let Some(pump) = self.pump.take() {
-            pump.abort();
-        }
     }
 }
 
@@ -1059,7 +1070,7 @@ mod accept_pump_tests {
             .build()
             .await
             .unwrap();
-        server.start_pump().await.unwrap();
+        server.start_pump().unwrap();
         let addr = server.local_addr().unwrap();
 
         // Silent peers: TCP connected, never speak. Before the fix the first

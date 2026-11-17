@@ -2,9 +2,21 @@
 
 2.0 is a deliberate breaking release, aiming at a small, honest public API.
 **The surface is frozen as of 2.0.0-beta.1** — it changes before 2.0.0 only to fix a defect, and any such change is called out in the release notes.
-Every change below is a compile error you fix once, not a silent behavior
-drift. The wire format is **unchanged** (byte-identical fixtures), so 1.x and
-2.0 peers interoperate.
+The Packet encoding is unchanged (byte-identical fixtures), but endpoint setup
+and validation are not. QUIC interoperates with 2.0 betas that negotiate
+`msgtrans/1`: the client sends the first Packet. Two peers negotiating
+`msgtrans/2` use a one-way stream preface so the server can send first. QUIC
+peers with no ALPN (including 1.0.10) are not supported. TCP and WebSocket do
+not use the QUIC preface; strict decoding and WebSocket upgrade settings
+still have to agree across peers.
+
+Server `send` and `request` use the session's writer directly. The inbound
+callback may send to its own session without waiting for that callback to
+return to the actor mailbox. An accepted `close_session`,
+`force_close_session`, or `remove_session` signals the session runtime; it
+does not wait for its own callback to finish. Admission capacity is returned
+only after the runtime and callbacks have exited. Use `shutdown` to await
+server-wide teardown.
 
 ## 1. Server handlers: `on_message` split into `on_message` + `on_request`
 
@@ -79,12 +91,12 @@ produced a self-inconsistent frame. `to_bytes()`/`encode_to_vec()` are removed.
   returns the consumed length) and `Packet::decode_exact(bytes)` (framed
   transports, rejects trailing bytes). `from_bytes` == `decode_exact`.
 
-## 4. Single send SPI on `Connection`
+## 4. Single send SPI on `ConnectionWriter`
 
-Adapters implement ONE send method:
+Adapters expose a connection-bound writer through `Connection::writer()`. The writer implements one send method:
 
 ```rust
-async fn send_with_completion(&mut self, packet: Packet, completion: WriteCompletion)
+async fn send_with_completion(&self, packet: Packet, completion: WriteCompletion)
     -> Result<(), TransportError>;
 ```
 

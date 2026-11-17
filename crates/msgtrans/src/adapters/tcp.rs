@@ -886,77 +886,21 @@ impl TcpServerBuilder {
             listener.local_addr()?
         );
 
-        // TLS acceptor 只在启动时构建一次。此前每个连接都重新解析 PEM 并重建
-        // rustls 配置——那是一条免费的 CPU 放大攻击路径。
         let local_addr = listener.local_addr()?;
-
         #[cfg(feature = "tcp-tls")]
-        if self.config.is_tls_enabled() {
-            let acceptor = build_tls_acceptor(&self.config)?;
-            let (tx, rx) = tokio::sync::mpsc::channel(MAX_PENDING_HANDSHAKES);
-            let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_HANDSHAKES));
-            let keepalive = self.config.keepalive;
-            let pump = tokio::spawn(async move {
-                loop {
-                    let (stream, peer_addr) = match listener.accept().await {
-                        Ok(v) => v,
-                        Err(e) => {
-                            tracing::warn!("[TLS] accept failed: {e}");
-                            continue;
-                        }
-                    };
-                    if let Some(ka) = keepalive {
-                        apply_tcp_keepalive(&stream, ka);
-                    }
-                    // Bounded: a flood of peers that open sockets and never
-                    // speak cannot exhaust tasks or memory.
-                    let Ok(permit) = permits.clone().try_acquire_owned() else {
-                        tracing::warn!("[TLS] too many pending handshakes, dropping {peer_addr}");
-                        continue;
-                    };
-                    let acceptor = acceptor.clone();
-                    let tx = tx.clone();
-                    // Handshakes run concurrently: a slow or silent peer must
-                    // not stall connections behind it.
-                    tokio::spawn(async move {
-                        let result =
-                            tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream))
-                                .await;
-                        match result {
-                            Ok(Ok(tls)) => {
-                                // Shed completed handshakes when the bounded accept queue is full.
-                                if tx
-                                    .try_send((MaybeTlsStream::ServerTls(Box::new(tls)), peer_addr))
-                                    .is_err()
-                                {
-                                    tracing::warn!("[TLS] accept queue full, dropping {peer_addr}");
-                                }
-                            }
-                            Ok(Err(e)) => {
-                                tracing::debug!("[TLS] handshake failed from {peer_addr}: {e}")
-                            }
-                            Err(_) => tracing::debug!("[TLS] handshake timed out from {peer_addr}"),
-                        }
-                        // Keep the permit until the connection is handed off or dropped.
-                        drop(permit);
-                    });
-                }
-            });
-            return Ok(TcpServer {
-                listener: None,
-                config: self.config,
-                limits: self.limits,
-                local_addr,
-                incoming: Some(rx),
-                pump: Some(pump),
-            });
-        }
+        let tls_acceptor = if self.config.is_tls_enabled() {
+            Some(build_tls_acceptor(&self.config)?)
+        } else {
+            None
+        };
 
         Ok(TcpServer {
             listener: Some(listener),
             config: self.config,
             limits: self.limits,
             local_addr,
+            #[cfg(feature = "tcp-tls")]
+            tls_acceptor,
             #[cfg(feature = "tcp-tls")]
             incoming: None,
             #[cfg(feature = "tcp-tls")]
@@ -979,12 +923,14 @@ pub(crate) struct TcpServer {
     /// Bound address, captured at build time so it survives the listener being
     /// moved into the background accept pump.
     local_addr: std::net::SocketAddr,
+    #[cfg(feature = "tcp-tls")]
+    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
     /// Completed TLS handshakes. `None` when the listener runs in plain mode.
     #[cfg(feature = "tcp-tls")]
     incoming: Option<tokio::sync::mpsc::Receiver<(MaybeTlsStream, std::net::SocketAddr)>>,
     /// Handle to the background pump, aborted on shutdown.
     #[cfg(feature = "tcp-tls")]
-    pump: Option<tokio::task::JoinHandle<()>>,
+    pump: Option<crate::adapters::core::AcceptPump>,
 }
 
 /// Upper bound on concurrently pending TLS handshakes.
@@ -1035,7 +981,79 @@ fn build_tls_acceptor(config: &TcpServerConfig) -> Result<tokio_rustls::TlsAccep
 }
 
 impl TcpServer {
+    #[cfg(feature = "tcp-tls")]
+    fn start_tls_pump(&mut self, acceptor: tokio_rustls::TlsAcceptor) -> Result<(), TcpError> {
+        let listener = self
+            .listener
+            .take()
+            .ok_or_else(|| TcpError::Config("TCP server is shut down".into()))?;
+        let (tx, rx) = tokio::sync::mpsc::channel(MAX_PENDING_HANDSHAKES);
+        let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_HANDSHAKES));
+        let keepalive = self.config.keepalive;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let stop = cancel.clone();
+        let pump = tokio::spawn(async move {
+            let mut handshakes = tokio::task::JoinSet::new();
+            loop {
+                let (stream, peer_addr) = match tokio::select! {
+                    biased;
+                    _ = stop.cancelled() => break,
+                    _ = handshakes.join_next(), if !handshakes.is_empty() => continue,
+                    conn = listener.accept() => conn,
+                } {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!("[TLS] accept failed: {e}");
+                        continue;
+                    }
+                };
+                if let Some(ka) = keepalive {
+                    apply_tcp_keepalive(&stream, ka);
+                }
+                // Bounded: a flood of peers that open sockets and never
+                // speak cannot exhaust tasks or memory.
+                let Ok(permit) = permits.clone().try_acquire_owned() else {
+                    tracing::warn!("[TLS] too many pending handshakes, dropping {peer_addr}");
+                    continue;
+                };
+                let acceptor = acceptor.clone();
+                let tx = tx.clone();
+                // Handshakes run concurrently: a slow or silent peer must
+                // not stall connections behind it.
+                handshakes.spawn(async move {
+                    let result =
+                        tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await;
+                    match result {
+                        Ok(Ok(tls)) => {
+                            // Shed completed handshakes when the bounded accept queue is full.
+                            if tx
+                                .try_send((MaybeTlsStream::ServerTls(Box::new(tls)), peer_addr))
+                                .is_err()
+                            {
+                                tracing::warn!("[TLS] accept queue full, dropping {peer_addr}");
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            tracing::debug!("[TLS] handshake failed from {peer_addr}: {e}")
+                        }
+                        Err(_) => tracing::debug!("[TLS] handshake timed out from {peer_addr}"),
+                    }
+                    // Keep the permit until the connection is handed off or dropped.
+                    drop(permit);
+                });
+            }
+            handshakes.shutdown().await;
+        });
+        self.incoming = Some(rx);
+        self.pump = Some(crate::adapters::core::AcceptPump::new(cancel, pump));
+        Ok(())
+    }
+
     pub(crate) async fn accept(&mut self) -> Result<TcpAdapter<TcpServerConfig>, TcpError> {
+        #[cfg(feature = "tcp-tls")]
+        if let Some(acceptor) = self.tls_acceptor.take() {
+            self.start_tls_pump(acceptor)?;
+        }
         // TLS mode: the pump already accepted the socket and finished the
         // handshake, so nothing here can be stalled by a slow peer.
         #[cfg(feature = "tcp-tls")]
@@ -1087,8 +1105,10 @@ impl TcpServer {
         #[cfg(feature = "tcp-tls")]
         {
             self.incoming.take();
-            if let Some(pump) = self.pump.take() {
-                pump.abort();
+            if let Some(mut pump) = self.pump.take() {
+                pump.shutdown()
+                    .await
+                    .map_err(|e| TcpError::Config(format!("accept pump failed: {e}")))?;
             }
         }
         Ok(())

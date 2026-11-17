@@ -4,7 +4,8 @@ use crate::{
         config::TransportConfig,
         connection_state::ConnectionStateManager,
         session_actor::{
-            create_session_actor, SessionHandle, SessionHandler, DEFAULT_ACTOR_BUFFER_SIZE,
+            create_session_actor, SessionControl, SessionHandle, SessionHandler,
+            DEFAULT_ACTOR_BUFFER_SIZE,
         },
     },
     Packet, SessionId, TransportError,
@@ -57,7 +58,7 @@ const DEFAULT_REQUEST_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duratio
 /// protocol-level failure)?
 ///
 /// ANY `Connection`-class error raised while SENDING means this socket is
-/// finished: a dead peer, a closed actor channel, a replaced generation, or a
+/// finished: a dead peer, a replaced generation, or a
 /// custom adapter's own connection error. `retryable` is deliberately NOT part
 /// of the test — an `ECONNRESET` is mapped to `retryable: true` (retrying the
 /// *connect* is sensible), yet this particular connection is still gone.
@@ -108,7 +109,7 @@ pub struct TransportServer {
     /// IS the proof that every actor+pump ended and every permit returned.
     session_tracker: tokio_util::task::TaskTracker,
     /// Per-session cancel tokens (metadata only — no handles live here).
-    session_cancels: Arc<dashmap::DashMap<SessionId, tokio_util::sync::CancellationToken>>,
+    session_cancels: Arc<dashmap::DashMap<SessionId, Arc<SessionControl>>>,
     /// SINGLE owner of the real listener/scanner tasks. serve() only spawns
     /// into it and then OBSERVES — cancelling serve() cannot detach a
     /// listener, because serve() never holds their ownership.
@@ -227,92 +228,25 @@ impl TransportServer {
             packet.payload.len()
         );
 
-        // Route through the actor mailbox (lock-free hot path)
-        if let Some(handle) = self.session_handles.get(&session_id) {
-            match handle.send_packet_with_reply(packet).await {
-                Ok(()) => {
-                    tracing::debug!(
-                        "[SUCCESS] Session {} send successful (via actor)",
-                        session_id
-                    );
-                    return Ok(());
-                }
-                // Classify STRUCTURALLY, not by formatting the error and
-                // grepping it for "Broken pipe"/"Connection closed"/…: that
-                // missed a custom protocol's connection errors (whose wording
-                // it could not predict) and could misread a protocol error that
-                // merely mentioned the same words.
-                Err(e) if is_connection_dead(&e) => {
-                    tracing::warn!("[WARN] Session {} connection closed: {:?}", session_id, e);
-                    let _ = self.remove_session(session_id).await;
-                    return Err(TransportError::connection_error(
-                        "Connection closed during send",
-                        false,
-                    ));
-                }
-                Err(e) => {
-                    tracing::error!("[ERROR] Session {} send failed: {:?}", session_id, e);
-                    return Err(e);
-                }
-            }
-        }
-
-        // Fallback for the rare case where the actor handle failed to register:
-        // send directly through Transport rather than dropping the packet.
-        if let Some(transport) = self.transports.get(&session_id) {
-            if !transport.is_connected().await {
-                tracing::warn!(
-                    "[WARN] Session {} connection closed, skipping send",
-                    session_id
+        // Do not submit a write-confirmed send to the inbound actor. A
+        // handler can call this API on its own session and must never need
+        // to release that same actor before the write can complete.
+        let transport = self
+            .transports
+            .get(&session_id)
+            .ok_or_else(|| TransportError::connection_error("Session not found", false))?;
+        let result = transport
+            .send_confirmed_with(packet, Some(session_id), None)
+            .await;
+        if let Err(error) = &result {
+            if is_connection_dead(error) {
+                self.request_session_close(
+                    session_id,
+                    crate::CloseReason::Error(error.to_string()),
                 );
-                let _ = self.remove_session(session_id).await;
-                return Err(TransportError::connection_error("Connection closed", false));
             }
-
-            // Write-CONFIRMED, like the actor path above. This fallback used to
-            // call the detached `send()` (enqueue only) while logging it as a
-            // confirmation, so `TransportServer::send` reported success for
-            // bytes that had merely been queued.
-            match transport
-                .send_confirmed_with(packet, Some(session_id), None)
-                .await
-            {
-                Ok(()) => {
-                    tracing::debug!(
-                        "[SUCCESS] Session {} send successful (write-confirmed)",
-                        session_id
-                    );
-                    Ok(())
-                }
-                // Same structural predicate as the actor path above: the two
-                // send branches of this method must not classify errors
-                // differently, and text matching missed custom adapters'
-                // connection errors while misreading protocol errors that
-                // happened to mention the same words.
-                Err(e) if is_connection_dead(&e) => {
-                    tracing::warn!("[WARN] Session {} connection closed: {:?}", session_id, e);
-                    let _ = self.remove_session(session_id).await;
-                    Err(TransportError::connection_error(
-                        "Connection closed during send",
-                        false,
-                    ))
-                }
-                Err(e) => {
-                    tracing::error!(
-                        "[ERROR] Session {} send failed (non-connection error): {:?}",
-                        session_id,
-                        e
-                    );
-                    Err(e)
-                }
-            }
-        } else {
-            tracing::warn!(
-                "[WARN] Session {} does not exist in connection mapping",
-                session_id
-            );
-            Err(TransportError::connection_error("Session not found", false))
         }
+        result
     }
 
     /// Send a pre-built request packet to a session and await its response.
@@ -366,7 +300,7 @@ impl TransportServer {
 
         // RAII: cancelling this future (or any error/timeout exit) aborts the
         // waiter on drop, so a cancelled server request never leaks a pending
-        // entry. send_to_session is write-confirmed (actor SendWithReply), so
+        // entry. send_to_session is write-confirmed, so
         // the response timeout below only measures the peer's processing time.
         // Bound to `token` -> generation-checked abort (no message-id ABA).
         let mut guard = crate::transport::request_registry::OutboundRequestGuard::new(
@@ -555,22 +489,25 @@ impl TransportServer {
             .set_connection_no_consumer(connection, session_id)
             .await;
 
-        // Insert into transport layer mapping
+        // Publish the close control before this session becomes discoverable
+        // in active_sessions() or callable from on_connected().
+        let control = Arc::new(SessionControl::new(self.root_cancel.child_token()));
+        let child_cancel = control.cancel.clone();
+        self.session_cancels.insert(session_id, control.clone());
+        self.state_manager.add_connection(session_id);
+        self.request_registry.open_session(session_id);
+
         if let Err(e) = self.transports.insert(session_id, transport.clone()) {
             tracing::error!(
                 "[ERROR] Failed to register transport for session {}: {:?}",
                 session_id,
                 e
             );
+            self.unlink_session(session_id);
+            self.session_cancels.remove(&session_id);
             let _ = transport.disconnect().await;
             return session_id;
         }
-
-        // Register connection state
-        self.state_manager.add_connection(session_id);
-        // Open request tracking; a session that was never opened (or already
-        // closed) refuses all request registrations.
-        self.request_registry.open_session(session_id);
 
         // Create this session's actor and keep a handle for event forwarding.
         let (handle, actor) = create_session_actor(
@@ -580,10 +517,9 @@ impl TransportServer {
             connection_info,
             self.actor_buffer_size,
         );
-        let child_cancel = self.root_cancel.child_token();
         let actor = actor
             .with_inbound_registry(Some(self.request_registry.clone()))
-            .with_cancel(child_cancel.clone());
+            .with_control(control);
         let actor_task = match self.session_handles.insert(session_id, handle.clone()) {
             Ok(_) => Some((tokio::spawn(actor.run()), handle)),
             Err(e) => {
@@ -600,110 +536,61 @@ impl TransportServer {
             None => (None, None),
         };
 
-        // [LOOP] Pump the connection's transport events into this session's actor.
-        // Bounded-backbone adapters hand over a single-consumer pipe (real
-        // backpressure; ends with exactly one ConnectionClosed). Legacy
-        // adapters still expose the broadcast facade until their migration.
-        let pump_task = if let Some(mut pipe) = event_pipe_opt {
-            let server_clone = self.clone();
-            let pump_cancel = child_cancel.clone();
-            tokio::spawn(async move {
-                tracing::info!(
-                    "[LISTENER] TransportServer pump started for session {} (bounded pipe)",
-                    session_id
-                );
+        // The pump owns transport teardown, including on cancellation. No
+        // public close future owns the transition or can strand it.
+        let server = self.clone();
+        let pump_cancel = child_cancel.clone();
+        let pump_task = tokio::spawn(async move {
+            if let (Some(mut pipe), Some(handle)) = (event_pipe_opt, actor_handle) {
                 loop {
-                    // The cancel arm matters for IDLE sessions: without it the
-                    // pump parks in pipe.next() until the ADAPTER ends, and
-                    // nothing would end an idle adapter during shutdown. On
-                    // cancel, pump_teardown's remove_session drops the
-                    // Transport -> connection -> adapter, closing the socket.
                     let event = tokio::select! {
-                        _ = pump_cancel.cancelled() => None,
+                        biased;
+                        _ = pump_cancel.cancelled() => break,
                         ev = pipe.next() => ev,
                     };
-                    let Some(transport_event) = event else { break };
-                    if let Some(handle) = &actor_handle {
-                        let keep_running = tokio::select! {
-                            _ = pump_cancel.cancelled() => false,
-                            keep = server_clone.pump_one_event(session_id, handle, transport_event) => keep,
-                        };
-                        if !keep_running {
-                            break;
-                        }
+                    let Some(event) = event else { break };
+                    let keep_running = tokio::select! {
+                        biased;
+                        _ = pump_cancel.cancelled() => false,
+                        keep = server.pump_one_event(session_id, &handle, event) => keep,
+                    };
+                    if !keep_running {
+                        break;
                     }
                 }
-                server_clone.pump_teardown(session_id).await;
-            })
-        } else {
-            tracing::warn!(
-                "[WARN] Session {} unable to get event stream before connection setup",
-                session_id
-            );
-            tokio::spawn(async {})
-        };
+            } else {
+                pump_cancel.cancel();
+            }
+            server.pump_teardown(session_id, &transport).await;
+        });
 
-        // Per-session supervisor: OWNS the actor + pump handles, joins both,
-        // then (idempotently) cleans the session maps, releases the permit —
-        // exactly when the whole session runtime is done, not earlier — and
-        // removes its own entry. Shutdown joins whichever supervisors are
-        // still running; normal session end needs no shutdown involvement.
-        // Registration barrier: the supervisor may not begin until its cancel
-        // token is registered, so "completes before registration" cannot
-        // strand metadata. OWNERSHIP: the supervisor task lives in the
-        // server's TaskTracker — the single owner. Its handle never enters a
-        // cancellable public future; shutdown only cancels tokens and then
-        // observes tracker.wait(). The task cleans the session maps and its
-        // own token entry (metadata only), and the permit drops exactly when
-        // it returns — which is exactly when the tracker stops counting it.
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
-        {
-            let server = self.clone();
-            let sup_cancel = child_cancel.clone();
-            self.session_tracker.spawn(async move {
-                let _ = started_rx.await;
-                let _permit = permit;
-                // Observe BOTH children concurrently. A JoinError (panic or
-                // abort) from either one cancels the sibling immediately —
-                // otherwise a panicked actor would leave the pump reading the
-                // socket forever, pinning the session and its permit until a
-                // global shutdown.
-                let mut pump_task = pump_task;
-                if let Some(mut actor) = actor_task {
-                    tokio::select! {
-                        r = &mut actor => {
-                            if r.is_err() {
-                                tracing::warn!(
-                                    "[SUPERVISOR] Session {} actor ended abnormally; cancelling sibling",
-                                    session_id
-                                );
-                                sup_cancel.cancel();
-                            }
-                            let _ = pump_task.await;
-                        }
-                        r = &mut pump_task => {
-                            if r.is_err() {
-                                tracing::warn!(
-                                    "[SUPERVISOR] Session {} pump ended abnormally; cancelling sibling",
-                                    session_id
-                                );
-                                sup_cancel.cancel();
-                            }
-                            let _ = actor.await;
-                        }
+        let server = self.clone();
+        let sup_cancel = child_cancel.clone();
+        self.session_tracker.spawn(async move {
+            let _permit = permit;
+            let mut pump_task = pump_task;
+            if let Some(mut actor) = actor_task {
+                tokio::select! {
+                    _ = &mut actor => {
+                        sup_cancel.cancel();
+                        let _ = pump_task.await;
                     }
-                } else {
-                    let _ = pump_task.await;
+                    result = &mut pump_task => {
+                        if result.is_err() {
+                            sup_cancel.cancel();
+                            if let Some(transport) = server.transports.get(&session_id) {
+                                server.pump_teardown(session_id, &transport).await;
+                            }
+                        }
+                        let _ = actor.await;
+                    }
                 }
-                let _ = server.remove_session(session_id).await;
-                server.session_cancels.remove(&session_id);
-                tracing::debug!("[SUPERVISOR] Session {} fully finalized", session_id);
-            });
-        }
-        self.session_cancels
-            .insert(session_id, child_cancel.clone());
-        let _ = started_tx.send(());
-
+            } else {
+                let _ = pump_task.await;
+            }
+            server.unlink_session(session_id);
+            server.session_cancels.remove(&session_id);
+        });
         // Admission re-check: a shutdown that started between the gate check
         // and this insert could not see this session. Self-cancel so it tears
         // down through the normal cascade; the supervisor releases the permit.
@@ -721,34 +608,25 @@ impl TransportServer {
         session_id
     }
 
-    /// Remove session
+    /// Request removal of a session, including its connection and capacity.
+    /// The supervisor releases the permit after the callbacks have exited.
+    /// Calling this from a session handler does not wait for that handler.
     pub async fn remove_session(&self, session_id: SessionId) -> Result<(), TransportError> {
-        let closed_pending = self.request_registry.close_session_pending(session_id);
-        if closed_pending > 0 {
-            tracing::debug!(
-                "[REQUEST] Session {} removed, closed {} pending requests",
-                session_id,
-                closed_pending
-            );
-        }
-
-        if let Err(e) = self.transports.remove(&session_id) {
-            tracing::warn!(
-                "[WARN] Failed to remove transport for session {}: {:?}",
-                session_id,
-                e
-            );
-        }
-        if let Err(e) = self.session_handles.remove(&session_id) {
-            tracing::warn!(
-                "[WARN] Failed to remove session actor handle for session {}: {:?}",
-                session_id,
-                e
-            );
-        }
-        self.state_manager.remove_connection(session_id);
-        tracing::info!("[REMOVE] TransportServer removed session: {}", session_id);
+        self.request_session_close(session_id, crate::CloseReason::Forced);
         Ok(())
+    }
+
+    fn unlink_session(&self, session_id: SessionId) {
+        self.request_registry.close_session_pending(session_id);
+        let _ = self.transports.remove(&session_id);
+        let _ = self.session_handles.remove(&session_id);
+        self.state_manager.remove_connection(session_id);
+    }
+
+    fn request_session_close(&self, session_id: SessionId, reason: crate::CloseReason) {
+        if let Some(control) = self.session_cancels.get(&session_id) {
+            control.close(reason);
+        }
     }
 
     /// Publish a phase value: CAS-free store used only by the owner of the
@@ -804,104 +682,26 @@ impl TransportServer {
         !is_close
     }
 
-    /// Shared pump teardown: fail this session's pending requests and reap its
-    /// map entries. Peer-initiated closes end here without ever passing through
-    /// close_session/force_close_session, so the reap must happen now —
-    /// otherwise entries linger until a send fails, and with a max_connections
-    /// cap they would pin capacity forever. (Server-initiated closes already
-    /// removed them; remove_session is idempotent, the presence check just
-    /// avoids warn noise.)
-    async fn pump_teardown(&self, session_id: SessionId) {
-        let closed = self.request_registry.close_session_pending(session_id);
-        if closed > 0 {
-            tracing::debug!(
-                "[END] Session {} loop ended: closed {} pending requests",
-                session_id,
-                closed
-            );
-        }
-        if self.transports.get(&session_id).is_some() {
-            let _ = self.remove_session(session_id).await;
-        }
+    async fn pump_teardown(
+        &self,
+        session_id: SessionId,
+        transport: &crate::transport::transport::Transport,
+    ) {
+        self.unlink_session(session_id);
+        // Disconnect explicitly: an application may still retain a SessionSender
+        // or Responder, so dropping the map entry alone need not drop the socket.
+        let _ = tokio::time::timeout(self.config.graceful_timeout, transport.disconnect()).await;
     }
 
-    /// Feed a server-initiated close into the session's actor mailbox.
-    ///
-    /// The actor stops after handling it, so a subsequent `ConnectionClosed` from
-    /// the adapter finds no receiver — `on_disconnected` fires exactly once
-    /// regardless of which side started the close.
-    async fn notify_actor_closed(&self, session_id: SessionId, reason: crate::error::CloseReason) {
-        if let Some(handle) = self.session_handles.get(&session_id) {
-            let _ = handle
-                .send_event(crate::event::TransportEvent::ConnectionClosed { reason })
-                .await;
-        }
-    }
-
-    /// UNIFIED Unified close method: graceful session close
+    /// Request a normal close. Completion is owned by the session runtime.
     pub async fn close_session(&self, session_id: SessionId) -> Result<(), TransportError> {
-        // 1. Check if close can be started
-        if !self.state_manager.try_start_closing(session_id).await {
-            tracing::debug!(
-                "Session {} already closing or closed, skipping close logic",
-                session_id
-            );
-            return Ok(());
-        }
-
-        tracing::info!(
-            "[CLOSE] Starting graceful close for session: {}",
-            session_id
-        );
-
-        // 2. Notify the handler through this session's actor (before cleanup), so
-        //    `on_disconnected` always arrives on the same task as `on_message`.
-        self.notify_actor_closed(session_id, crate::error::CloseReason::Normal)
-            .await;
-
-        // 3. Execute actual close logic
-        self.do_close_session(session_id).await?;
-
-        // 4. Mark as closed
-        self.state_manager.mark_closed(session_id).await;
-
-        // 5. Clean up session
-        self.remove_session(session_id).await?;
-
-        tracing::info!("[SUCCESS] Session {} close completed", session_id);
+        self.request_session_close(session_id, crate::CloseReason::Normal);
         Ok(())
     }
 
-    /// FORCE Force close session
+    /// Request a forced close without blocking on the session's mailbox.
     pub async fn force_close_session(&self, session_id: SessionId) -> Result<(), TransportError> {
-        // 1. Check if close can be started
-        if !self.state_manager.try_start_closing(session_id).await {
-            tracing::debug!(
-                "Session {} already closing or closed, skipping force close",
-                session_id
-            );
-            return Ok(());
-        }
-
-        tracing::info!("[FORCE] Force closing session: {}", session_id);
-
-        // 2. Notify the handler through this session's actor
-        self.notify_actor_closed(session_id, crate::error::CloseReason::Forced)
-            .await;
-
-        // 3. Immediately force close, no waiting
-        if let Some(transport) = self.transports.get(&session_id) {
-            let _ = transport.disconnect().await; // Ignore errors, close directly
-        }
-
-        // 4. Mark as closed
-        self.state_manager.mark_closed(session_id).await;
-
-        // 5. Clean up session
-        self.remove_session(session_id).await?;
-
-        tracing::info!("[SUCCESS] Session {} force close completed", session_id);
-        Ok(())
+        self.remove_session(session_id).await
     }
 
     /// BATCH Batch close all sessions
@@ -955,34 +755,15 @@ impl TransportServer {
         Ok(())
     }
 
-    /// Internal method: execute actual close logic - through Transport abstraction
-    async fn do_close_session(&self, session_id: SessionId) -> Result<(), TransportError> {
-        if let Some(transport) = self.transports.get(&session_id) {
-            // Try graceful close
-            match tokio::time::timeout(self.config.graceful_timeout, transport.disconnect()).await {
-                Ok(Ok(_)) => {
-                    tracing::debug!("[SUCCESS] Session {} graceful close successful", session_id);
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!(
-                        "[WARN] Session {} graceful close failed: {:?}",
-                        session_id,
-                        e
-                    );
-                    // Graceful close failed, but don't return error, continue cleanup
-                }
-                Err(_) => {
-                    tracing::warn!("[WARN] Session {} graceful close timeout", session_id);
-                    // Timeout, but don't return error, continue cleanup
-                }
-            }
-        }
-
-        Ok(())
-    }
-
     /// Check if connection should ignore messages
     pub async fn should_ignore_messages(&self, session_id: SessionId) -> bool {
+        if self
+            .session_cancels
+            .get(&session_id)
+            .is_none_or(|control| control.cancel.is_cancelled())
+        {
+            return true;
+        }
         self.state_manager.should_ignore_messages(session_id).await
     }
 
@@ -1524,15 +1305,7 @@ impl TransportServer {
         self.admission_open
             .store(false, std::sync::atomic::Ordering::SeqCst);
 
-        // Phase 2: graceful offer, then cancel — both non-blocking, so no
-        // session can stall this phase.
-        for entry in self.session_handles.keys().unwrap_or_default() {
-            if let Some(handle) = self.session_handles.get(&entry) {
-                let _ = handle.try_send_event(crate::event::TransportEvent::ConnectionClosed {
-                    reason: crate::error::CloseReason::Normal,
-                });
-            }
-        }
+        // Phase 2: signal session runtimes without waiting on their mailboxes.
         self.root_cancel.cancel();
         // TaskTracker::wait completes only once the tracker is closed AND
         // empty; close() is idempotent, and the admission gate already

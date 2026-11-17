@@ -35,11 +35,6 @@ pub enum ActorMessage {
     InboundEvent(TransportEvent),
     /// Outbound: send a packet through this actor's connection (fire-and-forget)
     Send(Packet),
-    /// Outbound: send a packet and notify the caller of the result
-    SendWithReply {
-        packet: Packet,
-        reply: tokio::sync::oneshot::Sender<Result<(), crate::TransportError>>,
-    },
 }
 
 /// Session handler trait - business layer implements this to receive messages
@@ -322,16 +317,7 @@ pub struct SessionHandle {
 }
 
 impl SessionHandle {
-    /// Forward an inbound transport event to the actor
-    ///
-    /// This will apply backpressure if the channel is full.
-    /// Non-blocking event injection: used by shutdown to offer the actor a
-    /// graceful close without parking on a full mailbox (cancellation follows
-    /// either way).
-    pub(crate) fn try_send_event(&self, event: TransportEvent) -> bool {
-        self.tx.try_send(ActorMessage::InboundEvent(event)).is_ok()
-    }
-
+    /// Forward an inbound event, applying backpressure if the mailbox is full.
     /// The error is BOXED: it carries the undelivered event back for
     /// diagnostics, but that payload is large (>128 bytes) and this call sits
     /// on the inbound event path — an unboxed `Err` would widen every `Result`
@@ -392,26 +378,40 @@ impl SessionHandle {
     pub async fn send_packet(&self, packet: Packet) -> Result<(), crate::TransportError> {
         self.enqueue(ActorMessage::Send(packet)).await
     }
-
-    /// Send a packet through the actor and wait for the send result.
-    pub async fn send_packet_with_reply(
-        &self,
-        packet: Packet,
-    ) -> Result<(), crate::TransportError> {
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        self.enqueue(ActorMessage::SendWithReply {
-            packet,
-            reply: reply_tx,
-        })
-        .await?;
-        reply_rx.await.map_err(|_| {
-            crate::TransportError::connection_error("Actor dropped before reply", false)
-        })?
-    }
 }
 
 /// Batch size for recv_many - optimal for reducing syscalls and scheduling overhead
 const BATCH_SIZE: usize = 64;
+
+pub(crate) struct SessionControl {
+    pub(crate) cancel: tokio_util::sync::CancellationToken,
+    reason: std::sync::Mutex<Option<crate::CloseReason>>,
+}
+
+impl SessionControl {
+    pub(crate) fn new(cancel: tokio_util::sync::CancellationToken) -> Self {
+        Self {
+            cancel,
+            reason: std::sync::Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn close(&self, reason: crate::CloseReason) {
+        let mut current = self.reason.lock().unwrap();
+        if !self.cancel.is_cancelled() {
+            *current = Some(reason);
+            self.cancel.cancel();
+        }
+    }
+
+    fn reason(&self) -> crate::CloseReason {
+        self.reason
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or(crate::CloseReason::Normal)
+    }
+}
 
 /// Session Actor - processes events for a single connection
 ///
@@ -432,7 +432,7 @@ pub struct SessionActor {
     inbound_registry: Option<Arc<RequestRegistry>>,
     /// Cooperative cancellation (server side): the session supervisor cancels
     /// this to force the actor out of its mailbox wait during shutdown.
-    cancel: tokio_util::sync::CancellationToken,
+    control: Arc<SessionControl>,
 }
 
 impl SessionActor {
@@ -451,13 +451,15 @@ impl SessionActor {
             handler,
             connection_info,
             inbound_registry: None,
-            cancel: tokio_util::sync::CancellationToken::new(),
+            control: Arc::new(SessionControl::new(
+                tokio_util::sync::CancellationToken::new(),
+            )),
         }
     }
 
     /// Attach the session supervisor's cancellation token (internal).
-    pub(crate) fn with_cancel(mut self, cancel: tokio_util::sync::CancellationToken) -> Self {
-        self.cancel = cancel;
+    pub(crate) fn with_control(mut self, control: Arc<SessionControl>) -> Self {
+        self.control = control;
         self
     }
 
@@ -522,7 +524,8 @@ impl SessionActor {
             // out of an idle mailbox wait during shutdown; a handler blocked
             // inside on_message is only reached once it returns here.
             let first = tokio::select! {
-                _ = self.cancel.cancelled() => break,
+                biased;
+                _ = self.control.cancel.cancelled() => return self.control.reason(),
                 msg = self.rx.recv_async() => msg,
             };
             match first {
@@ -540,17 +543,11 @@ impl SessionActor {
             // Process batch
             let mut should_break = false;
             for msg in batch.drain(..) {
-                // A terminal event (ConnectionClosed / Close) earlier in this
-                // batch stops the actor: do NOT run the remaining commands
-                // against a dead connection. Pending replies fail deterministically.
                 if should_break {
-                    if let ActorMessage::SendWithReply { reply, .. } = msg {
-                        let _ = reply.send(Err(crate::TransportError::connection_error(
-                            "session closed",
-                            true,
-                        )));
-                    }
-                    continue;
+                    break;
+                }
+                if self.control.cancel.is_cancelled() {
+                    return self.control.reason();
                 }
                 match msg {
                     ActorMessage::InboundEvent(event) => {
@@ -644,19 +641,6 @@ impl SessionActor {
                             );
                         }
                     }
-                    ActorMessage::SendWithReply { packet, reply } => {
-                        // Write-confirmed: a "send that reports its result" (used
-                        // by the server's request path) must report the WRITE
-                        // result, not enqueue success — otherwise the server's
-                        // response timeout could start before the request bytes
-                        // reach the socket (ghost RPC). Bound to this session's
-                        // generation so it can never write onto a replacement.
-                        let result = self
-                            .transport
-                            .send_confirmed_with(packet, Some(self.session_id), None)
-                            .await;
-                        let _ = reply.send(result);
-                    }
                 }
             }
 
@@ -727,7 +711,7 @@ mod tests {
         let handle = test_handle(tx).await;
 
         let error = handle
-            .send_packet_with_reply(Packet::one_way(2, vec![2]))
+            .send_packet(Packet::one_way(2, vec![2]))
             .await
             .unwrap_err();
 
