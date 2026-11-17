@@ -241,7 +241,11 @@ impl TransportClient {
         }
     }
 
-    /// CONNECT Use protocol configuration specified at build time for connection - Framework's only connection method
+    /// Connect using the protocol configuration supplied at build time.
+    ///
+    /// Success is local transport readiness, not remote session admission or
+    /// authentication. QUIC peers negotiating `msgtrans/2` support server-first
+    /// messages; legacy `msgtrans/1` peers still require a client message first.
     pub async fn connect(&mut self) -> Result<(), TransportError> {
         // Lifecycle gate BEFORE any network work: a shut-down client's event
         // receiver is permanently gone, so a connection made here could send
@@ -635,37 +639,11 @@ impl TransportClient {
     /// for a timeout, so a caller who only checked `is_ok()` treated a request
     /// that never got an answer as success.)
     pub async fn request(&self, data: &[u8]) -> Result<Bytes, TransportError> {
-        if !self.is_connected().await {
-            return Err(TransportError::connection_error(
-                "Not connected - call connect() first",
-                false,
-            ));
-        }
-
-        // Per-session, strictly monotonic, never wraps: an id is never reused
-        // within a session, so a late response cannot complete a newer request.
-        let Some(message_id) = self.inner.next_request_id().await else {
-            return Err(TransportError::resource_error(
-                "request_id_space",
-                u32::MAX as usize,
-                u32::MAX as usize,
-            ));
-        };
-        let packet = crate::packet::Packet::request(message_id, data.to_vec());
-
-        tracing::debug!(
-            "TransportClient sending request: {} bytes (ID: {})",
-            data.len(),
-            message_id
-        );
-
-        let response_packet = self.inner.request(packet).await?;
-        tracing::debug!(
-            "TransportClient received response: {} bytes (ID: {})",
-            response_packet.payload.len(),
-            response_packet.header.message_id
-        );
-        Ok(response_packet.payload)
+        self.request_with_options(
+            Bytes::copy_from_slice(data),
+            super::RequestOptions::default(),
+        )
+        .await
     }
 
     /// STATUS Check connection status

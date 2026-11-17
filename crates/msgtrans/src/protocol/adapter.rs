@@ -259,14 +259,7 @@ impl ClientConfig for QuicClientConfig {
             .config(self.clone())
             .connect()
             .await
-            .map_err(|e| {
-                // A TLS refusal is deterministic; anything else may be transient.
-                let retryable = !e.is_tls_rejection();
-                TransportError::connection_error(
-                    format!("Failed to build QUIC connection: {:?}", e),
-                    retryable,
-                )
-            })
+            .map_err(TransportError::from)
     }
 }
 

@@ -103,11 +103,7 @@ impl QuicServerWrapper {
 #[async_trait]
 impl Server for QuicServerWrapper {
     async fn accept(&mut self) -> Result<Box<dyn Connection>, TransportError> {
-        let adapter = self
-            .inner
-            .accept()
-            .await
-            .map_err(|e| TransportError::config_error("quic", e.to_string()))?;
+        let adapter = self.inner.accept().await.map_err(TransportError::from)?;
         Ok(Box::new(adapter))
     }
 

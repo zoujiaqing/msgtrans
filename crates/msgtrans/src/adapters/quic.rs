@@ -6,6 +6,7 @@
 /// - Read-write separation
 /// - Asynchronous queues
 use async_trait::async_trait;
+use futures_util::{future::BoxFuture, stream::FuturesUnordered, StreamExt};
 use quinn::{
     ClientConfig, ClosedStream, ConnectError, Connection as QuinnConnection, ConnectionError,
     Endpoint, ReadError, ReadToEndError, ServerConfig, WriteError,
@@ -55,6 +56,12 @@ pub enum QuicError {
     #[error("TLS error: {0}")]
     Tls(#[from] rustls::Error),
 
+    #[error("{operation} timed out after {duration:?}")]
+    Timeout {
+        operation: &'static str,
+        duration: Duration,
+    },
+
     #[error("Connection closed")]
     ConnectionClosed,
 
@@ -88,6 +95,12 @@ impl QuicError {
 impl From<QuicError> for TransportError {
     fn from(error: QuicError) -> Self {
         match error {
+            e if e.is_tls_rejection() => TransportError::connection_error(e.to_string(), false),
+            QuicError::Timeout {
+                operation,
+                duration,
+            } => TransportError::timeout_error(operation, duration),
+
             QuicError::Connect(e) => {
                 TransportError::connection_error(format!("QUIC connection failed: {}", e), true)
             }
@@ -195,6 +208,40 @@ fn ring_server_builder(
 /// foreign QUIC clients are rejected at the TLS layer instead of feeding
 /// garbage to the framer.
 pub(crate) const ALPN_MSGTRANS: &[u8] = b"msgtrans/1";
+const ALPN_STREAM_READY: &[u8] = b"msgtrans/2";
+const STREAM_PREFACE: &[u8] = b"MSGTRANS\x02";
+const ACCEPT_SETUP_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_PENDING_SETUP: usize = 64;
+type BidiStream = (quinn::SendStream, quinn::RecvStream);
+type PendingSetup = BoxFuture<'static, Result<(QuinnConnection, Option<BidiStream>), QuicError>>;
+
+fn uses_stream_preface(connection: &QuinnConnection) -> bool {
+    connection
+        .handshake_data()
+        .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+        .and_then(|data| data.protocol)
+        .as_deref()
+        == Some(ALPN_STREAM_READY)
+}
+
+async fn setup_server_stream(
+    connection: &QuinnConnection,
+) -> Result<Option<BidiStream>, QuicError> {
+    if !uses_stream_preface(connection) {
+        return Ok(None);
+    }
+    let (send, mut recv) = connection.accept_bi().await?;
+    let mut preface = [0; STREAM_PREFACE.len()];
+    recv.read_exact(&mut preface)
+        .await
+        .map_err(|e| QuicError::Serialization(format!("incomplete QUIC stream preface: {e}")))?;
+    if preface != STREAM_PREFACE {
+        return Err(QuicError::Serialization(
+            "invalid QUIC stream preface".into(),
+        ));
+    }
+    Ok(Some((send, recv)))
+}
 
 /// Apply the server transport parameters FROM THE CONFIG — previously the
 /// receive window was hardcoded (1500*100) and send_window/initial_rtt/
@@ -290,7 +337,7 @@ fn configure_client_with_config(config: &QuicClientConfig) -> Result<ClientConfi
     };
 
     let mut crypto = crypto;
-    crypto.alpn_protocols = vec![ALPN_MSGTRANS.to_vec()];
+    crypto.alpn_protocols = vec![ALPN_STREAM_READY.to_vec(), ALPN_MSGTRANS.to_vec()];
     let mut client_config = ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
             .map_err(|e| QuicError::Config(format!("QUIC client config error: {}", e)))?,
@@ -336,7 +383,7 @@ fn configure_server_insecure_with_config(
     let mut server_crypto = ring_server_builder()
         .with_single_cert(vec![cert.clone()], key.into())
         .expect("self-signed cert is valid");
-    server_crypto.alpn_protocols = vec![ALPN_MSGTRANS.to_vec()];
+    server_crypto.alpn_protocols = vec![ALPN_STREAM_READY.to_vec(), ALPN_MSGTRANS.to_vec()];
     let mut server_config = ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
             .expect("self-signed crypto config is valid"),
@@ -420,7 +467,7 @@ fn configure_server_with_pem(
     let mut server_crypto = ring_server_builder()
         .with_single_cert(certs, key)
         .map_err(|e| QuicError::Config(format!("TLS configuration error: {}", e)))?;
-    server_crypto.alpn_protocols = vec![ALPN_MSGTRANS.to_vec()];
+    server_crypto.alpn_protocols = vec![ALPN_STREAM_READY.to_vec(), ALPN_MSGTRANS.to_vec()];
 
     // Create QUIC server configuration
     let quic_server_config = quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
@@ -456,10 +503,10 @@ pub struct QuicAdapter<C> {
 }
 
 impl<C> QuicAdapter<C> {
-    pub async fn new_with_connection(
+    fn new_with_connection(
         connection: QuinnConnection,
         config: C,
-        is_server: bool,
+        streams: Option<BidiStream>,
         limits: crate::transport::limits::ConnectionLimits,
     ) -> Result<Self, QuicError> {
         let state =
@@ -503,12 +550,11 @@ impl<C> QuicAdapter<C> {
             send_queue_rx,
             shutdown_rx,
             event_pipe,
-            is_server,
+            streams,
             frame_policy.clone(),
             limits.write_deadline,
             limits.decode_limits(),
-        )
-        .await;
+        );
 
         Ok(Self {
             state,
@@ -536,71 +582,46 @@ impl<C> QuicAdapter<C> {
     ///
     /// Frame format: [4-byte length (big-endian)] + [packet data]
     ///
-    /// `is_server`: if true, use accept_bi() to wait for client stream; if false, use open_bi() to create stream
+    /// Without pre-established streams, wait for the legacy client to write first.
     ///
     /// This version uses separate tasks for reading and writing to avoid blocking issues
     /// under high load where one direction could starve the other in a select! loop.
     #[allow(clippy::too_many_arguments)]
-    async fn start_event_loop(
+    fn start_event_loop(
         connection: QuinnConnection,
         state: crate::adapters::core::ConnState,
         mut send_queue: mpsc::Receiver<crate::adapters::outbound::Outbound>,
         mut shutdown_signal: mpsc::UnboundedReceiver<()>,
         event_pipe: std::sync::Arc<crate::adapters::events::EventPipe>,
-        is_server: bool,
+        streams: Option<BidiStream>,
         frame_policy: Arc<std::sync::atomic::AtomicU8>,
         write_deadline: std::time::Duration,
         decode_limits: crate::packet::DecodeLimits,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let current_session_id = state.session_id();
-            tracing::debug!(
-                "[START] QUIC event loop started with single-stream multiplexing (session: {}, role: {})",
-                current_session_id,
-                if is_server { "server" } else { "client" }
-            );
-
-            // Get bidirectional stream based on role:
-            // - Server: accept_bi() to wait for client's stream
-            // - Client: open_bi() to create a new stream
-            let (send_stream, recv_stream) = if is_server {
-                match connection.accept_bi().await {
-                    Ok(streams) => streams,
-                    Err(e) => {
-                        tracing::error!(
-                            "[ERROR] Failed to accept bidirectional stream: {:?} (session: {})",
-                            e,
-                            current_session_id
-                        );
-                        event_pipe.close(crate::error::CloseReason::Error(format!(
-                            "Failed to accept stream: {:?}",
-                            e
-                        )));
+            // Legacy peers intentionally keep the client-first framing. Even with
+            // no stream to read, close (including adapter drop) must wake this task.
+            let (send_stream, recv_stream) = match streams {
+                Some(streams) => streams,
+                None => tokio::select! {
+                    biased;
+                    _ = shutdown_signal.recv() => {
+                        connection.close(0u32.into(), b"connection closed");
+                        state.set_status(crate::adapters::core::ConnStatus::Closed);
+                        event_pipe.close(crate::error::CloseReason::Normal);
                         return;
                     }
-                }
-            } else {
-                match connection.open_bi().await {
-                    Ok(streams) => streams,
-                    Err(e) => {
-                        tracing::error!(
-                            "[ERROR] Failed to open bidirectional stream: {:?} (session: {})",
-                            e,
-                            current_session_id
-                        );
-                        event_pipe.close(crate::error::CloseReason::Error(format!(
-                            "Failed to open stream: {:?}",
-                            e
-                        )));
-                        return;
+                    result = connection.accept_bi() => match result {
+                        Ok(streams) => streams,
+                        Err(e) => {
+                            state.set_status(crate::adapters::core::ConnStatus::Closed);
+                            event_pipe.close(crate::error::CloseReason::Error(format!("Failed to accept stream: {e}")));
+                            return;
+                        }
                     }
-                }
+                },
             };
-
-            tracing::debug!(
-                "[STREAM] Bidirectional stream ready (session: {})",
-                current_session_id
-            );
 
             // The bidi stream is up: the connection is now live.
             state.set_status(crate::adapters::core::ConnStatus::Connected);
@@ -828,7 +849,7 @@ impl<C> QuicAdapter<C> {
             // Record which handle select! consumed: a JoinHandle polled after
             // completion panics, so the grace window below must only re-await
             // the tasks that have NOT finished yet.
-            let (read_done, write_done) = tokio::select! {
+            let (mut read_done, mut write_done) = tokio::select! {
                 _ = shutdown_signal.recv() => {
                     tracing::info!("[STOP] Received shutdown signal (session: {})", current_session_id);
                     // Locally initiated close is Normal, not an abnormal end.
@@ -852,16 +873,23 @@ impl<C> QuicAdapter<C> {
             let _ = tokio::time::timeout(std::time::Duration::from_millis(200), async {
                 if !read_done {
                     let _ = (&mut read_task).await;
+                    read_done = true;
                 }
                 if !write_done {
                     let _ = (&mut write_task).await;
+                    write_done = true;
                 }
             })
             .await;
             let mut tasks = crate::adapters::core::TaskGroup::new();
-            tasks.push(read_task);
-            tasks.push(write_task);
-            tasks.abort_all(); // no-op for tasks that already exited
+            if !read_done {
+                tasks.push(read_task);
+            }
+            if !write_done {
+                tasks.push(write_task);
+            }
+            tasks.abort_and_join().await;
+            connection.close(0u32.into(), b"connection closed");
             state.set_status(crate::adapters::core::ConnStatus::Closed);
 
             tracing::debug!(
@@ -896,15 +924,28 @@ impl QuicAdapter<QuicClientConfig> {
 
         // Connect to server (using configured timeout)
         let connecting = endpoint.connect(addr, server_name)?;
-        let connection = tokio::time::timeout(config.connect_timeout, connecting)
-            .await
-            .map_err(|_| {
-                QuicError::Config(format!(
-                    "Connection timeout after {:?}",
-                    config.connect_timeout
-                ))
-            })?
-            .map_err(QuicError::Connection)?;
+        let (connection, streams) = tokio::time::timeout(config.connect_timeout, async {
+            let connection = connecting.await?;
+            let mut streams = connection.open_bi().await?;
+            if uses_stream_preface(&connection) {
+                // A write exposes the stream to the peer. No application ACK is
+                // needed, so this does not add a round trip to connect().
+                streams
+                    .0
+                    .write_all(STREAM_PREFACE)
+                    .await
+                    .map_err(|error| match error {
+                        WriteError::ConnectionLost(cause) => QuicError::Connection(cause),
+                        other => QuicError::Write(other),
+                    })?;
+            }
+            Ok::<_, QuicError>((connection, streams))
+        })
+        .await
+        .map_err(|_| QuicError::Timeout {
+            operation: "QUIC connect",
+            duration: config.connect_timeout,
+        })??;
         tracing::debug!(
             "[SUCCESS] QUIC client connected to: {} (server name: {}) timeout: {:?}",
             addr,
@@ -912,7 +953,7 @@ impl QuicAdapter<QuicClientConfig> {
             config.connect_timeout
         );
 
-        Self::new_with_connection(connection, config, false, limits).await
+        Self::new_with_connection(connection, config, Some(streams), limits)
     }
 }
 
@@ -934,12 +975,13 @@ impl<C: Send + Sync + 'static> Connection for QuicAdapter<C> {
             tracing::warn!("Failed to send shutdown signal: {:?}", e);
         }
 
-        if let Some(handle) = self.event_loop_handle.take() {
+        if let Some(handle) = self.event_loop_handle.as_mut() {
             if let Err(e) = handle.await {
                 tracing::warn!("Failed to wait for event loop to end: {:?}", e);
             }
         }
 
+        self.event_loop_handle = None;
         Ok(())
     }
 
@@ -1085,6 +1127,7 @@ impl QuicServerBuilder {
         Ok(QuicServer {
             config: self.config,
             endpoint,
+            pending_setup: std::sync::Mutex::new(FuturesUnordered::new()),
             limits: self.limits,
         })
     }
@@ -1099,30 +1142,37 @@ impl Default for QuicServerBuilder {
 pub(crate) struct QuicServer {
     config: QuicServerConfig,
     endpoint: Endpoint,
+    // Polled exclusively via &mut self; the mutex makes the server Sync
+    // without locking during accept or shutdown.
+    pending_setup: std::sync::Mutex<FuturesUnordered<PendingSetup>>,
     limits: crate::transport::limits::ConnectionLimits,
 }
 
 impl QuicServer {
     pub(crate) async fn accept(&mut self) -> Result<QuicAdapter<QuicServerConfig>, QuicError> {
-        let incoming = self
-            .endpoint
-            .accept()
-            .await
-            .ok_or(QuicError::ConnectionClosed)?;
-        let connection = incoming.await?;
-
-        tracing::debug!(
-            "[SUCCESS] QUIC server accepted connection: {}",
-            connection.remote_address()
-        );
-
-        QuicAdapter::new_with_connection(
-            connection,
-            self.config.clone(),
-            true, // is_server = true
-            self.limits,
-        )
-        .await
+        let pending = self.pending_setup.get_mut().unwrap();
+        loop {
+            tokio::select! {
+                biased;
+                Some(result) = pending.next(), if !pending.is_empty() => {
+                    let (connection, streams) = result?;
+                    return QuicAdapter::new_with_connection(connection, self.config.clone(), streams, self.limits);
+                }
+                incoming = self.endpoint.accept(), if pending.len() < MAX_PENDING_SETUP => {
+                    let incoming = incoming.ok_or(QuicError::ConnectionClosed)?;
+                    pending.push(Box::pin(async move {
+                        tokio::time::timeout(ACCEPT_SETUP_TIMEOUT, async {
+                            let connection = incoming.await?;
+                            let streams = setup_server_stream(&connection).await?;
+                            Ok((connection, streams))
+                        }).await.map_err(|_| QuicError::Timeout {
+                            operation: "QUIC accept setup",
+                            duration: ACCEPT_SETUP_TIMEOUT,
+                        })?
+                    }));
+                }
+            }
+        }
     }
 
     pub(crate) fn local_addr(&self) -> Result<SocketAddr, QuicError> {
@@ -1132,6 +1182,7 @@ impl QuicServer {
     pub(crate) async fn shutdown(&mut self) -> Result<(), QuicError> {
         // Actively close endpoint to release UDP port quickly on shutdown.
         self.endpoint.close(0u32.into(), b"server shutdown");
+        self.pending_setup.get_mut().unwrap().clear();
 
         // Wait briefly for QUIC internals to drain; don't block shutdown forever.
         let _ = tokio::time::timeout(Duration::from_secs(2), self.endpoint.wait_idle()).await;
@@ -1270,5 +1321,206 @@ mod batch_tests {
             completion.complete(Ok(()));
         }
         assert!(matches!(good_rx.try_recv(), Ok(Ok(()))));
+    }
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::*;
+    use crate::{
+        ClientEvent, Responder, SessionHandler, SessionSender, TransportClientBuilder,
+        TransportServerBuilder,
+    };
+
+    fn raw_client(alpn: &[u8]) -> Endpoint {
+        let mut crypto = ring_client_builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
+            .with_no_client_auth();
+        crypto.alpn_protocols = vec![alpn.to_vec()];
+        let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(crypto).unwrap();
+        let mut endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(ClientConfig::new(Arc::new(crypto)));
+        endpoint
+    }
+
+    struct TestHandler(mpsc::UnboundedSender<SessionId>);
+
+    #[async_trait]
+    impl SessionHandler for TestHandler {
+        async fn on_connected(&self, id: SessionId, _: ConnectionInfo) {
+            let _ = self.0.send(id);
+        }
+        async fn on_message(&self, _: SessionId, _: Packet, _: SessionSender) {}
+        async fn on_request(&self, _: SessionId, packet: Packet, responder: Responder) {
+            responder.respond(packet.into_payload()).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn quic_server_first_and_legacy_no_stream_rejection_do_not_stall_accept() {
+        tokio::time::timeout(Duration::from_secs(8), async {
+            let addr = {
+                let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+                socket.local_addr().unwrap()
+            };
+            let (connected, mut sessions) = mpsc::unbounded_channel();
+            let server = TransportServerBuilder::new()
+                .protocol(QuicServerConfig::new(&addr.to_string()).unwrap())
+                .max_connections(1)
+                .build(Arc::new(TestHandler(connected)))
+                .await
+                .unwrap();
+            let bg = server.clone();
+            let serving = tokio::spawn(async move { bg.serve().await });
+
+            // Raw /1 peer: v1 framing, no preface and no application stream.
+            let legacy = raw_client(ALPN_MSGTRANS);
+            let first = legacy.connect(addr, "localhost").unwrap().await.unwrap();
+            let first_id = sessions.recv().await.unwrap();
+            let refused = legacy.connect(addr, "localhost").unwrap().await.unwrap();
+            tokio::time::timeout(Duration::from_secs(1), refused.closed())
+                .await
+                .expect("over-capacity rejection must close a streamless connection");
+            server.close_session(first_id).await.unwrap();
+            while server.available_permits() != 1 {
+                tokio::task::yield_now().await;
+            }
+
+            // A /2 peer that never writes the preface cannot block the next
+            // handshake. It also must not consume the only application slot.
+            let silent = raw_client(ALPN_STREAM_READY);
+            let silent_conn = silent.connect(addr, "localhost").unwrap().await.unwrap();
+            let mut client = TransportClientBuilder::new()
+                .protocol(
+                    QuicClientConfig::new(&addr.to_string())
+                        .unwrap()
+                        .danger_skip_verification(),
+                )
+                .build()
+                .await
+                .unwrap();
+            let mut events = client.events().await.unwrap();
+            client.connect().await.unwrap();
+            let ready = sessions.recv().await.unwrap();
+            server.send(ready, b"welcome").await.unwrap();
+            loop {
+                if let ClientEvent::Message(message) = events.next().await.unwrap() {
+                    assert_eq!(message.payload().as_ref(), b"welcome");
+                    break;
+                }
+            }
+            assert_eq!(client.request(b"echo").await.unwrap().as_ref(), b"echo");
+            client.shutdown().await.unwrap();
+
+            while server.available_permits() != 1 {
+                tokio::task::yield_now().await;
+            }
+            // A v1-only client can still send an ordinary first frame to the
+            // new server and receive its reply without a readiness preface.
+            let legacy_conn = legacy.connect(addr, "localhost").unwrap().await.unwrap();
+            sessions.recv().await.unwrap();
+            let (mut send, mut recv) = legacy_conn.open_bi().await.unwrap();
+            let frame = Packet::request(7, b"old client".to_vec())
+                .try_encode()
+                .unwrap();
+            send.write_all(&(frame.len() as u32).to_be_bytes())
+                .await
+                .unwrap();
+            send.write_all(&frame).await.unwrap();
+            let mut response = vec![0; 4 + frame.len()];
+            recv.read_exact(&mut response).await.unwrap();
+            assert_eq!(&response[..4], &(frame.len() as u32).to_be_bytes());
+            let response = Packet::decode_exact(&response[4..]).unwrap();
+            assert_eq!(response.message_id(), 7);
+            assert_eq!(response.payload().as_ref(), b"old client");
+
+            let report = server.shutdown().await;
+            assert!(report.clean, "{report:?}");
+            first.closed().await;
+            silent_conn.closed().await;
+            serving.await.unwrap().unwrap();
+            std::net::UdpSocket::bind(addr).expect("clean shutdown releases the UDP port");
+        })
+        .await
+        .expect("QUIC lifecycle test finished within its deadline");
+    }
+
+    #[tokio::test]
+    async fn new_client_uses_legacy_framing_with_v1_only_server() {
+        let (cert, key) = generate_self_signed_cert();
+        let mut crypto = ring_server_builder()
+            .with_single_cert(vec![cert], key.into())
+            .unwrap();
+        crypto.alpn_protocols = vec![ALPN_MSGTRANS.to_vec()];
+        let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(crypto).unwrap();
+        let endpoint = Endpoint::server(
+            ServerConfig::with_crypto(Arc::new(crypto)),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let addr = endpoint.local_addr().unwrap();
+
+        tokio::time::timeout(Duration::from_secs(4), async {
+            let server = async {
+                let conn = endpoint.accept().await.unwrap().await.unwrap();
+                let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+                let mut prefix = [0; 4];
+                recv.read_exact(&mut prefix).await.unwrap();
+                let len = u32::from_be_bytes(prefix) as usize;
+                assert!(len < 128, "legacy frame starts with length, not a preface");
+                let mut frame = vec![0; len];
+                recv.read_exact(&mut frame).await.unwrap();
+                let request = Packet::decode_exact(&frame).unwrap();
+                let response = Packet::response(request.message_id(), request.into_payload())
+                    .try_encode()
+                    .unwrap();
+                send.write_all(&(response.len() as u32).to_be_bytes())
+                    .await
+                    .unwrap();
+                send.write_all(&response).await.unwrap();
+                conn.closed().await;
+            };
+            let client = async {
+                let mut client = TransportClientBuilder::new()
+                    .protocol(
+                        QuicClientConfig::new(&addr.to_string())
+                            .unwrap()
+                            .danger_skip_verification(),
+                    )
+                    .build()
+                    .await
+                    .unwrap();
+                client.connect().await.unwrap();
+                assert_eq!(client.request(b"legacy").await.unwrap().as_ref(), b"legacy");
+                client.shutdown().await.unwrap();
+            };
+            tokio::join!(server, client);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn quic_udp_blackhole_returns_retryable_typed_timeout() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let duration = Duration::from_millis(40);
+        let mut client = TransportClientBuilder::new()
+            .retry_strategy(crate::RetryConfig::default().max_retries(0))
+            .protocol(
+                QuicClientConfig::new(&socket.local_addr().unwrap().to_string())
+                    .unwrap()
+                    .connect_timeout(duration)
+                    .danger_skip_verification(),
+            )
+            .build()
+            .await
+            .unwrap();
+        let error = client.connect().await.unwrap_err();
+        assert!(
+            matches!(error, TransportError::Timeout { duration: d, .. } if d == duration),
+            "{error:?}"
+        );
+        assert!(error.is_retryable());
     }
 }

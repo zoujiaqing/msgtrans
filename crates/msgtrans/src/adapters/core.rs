@@ -91,6 +91,15 @@ impl TaskGroup {
         self.handles.push(handle);
     }
 
+    pub(crate) async fn abort_and_join(&mut self) {
+        for handle in &self.handles {
+            handle.abort();
+        }
+        while let Some(handle) = self.handles.pop() {
+            let _ = handle.await;
+        }
+    }
+
     /// Abort every task still running.
     pub(crate) fn abort_all(&mut self) {
         for handle in self.handles.drain(..) {

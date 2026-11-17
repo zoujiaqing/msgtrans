@@ -59,16 +59,6 @@ pub struct Transport {
     /// abort_all) cannot cancel the replacement connection's requests.
     connection_epoch: Arc<std::sync::atomic::AtomicU64>,
 }
-/// Fallback lifecycle deadline for waiter-based requests. The real timeout is
-/// enforced by the caller (tokio::time::timeout); this only bounds the entry if
-/// the caller forgets to remove it.
-/// Fallback deadline recorded for a waiter-based request whose caller did not
-/// name one. Waiters are NOT scheduled into the timeout wheel — the caller's
-/// own `tokio::time::timeout` is the real deadline — so this only labels the
-/// entry for diagnostics. It is deliberately NOT the inbound lifecycle
-/// constant: those are different policies, and merging them made every
-/// outbound entry claim a 30s deadline no matter what the caller asked for.
-const DEFAULT_WAITER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 /// Lifecycle deadline for inbound (peer-initiated) requests on the client
 /// side. Client transports run no timeout scanner, so this only labels the
 /// entry; actual cleanup is the respond itself or the session-close drain,
@@ -495,63 +485,6 @@ impl Transport {
     }
 
     /// Send data packet and wait for response
-    pub async fn request(&self, packet: Packet) -> Result<Packet, TransportError> {
-        if packet.header.packet_type != crate::packet::PacketType::Request {
-            return Err(TransportError::connection_error(
-                "Not a Request packet",
-                false,
-            ));
-        }
-
-        // [FIX] Use client-set message_id instead of overriding it
-        let client_message_id = packet.header.message_id;
-        let session_id = self.current_session_id().await;
-        let (rx, token) = match self.request_registry.try_register_waiter(
-            client_message_id,
-            session_id,
-            packet.header.biz_type,
-            DEFAULT_WAITER_DEADLINE,
-        ) {
-            Ok(pair) => pair,
-            Err(_) => {
-                return Err(TransportError::connection_error(
-                    "Duplicate in-flight request id",
-                    false,
-                ))
-            }
-        };
-
-        // RAII guard: any exit from here that is NOT an explicit disarm — an
-        // error return, a timeout, OR the caller cancelling this future
-        // (select!/abort/outer timeout) — aborts the waiter on drop, so a
-        // cancelled request never leaks a pending entry (waiters are not in
-        // the timeout wheel). The guard is bound to `token`, so aborting is
-        // generation-checked: a cancelled OLD request cannot delete the waiter
-        // of a NEW request that reused its message id.
-        let mut guard = crate::transport::request_registry::OutboundRequestGuard::new(
-            self.request_registry.clone(),
-            token,
-        )
-        .armed();
-
-        // Confirm the WRITE before starting the response timeout: the waiter is
-        // already registered (so a fast response cannot be missed), and only
-        // once the request bytes have reached the socket do we begin the
-        // response deadline. This closes the ghost-RPC window where a request
-        // stuck in a congested outbound queue could time out for the caller
-        // and then still be written and executed at the peer.
-        self.send_confirmed_with(packet, session_id, None).await?;
-        let timeout_duration = std::time::Duration::from_secs(10);
-        match tokio::time::timeout(timeout_duration, rx).await {
-            Ok(Ok(resp)) => {
-                guard.disarm();
-                Ok(resp)
-            }
-            Ok(Err(_)) => Err(TransportError::connection_error("Connection closed", true)),
-            Err(_) => Err(TransportError::timeout_error("request", timeout_duration)),
-        }
-    }
-
     /// TARGET Unified event handling entry point - complete unpacking and send user-friendly events at this layer
     /// Handle one event from a connection, keyed by the session (generation)
     /// that produced it — never by "whatever session is current now", which a
@@ -727,29 +660,37 @@ impl Transport {
         // echoes the id on the wire with no generation, so a late old response
         // would be delivered to the new caller. Exhaustion fails the request
         // instead of restarting the id space under live requests.
-        let session_id = self.current_session_id().await;
-        let Some(message_id) = self.request_registry.next_request_id(session_id) else {
+        let session_id = self.current_session_id().await.ok_or_else(|| {
+            TransportError::connection_error("Not connected - call connect() first", false)
+        })?;
+        let Some(message_id) = self.request_registry.next_request_id(Some(session_id)) else {
             return Err(TransportError::resource_error(
                 "request_id_space",
                 u32::MAX as usize,
                 u32::MAX as usize,
             ));
         };
-
-        // Create request packet; options.apply performs any compression and
-        // fails loudly rather than shipping a mislabeled body.
-        let mut packet = crate::packet::Packet::request(message_id, data.clone());
+        let mut packet = Packet::request(message_id, data);
         options.send.apply(&mut packet)?;
+        self.request_on_generation(session_id, packet, options.timeout)
+            .await
+    }
 
-        // Register request tracking
-        let session_id = self.current_session_id().await;
+    async fn request_on_generation(
+        &self,
+        session_id: SessionId,
+        packet: Packet,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<Bytes, TransportError> {
+        let message_id = packet.header.message_id;
+        let timeout_duration = timeout.unwrap_or(std::time::Duration::from_secs(10));
         let (rx, token) = match self.request_registry.try_register_waiter(
             message_id,
-            session_id,
+            Some(session_id),
             packet.header.biz_type,
             // The caller's REAL deadline, so the registry entry does not claim
             // one the caller never asked for.
-            options.timeout.unwrap_or(DEFAULT_WAITER_DEADLINE),
+            timeout_duration,
         ) {
             Ok(pair) => pair,
             Err(_) => {
@@ -764,7 +705,7 @@ impl Transport {
             "[SEND] Sending request: message_id={}, biz_type={}, timeout={:?}",
             message_id,
             packet.header.biz_type,
-            options.timeout
+            timeout
         );
 
         // RAII guard: cancelling this future / any error exit aborts the waiter
@@ -780,18 +721,16 @@ impl Transport {
         // Confirm the write before the response deadline (see `request`): no
         // ghost RPCs from a request that timed out while queued and was then
         // written.
-        self.send_confirmed_with(packet, session_id, None).await?;
+        self.send_confirmed_with(packet, Some(session_id), None)
+            .await?;
 
         tracing::debug!(
             "[WAIT] Waiting for response: message_id={}, timeout={:?}",
             message_id,
-            options.timeout
+            timeout
         );
 
         // Wait for response (with custom timeout)
-        let timeout_duration = options
-            .timeout
-            .unwrap_or(std::time::Duration::from_secs(10));
         match tokio::time::timeout(timeout_duration, rx).await {
             Ok(Ok(resp)) => {
                 guard.disarm();
@@ -823,14 +762,6 @@ impl Transport {
     /// Id for a ONE-WAY message (wrapping is harmless: nothing matches on it).
     pub(crate) fn next_oneway_id(&self) -> u32 {
         self.request_registry.next_oneway_id()
-    }
-
-    /// Id for an OUTBOUND request on the current session. `None` means the
-    /// session's request-id space is exhausted (or the session is gone): the
-    /// caller must fail the request rather than reuse an id.
-    pub(crate) async fn next_request_id(&self) -> Option<u32> {
-        let session_id = self.current_session_id().await;
-        self.request_registry.next_request_id(session_id)
     }
 
     /// Send a one-way message with options, **write-confirmed** (every public
@@ -1121,6 +1052,39 @@ mod generation_tests {
             .on_event(id2, crate::event::TransportEvent::MessageReceived(good))
             .await;
         assert_eq!(rx.try_recv().expect("delivered").payload, b"good"[..]);
+    }
+
+    #[tokio::test]
+    async fn prepared_request_cannot_register_or_write_under_a_replacement_generation() {
+        let ctx = TransportContext::new().await.unwrap();
+        let transport = Arc::new(Transport::with_context(TransportConfig::default(), &ctx));
+        let closed = Arc::new(AtomicBool::new(false));
+        let original = transport.set_connection(mock(&closed)).await;
+        let id = transport
+            .request_registry
+            .next_request_id(Some(original))
+            .unwrap();
+
+        // Replace the slot after allocation but before the common RPC path
+        // registers and writes. Keep the old registry open to exercise the
+        // generation check at the actual write boundary, not only registration.
+        let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let replacement = transport
+            .set_connection(mock_counting(&closed, &writes))
+            .await;
+        assert_eq!(
+            transport
+                .request_registry
+                .next_request_id(Some(replacement)),
+            Some(id)
+        );
+        let error = transport
+            .request_on_generation(original, Packet::request(id, b"old".to_vec()), None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("connection replaced"), "{error}");
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+        assert_eq!(transport.request_registry.pending_count(), 0);
     }
 
     /// The connection lock must NOT be held across the enqueue await.
