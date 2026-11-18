@@ -1,6 +1,6 @@
 # MsgTrans
 
-[English](README.md) | [简体中文](README.zh-Hans.md) | [繁體中文](README.zh-Hant.md) | [Français](README.fr-FR.md) | [Deutsch](README.de.md) | [Español](README.es.md) | [Українська](README.uk.md) | **Русский** | [日本語](README.ja-JP.md) | [한국어](README.ko-KR.md) | [Tiếng Việt](README.vi-VN.md)
+[English](README.md) | [简体中文](README.zh-Hans.md) | [繁體中文](README.zh-Hant.md) | [Français](README.fr-FR.md) | [Deutsch](README.de.md) | [Español](README.es.md) | [Português (Brasil)](README.pt-BR.md) | [Українська](README.uk.md) | **Русский** | [日本語](README.ja-JP.md) | [한국어](README.ko-KR.md) | [Tiếng Việt](README.vi-VN.md) | [Bahasa Indonesia](README.id.md) | [العربية](README.ar.md)
 
 MsgTrans — библиотека Rust для двустороннего обмена сообщениями в приложениях реального времени. Единый API поддерживает односторонние сообщения, запросы и ответы через TCP, WebSocket или QUIC. При смене транспорта не нужно переписывать логику приложения. Типичные сценарии — чаты, онлайн-игры, телеметрия и обмен данными между сервисами.
 

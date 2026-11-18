@@ -3,7 +3,7 @@
 [![Crates.io](https://img.shields.io/crates/v/msgtrans.svg)](https://crates.io/crates/msgtrans)
 [![Docs.rs](https://img.shields.io/docsrs/msgtrans)](https://docs.rs/msgtrans)
 
-[English](README.md) | [简体中文](README.zh-Hans.md) | [繁體中文](README.zh-Hant.md) | **Français** | [Deutsch](README.de.md) | [Español](README.es.md) | [Українська](README.uk.md) | [Русский](README.ru.md) | [日本語](README.ja-JP.md) | [한국어](README.ko-KR.md) | [Tiếng Việt](README.vi-VN.md)
+[English](README.md) | [简体中文](README.zh-Hans.md) | [繁體中文](README.zh-Hant.md) | **Français** | [Deutsch](README.de.md) | [Español](README.es.md) | [Português (Brasil)](README.pt-BR.md) | [Українська](README.uk.md) | [Русский](README.ru.md) | [日本語](README.ja-JP.md) | [한국어](README.ko-KR.md) | [Tiếng Việt](README.vi-VN.md) | [Bahasa Indonesia](README.id.md) | [العربية](README.ar.md)
 
 MsgTrans est une bibliothèque Rust de messagerie bidirectionnelle pour les applications temps réel. Une même API permet d’envoyer des messages à sens unique ou d’échanger des requêtes et des réponses sur TCP, WebSocket ou QUIC, sans réécrire la logique applicative.
 

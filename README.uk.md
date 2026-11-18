@@ -1,6 +1,6 @@
 # MsgTrans
 
-[English](README.md) | [简体中文](README.zh-Hans.md) | [繁體中文](README.zh-Hant.md) | [Français](README.fr-FR.md) | [Deutsch](README.de.md) | [Español](README.es.md) | **Українська** | [Русский](README.ru.md) | [日本語](README.ja-JP.md) | [한국어](README.ko-KR.md) | [Tiếng Việt](README.vi-VN.md)
+[English](README.md) | [简体中文](README.zh-Hans.md) | [繁體中文](README.zh-Hant.md) | [Français](README.fr-FR.md) | [Deutsch](README.de.md) | [Español](README.es.md) | [Português (Brasil)](README.pt-BR.md) | **Українська** | [Русский](README.ru.md) | [日本語](README.ja-JP.md) | [한국어](README.ko-KR.md) | [Tiếng Việt](README.vi-VN.md) | [Bahasa Indonesia](README.id.md) | [العربية](README.ar.md)
 
 MsgTrans — бібліотека Rust для двостороннього обміну повідомленнями в застосунках реального часу. Спільний API підтримує односторонні повідомлення, запити й відповіді через TCP, WebSocket або QUIC. Зміна транспорту не потребує переписування логіки застосунку. Типові сценарії — чати, онлайн-ігри, телеметрія та обмін даними між сервісами.
 

@@ -1,6 +1,6 @@
 # MsgTrans
 
-[English](README.md) | [简体中文](README.zh-Hans.md) | [繁體中文](README.zh-Hant.md) | [Français](README.fr-FR.md) | **Deutsch** | [Español](README.es.md) | [Українська](README.uk.md) | [Русский](README.ru.md) | [日本語](README.ja-JP.md) | [한국어](README.ko-KR.md) | [Tiếng Việt](README.vi-VN.md)
+[English](README.md) | [简体中文](README.zh-Hans.md) | [繁體中文](README.zh-Hant.md) | [Français](README.fr-FR.md) | **Deutsch** | [Español](README.es.md) | [Português (Brasil)](README.pt-BR.md) | [Українська](README.uk.md) | [Русский](README.ru.md) | [日本語](README.ja-JP.md) | [한국어](README.ko-KR.md) | [Tiếng Việt](README.vi-VN.md) | [Bahasa Indonesia](README.id.md) | [العربية](README.ar.md)
 
 MsgTrans ist eine Rust-Bibliothek für bidirektionalen Nachrichtenaustausch in Echtzeitanwendungen. Dieselbe API unterstützt Einwegnachrichten sowie Anfragen und Antworten über TCP, WebSocket und QUIC. Die Anwendungslogik bleibt beim Wechsel des Transports unverändert. Typische Einsatzbereiche sind Chats, Onlinespiele, Telemetrie und die Kommunikation zwischen Diensten.
 

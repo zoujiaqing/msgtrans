@@ -1,6 +1,6 @@
 # MsgTrans
 
-[English](README.md) | [简体中文](README.zh-Hans.md) | [繁體中文](README.zh-Hant.md) | [Français](README.fr-FR.md) | [Deutsch](README.de.md) | [Español](README.es.md) | [Українська](README.uk.md) | [Русский](README.ru.md) | **日本語** | [한국어](README.ko-KR.md) | [Tiếng Việt](README.vi-VN.md)
+[English](README.md) | [简体中文](README.zh-Hans.md) | [繁體中文](README.zh-Hant.md) | [Français](README.fr-FR.md) | [Deutsch](README.de.md) | [Español](README.es.md) | [Português (Brasil)](README.pt-BR.md) | [Українська](README.uk.md) | [Русский](README.ru.md) | **日本語** | [한국어](README.ko-KR.md) | [Tiếng Việt](README.vi-VN.md) | [Bahasa Indonesia](README.id.md) | [العربية](README.ar.md)
 
 MsgTrans は、リアルタイムアプリケーション向けの Rust 製双方向メッセージングライブラリです。TCP、WebSocket、QUIC で共通の API を使い、アプリケーションロジックを変更せずに一方向メッセージやリクエスト／レスポンスを扱えます。チャット、オンラインゲーム、デバイスのテレメトリー、サービス間通信に適しています。
 

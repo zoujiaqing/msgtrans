@@ -1,6 +1,6 @@
 # MsgTrans
 
-[English](README.md) | [简体中文](README.zh-Hans.md) | [繁體中文](README.zh-Hant.md) | [Français](README.fr-FR.md) | [Deutsch](README.de.md) | [Español](README.es.md) | [Українська](README.uk.md) | [Русский](README.ru.md) | [日本語](README.ja-JP.md) | [한국어](README.ko-KR.md) | **Tiếng Việt**
+[English](README.md) | [简体中文](README.zh-Hans.md) | [繁體中文](README.zh-Hant.md) | [Français](README.fr-FR.md) | [Deutsch](README.de.md) | [Español](README.es.md) | [Português (Brasil)](README.pt-BR.md) | [Українська](README.uk.md) | [Русский](README.ru.md) | [日本語](README.ja-JP.md) | [한국어](README.ko-KR.md) | **Tiếng Việt** | [Bahasa Indonesia](README.id.md) | [العربية](README.ar.md)
 
 MsgTrans là thư viện Rust cung cấp khả năng truyền tin hai chiều cho các ứng dụng thời gian thực. Một API dùng chung cho TCP, WebSocket và QUIC hỗ trợ cả tin nhắn một chiều lẫn mô hình yêu cầu/phản hồi, không cần viết lại logic ứng dụng khi đổi phương thức truyền tải. Phù hợp cho ứng dụng trò chuyện, trò chơi trực tuyến, thu thập dữ liệu thiết bị và giao tiếp giữa các dịch vụ.
 
