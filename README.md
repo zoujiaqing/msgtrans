@@ -7,7 +7,7 @@
 A multi-protocol communication framework for Rust: one interface over TCP,
 WebSocket and QUIC, with bindings for Kotlin and Swift.
 
-🌐 [English](crates/msgtrans/README.md) | [简体中文](crates/msgtrans/README.zh-CN.md)
+🌐 [English](crates/msgtrans/README.md) | [简体中文](crates/msgtrans/README.zh-CN.md) | [Français](README.fr-FR.md) | [Español](README.es-ES.md)
 
 ## Repository layout
 
