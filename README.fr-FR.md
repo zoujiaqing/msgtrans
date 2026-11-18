@@ -3,7 +3,7 @@
 [![Crates.io](https://img.shields.io/crates/v/msgtrans.svg)](https://crates.io/crates/msgtrans)
 [![Docs.rs](https://img.shields.io/docsrs/msgtrans)](https://docs.rs/msgtrans)
 
-[English](README.md) | Français | [Español](README.es-ES.md) | [简体中文](crates/msgtrans/README.zh-CN.md)
+[English](README.md) | [简体中文](README.zh-CN.md) | [繁體中文（台灣）](README.zh-TW.md) | **Français** | [日本語](README.ja-JP.md) | [한국어](README.ko-KR.md) | [Tiếng Việt](README.vi-VN.md) | [Español](README.es-ES.md)
 
 MsgTrans est une bibliothèque Rust de messagerie bidirectionnelle pour les applications temps réel. Une même API permet d’envoyer des messages à sens unique ou d’échanger des requêtes et des réponses sur TCP, WebSocket ou QUIC, sans réécrire la logique applicative.
 
@@ -31,9 +31,25 @@ La bibliothèque nécessite Rust 1.88 ou une version ultérieure.
 msgtrans = "2.0.0"
 ```
 
-- [Guide Rust complet et exemples](crates/msgtrans/README.md) · [Référence de l’API](https://docs.rs/msgtrans)
+Depuis la racine du dépôt, démarrez le serveur d’écho puis lancez le client TCP dans un second terminal :
+
+```sh
+cargo run -p msgtrans --example echo_server
+```
+
+```sh
+cargo run -p msgtrans --example echo_client_tcp
+```
+
+- [Guide Rust complet et exemples](README.md) · [Référence de l’API](https://docs.rs/msgtrans)
+
+## Liaisons natives Kotlin et Swift
+
+[`msgtrans-ffi`](crates/msgtrans-ffi/README.md) expose l’**API cliente** via UniFFI pour Kotlin (Android, JVM, Kotlin Multiplatform) et Swift (iOS, macOS). Les liaisons prennent en charge TCP (avec TLS), WebSocket et QUIC, y compris les réponses aux requêtes initiées par le serveur. L’API serveur reste dans la bibliothèque Rust. Les bibliothèques natives et les liaisons générées sont distribuées ensemble, et non via un paquet crates.io distinct. Pour les navigateurs, le [client TypeScript pour WebSocket](https://github.com/zoujiaqing/msgtrans-typescript) est disponible séparément.
+
+## Migration depuis 1.x
+
 - [Migration depuis 1.x](docs/MIGRATION_2.0.md) · [Format des paquets](docs/WIRE_FORMAT.md)
-- [Liaisons client UniFFI pour Kotlin et Swift](crates/msgtrans-ffi) · [Client TypeScript pour WebSocket](https://github.com/zoujiaqing/msgtrans-typescript)
 
 Le format des paquets n’a pas changé, mais l’API Rust et certaines règles de connexion ont évolué. Le décodage strict est désormais le comportement par défaut. Les anciens pairs QUIC qui ne proposent pas d’ALPN, dont MsgTrans 1.0.10, ne sont pas pris en charge.
 
