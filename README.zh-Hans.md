@@ -5,7 +5,7 @@
 [![Crates.io](https://img.shields.io/crates/v/msgtrans.svg)](https://crates.io/crates/msgtrans)
 [![Docs.rs](https://img.shields.io/docsrs/msgtrans)](https://docs.rs/msgtrans)
 
-🌐 [English](https://github.com/zoujiaqing/msgtrans/blob/main/README.md) | [简体中文](https://github.com/zoujiaqing/msgtrans/blob/main/README.zh-CN.md) | [繁體中文（台灣）](https://github.com/zoujiaqing/msgtrans/blob/main/README.zh-TW.md) | [Français](https://github.com/zoujiaqing/msgtrans/blob/main/README.fr-FR.md) | [日本語](https://github.com/zoujiaqing/msgtrans/blob/main/README.ja-JP.md) | [한국어](https://github.com/zoujiaqing/msgtrans/blob/main/README.ko-KR.md) | [Tiếng Việt](https://github.com/zoujiaqing/msgtrans/blob/main/README.vi-VN.md) | [Español](https://github.com/zoujiaqing/msgtrans/blob/main/README.es-ES.md)
+[English](https://github.com/zoujiaqing/msgtrans/blob/main/README.md) | **简体中文** | [繁體中文](https://github.com/zoujiaqing/msgtrans/blob/main/README.zh-Hant.md) | [Français](https://github.com/zoujiaqing/msgtrans/blob/main/README.fr-FR.md) | [Deutsch](https://github.com/zoujiaqing/msgtrans/blob/main/README.de.md) | [Español](https://github.com/zoujiaqing/msgtrans/blob/main/README.es.md) | [Українська](https://github.com/zoujiaqing/msgtrans/blob/main/README.uk.md) | [Русский](https://github.com/zoujiaqing/msgtrans/blob/main/README.ru.md) | [日本語](https://github.com/zoujiaqing/msgtrans/blob/main/README.ja-JP.md) | [한국어](https://github.com/zoujiaqing/msgtrans/blob/main/README.ko-KR.md) | [Tiếng Việt](https://github.com/zoujiaqing/msgtrans/blob/main/README.vi-VN.md)
 
 > **现代化多协议通信框架，用统一接口封装 TCP、WebSocket、QUIC**
 

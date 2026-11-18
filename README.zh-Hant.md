@@ -1,6 +1,6 @@
 # MsgTrans
 
-[English](README.md) | [简体中文](README.zh-CN.md) | **繁體中文（台灣）** | [Français](README.fr-FR.md) | [日本語](README.ja-JP.md) | [한국어](README.ko-KR.md) | [Tiếng Việt](README.vi-VN.md) | [Español](README.es-ES.md)
+[English](README.md) | [简体中文](README.zh-Hans.md) | **繁體中文** | [Français](README.fr-FR.md) | [Deutsch](README.de.md) | [Español](README.es.md) | [Українська](README.uk.md) | [Русский](README.ru.md) | [日本語](README.ja-JP.md) | [한국어](README.ko-KR.md) | [Tiếng Việt](README.vi-VN.md)
 
 MsgTrans 是以 Rust 開發的雙向訊息傳輸函式庫，適用於即時應用程式。以同一套 API 在 TCP、WebSocket 和 QUIC 上傳送單向訊息、發出請求並接收回應，切換傳輸方式，不必重寫應用程式邏輯。適合即時通訊、線上遊戲、裝置遙測與服務間通訊。
 

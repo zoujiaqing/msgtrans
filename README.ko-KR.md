@@ -1,6 +1,6 @@
 # MsgTrans
 
-[English](README.md) | [简体中文](README.zh-CN.md) | [繁體中文（台灣）](README.zh-TW.md) | [Français](README.fr-FR.md) | [日本語](README.ja-JP.md) | **한국어** | [Tiếng Việt](README.vi-VN.md) | [Español](README.es-ES.md)
+[English](README.md) | [简体中文](README.zh-Hans.md) | [繁體中文](README.zh-Hant.md) | [Français](README.fr-FR.md) | [Deutsch](README.de.md) | [Español](README.es.md) | [Українська](README.uk.md) | [Русский](README.ru.md) | [日本語](README.ja-JP.md) | **한국어** | [Tiếng Việt](README.vi-VN.md)
 
 MsgTrans는 실시간 애플리케이션을 위한 Rust 양방향 메시징 라이브러리입니다. 하나의 API로 TCP, WebSocket, QUIC에서 단방향 메시지와 요청·응답을 주고받을 수 있어, 전송 방식을 바꿔도 애플리케이션 로직을 다시 작성할 필요가 없습니다. 채팅, 온라인 게임, 장치 텔레메트리, 서비스 간 통신에 적합합니다.
 

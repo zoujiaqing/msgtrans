@@ -36,7 +36,7 @@
 /// duplicate the rendered crate docs.
 #[cfg(all(feature = "tcp", feature = "websocket", feature = "quic"))]
 #[doc(hidden)]
-#[doc = include_str!("../README.zh-CN.md")]
+#[doc = include_str!("../README.zh-Hans.md")]
 pub mod readme_zh_cn_doctests {}
 
 pub(crate) mod adapters;
